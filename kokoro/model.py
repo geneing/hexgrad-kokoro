@@ -64,7 +64,7 @@ class KModel(torch.nn.Module):
             dim_out=config['n_mels'], disable_complex=disable_complex, **config['istftnet']
         )
         if not model:
-            model = hf_hub_download(repo_id=repo_id, filename=MODEL_NAMES[repo_id])
+            model = hf_hub_download(repo_id=repo_id, filename=KModel.MODEL_NAMES[repo_id])
         for key, state_dict in torch.load(model, map_location='cpu', weights_only=True).items():
             assert hasattr(self, key), key
             try:
