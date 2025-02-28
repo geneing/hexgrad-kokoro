@@ -148,4 +148,4 @@ class KModelForONNX(torch.nn.Module):
         speed: float = 1
     ) -> tuple[torch.FloatTensor, torch.LongTensor]:
         waveform, duration = self.kmodel.forward_with_tokens(input_ids, ref_s, speed)
-        return waveform
+        return waveform, duration
