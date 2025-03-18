@@ -1,4 +1,4 @@
-__version__ = '0.8.4'
+__version__ = '0.9.2'
 
 from loguru import logger
 import sys
