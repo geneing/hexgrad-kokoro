@@ -7,7 +7,7 @@ An inference library for [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)
 ### Usage
 You can run this basic cell on [Google Colab](https://colab.research.google.com/). [Listen to samples](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/SAMPLES.md).
 ```py
-!pip install -q kokoro>=0.9.2 soundfile
+!pip install -q kokoro>=0.9.4 soundfile
 !apt-get -qq -y install espeak-ng > /dev/null 2>&1
 from kokoro import KPipeline
 from IPython.display import display, Audio
@@ -25,21 +25,11 @@ for i, (gs, ps, audio) in enumerate(generator):
 ```
 Under the hood, `kokoro` uses [`misaki`](https://pypi.org/project/misaki/), a G2P library at https://github.com/hexgrad/misaki
 
-### Windows Installation
-To install espeak-ng on Windows:
-1. Go to [espeak-ng releases](https://github.com/espeak-ng/espeak-ng/releases)
-2. Click on **Latest release** 
-3. Download the appropriate *.msi file (e.g. **espeak-ng-20191129-b702b03-x64.msi**)
-4. Run the downloaded installer
-
-For advanced configuration and usage on Windows, see the [official espeak-ng Windows guide](https://github.com/espeak-ng/espeak-ng/blob/master/docs/guide.md)
-
 ### Advanced Usage
 You can run this advanced cell on [Google Colab](https://colab.research.google.com/).
 ```py
 # 1️⃣ Install kokoro
-!pip install -q kokoro>=0.9.2 soundfile
-
+!pip install -q kokoro>=0.9.4 soundfile
 # 2️⃣ Install espeak, used for English OOD fallback and some non-English languages
 !apt-get -qq -y install espeak-ng > /dev/null 2>&1
 
@@ -95,6 +85,15 @@ for i, (gs, ps, audio) in enumerate(generator):
     display(Audio(data=audio, rate=24000, autoplay=i==0))
     sf.write(f'{i}.wav', audio, 24000) # save each audio file
 ```
+
+### Windows Installation
+To install espeak-ng on Windows:
+1. Go to [espeak-ng releases](https://github.com/espeak-ng/espeak-ng/releases)
+2. Click on **Latest release** 
+3. Download the appropriate `*.msi` file (e.g. **espeak-ng-20191129-b702b03-x64.msi**)
+4. Run the downloaded installer
+
+For advanced configuration and usage on Windows, see the [official espeak-ng Windows guide](https://github.com/espeak-ng/espeak-ng/blob/master/docs/guide.md)
 
 ### Conda Environment
 Use the following conda `environment.yml` if you're facing any dependency issues.
