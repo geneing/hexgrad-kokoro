@@ -1,0 +1,280 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kokoro-litert"
+version = "1.0.0"
+description = "TensorFlow Keras implementation of Kokoro TTS with TFAlbertModel"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Converted to TensorFlow Keras", email = ""}
+]
+maintainers = [
+    {name = "TensorFlow Conversion Team", email = ""}
+]
+keywords = [
+    "text-to-speech",
+    "tts", 
+    "neural-vocoder",
+    "tensorflow",
+    "keras",
+    "albert",
+    "speech-synthesis",
+    "deep-learning"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules"
+]
+requires-python = ">=3.8"
+
+# Core dependencies
+dependencies = [
+    # TensorFlow and ML frameworks
+    "tensorflow>=2.12.0,<3.0.0",
+    "transformers>=4.20.0",
+    "huggingface-hub>=0.14.0",
+    
+    # Numerical computing
+    "numpy>=1.21.0,<2.0.0",
+    
+    # Audio processing
+    "librosa>=0.9.0",
+    "soundfile>=0.12.0",
+    
+    # Utilities and logging
+    "loguru>=0.6.0",
+    "dataclasses-json>=0.5.0",
+    
+    # Type hints and validation
+    "typing-extensions>=4.0.0",
+]
+
+[project.optional-dependencies]
+# G2P (Grapheme-to-Phoneme) dependencies - language specific
+g2p-en = [
+    "misaki[en]>=0.1.0"
+]
+g2p-ja = [
+    "misaki[ja]>=0.1.0"  
+]
+g2p-zh = [
+    "misaki[zh]>=0.1.0"
+]
+g2p-multilingual = [
+    "espeak-ng-python>=1.0.0"
+]
+g2p-all = [
+    "misaki[en]>=0.1.0",
+    "misaki[ja]>=0.1.0", 
+    "misaki[zh]>=0.1.0",
+    "espeak-ng-python>=1.0.0"
+]
+
+# Development dependencies
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-mock>=3.10.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+    "pre-commit>=3.0.0"
+]
+
+# Conversion utilities (for loading PyTorch weights)
+conversion = [
+    "torch>=1.12.0",  # Only needed for weight conversion
+    "torchvision>=0.13.0",
+    "torchaudio>=0.12.0"
+]
+
+# Documentation
+docs = [
+    "sphinx>=5.0.0",
+    "sphinx-rtd-theme>=1.2.0",
+    "myst-parser>=0.18.0"
+]
+
+# Complete development environment
+full = [
+    "kokoro-litert[dev,conversion,docs,g2p-all]"
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/kokoro-litert"
+Repository = "https://github.com/your-org/kokoro-litert"
+Documentation = "https://kokoro-litert.readthedocs.io"
+"Bug Tracker" = "https://github.com/your-org/kokoro-litert/issues"
+
+[project.scripts]
+# Command-line interfaces
+kokoro-tts = "kokoro_litert.cli:main"
+kokoro-convert-weights = "kokoro_litert.conversion:convert_weights_cli"
+
+[tool.setuptools]
+packages = ["kokoro_litert"]
+
+[tool.setuptools.package-dir]
+kokoro_litert = "."
+
+[tool.setuptools.package-data]
+kokoro_litert = [
+    "*.md",
+    "*.txt",
+    "*.json",
+    "*.yaml",
+    "*.yml"
+]
+
+# Black code formatting
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # Directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
+
+# isort import sorting
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 100
+known_first_party = ["kokoro_litert"]
+known_third_party = [
+    "tensorflow",
+    "transformers", 
+    "numpy",
+    "librosa",
+    "soundfile",
+    "loguru",
+    "huggingface_hub"
+]
+
+# MyPy type checking
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = [
+    "librosa.*",
+    "soundfile.*",
+    "misaki.*",
+    "espeak.*"
+]
+ignore_missing_imports = true
+
+# Pytest configuration
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = [
+    "--strict-markers",
+    "--strict-config", 
+    "--cov=kokoro_litert",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+    "--cov-report=xml"
+]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "conversion: marks tests for PyTorch-TensorFlow conversion",
+    "g2p: marks tests requiring G2P libraries"
+]
+
+# Coverage configuration
+[tool.coverage.run]
+source = ["kokoro_litert"]
+omit = [
+    "*/tests/*",
+    "*/test_*",
+    "setup.py",
+    "*/conversion/*"  # Exclude conversion utilities from coverage
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod"
+]
+
+# Flake8 linting
+[tool.flake8]
+max-line-length = 100
+extend-ignore = [
+    "E203",  # whitespace before ':'
+    "E501",  # line too long (handled by black)
+    "W503"   # line break before binary operator
+]
+exclude = [
+    ".git",
+    "__pycache__",
+    "build",
+    "dist",
+    ".venv",
+    ".tox"
+]
+
+# Additional project metadata
+[tool.bumpversion]
+current_version = "1.0.0"
+commit = true
+tag = true
+
+[[tool.bumpversion.files]]
+filename = "kokoro_litert/__init__.py"
+search = '__version__ = "{current_version}"'
+replace = '__version__ = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'

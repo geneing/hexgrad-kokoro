@@ -1,0 +1,38 @@
+# TensorFlow Keras implementation of Kokoro TTS
+# Converted from PyTorch implementation
+
+# Core dependencies
+tensorflow>=2.12.0
+transformers>=4.20.0
+huggingface_hub>=0.14.0
+numpy>=1.21.0
+
+# Audio processing
+librosa>=0.9.0
+soundfile>=0.12.0
+
+# Logging and utilities
+loguru>=0.6.0
+dataclasses-json>=0.5.0
+
+# Optional: For G2P conversion (language-specific)
+# Note: These may need to be installed separately based on language requirements
+
+# For English G2P:
+# misaki[en]>=0.1.0
+
+# For multilingual G2P:  
+# espeak-ng-python>=1.0.0
+
+# For Japanese G2P:
+# misaki[ja]>=0.1.0
+
+# For Chinese G2P:
+# misaki[zh]>=0.1.0
+
+# Development and testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
+# Optional: For loading PyTorch weights during conversion
+# torch>=1.12.0  # Only needed for weight conversion utilities
