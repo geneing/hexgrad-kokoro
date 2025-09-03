@@ -11,10 +11,11 @@ from loguru import logger
 
 # Import the TensorFlow Keras implementation
 try:
-    from . import KModelTF, KPipelineTF, print_conversion_notes, get_conversion_status
-except ImportError:
+    from kokoro import KModelTF, KPipelineTF 
+    #from . import print_conversion_notes, get_conversion_status
+except ImportError as e:
     print("Kokoro LiteRT not properly installed. Make sure to install dependencies:")
-    print("pip install -r requirements.txt")
+    print(f"{e}")
     exit(1)
 
 
@@ -23,13 +24,13 @@ def main():
     print("=== Kokoro TTS TensorFlow Keras Implementation ===\n")
     
     # Print conversion notes
-    print("Conversion Notes:")
-    print_conversion_notes()
+    #print("Conversion Notes:")
+    #print_conversion_notes()
     
-    print("\nConversion Status:")
-    status = get_conversion_status()
-    for component, status_text in status.items():
-        print(f"  {component}: {status_text}")
+    #print("\nConversion Status:")
+    #status = get_conversion_status()
+    #for component, status_text in status.items():
+    #    print(f"  {component}: {status_text}")
     
     print("\n" + "="*50)
     
@@ -41,7 +42,8 @@ def main():
             disable_complex=False
         )
         print("   ✓ Model initialized (note: weights not loaded - conversion needed)")
-        
+        return 
+    
         # Initialize pipeline
         print("\n2. Initializing pipeline for English...")
         pipeline = KPipelineTF(

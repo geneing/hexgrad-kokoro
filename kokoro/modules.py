@@ -4,10 +4,25 @@ Converted from PyTorch implementation.
 """
 
 import tensorflow as tf
-from transformers import TFAlbertModel, AlbertConfig
+import tensorflow_models as tfm
+import tensorflow_models.nlp as nlp
+from transformers import TFAlbertModel
+
 import numpy as np
 import math
 from typing import Dict, Optional, Union, Tuple
+
+# https://github.com/yl4579/StyleTTS2/blob/main/Utils/PLBERT/util.py
+class CustomAlbert(nlp.networks.AlbertEncoder):
+    def __init__(self, *args, **kwargs):
+        super(CustomAlbert, self).__init__(*args, **kwargs)
+
+
+    def call(self, *args, **kwargs):
+        outputs = super().call(*args, **kwargs)
+        # Return only the last hidden state, matching PyTorch implementation
+        return outputs['encoder_outputs'][-1]
+
 
 class LinearNorm(tf.keras.layers.Layer):
     """TensorFlow equivalent of PyTorch LinearNorm layer."""
@@ -294,35 +309,6 @@ class DurationEncoder(tf.keras.layers.Layer):
         return config
 
 
-# Note: Replacing AlbertModel with TFAlbertModel as requested
-class CustomTFAlbert(tf.keras.layers.Layer):
-    """Custom TensorFlow Albert model that returns only last hidden states."""
-    
-    def __init__(self, config: AlbertConfig, **kwargs):
-        super(CustomTFAlbert, self).__init__(**kwargs)
-        # Using TFAlbertModel instead of AlbertModel as requested
-        self.albert = TFAlbertModel(config)
-        self.config = config
-
-    def call(self, *args, **kwargs):
-        outputs = self.albert(*args, **kwargs)
-        # Return only the last hidden state, matching PyTorch implementation
-        return outputs.last_hidden_state
-
-    @property
-    def device(self):
-        # TensorFlow doesn't have the same device concept as PyTorch
-        # This is a potential conversion issue
-        return '/GPU:0' if tf.config.list_physical_devices('GPU') else '/CPU:0'
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            'config': self.config.to_dict()
-        })
-        return config
-
-
 class ProsodyPredictor(tf.keras.layers.Layer):
     """Prosody predictor with F0 and energy prediction."""
     
@@ -424,3 +410,5 @@ class ProsodyPredictor(tf.keras.layers.Layer):
             'max_dur': self.max_dur
         })
         return config
+
+

@@ -5,7 +5,7 @@ Kokoro TTS core modules - TensorFlow Keras implementation
 from .model import KModelTF, KModelForONNXTF
 from .pipeline import KPipelineTF  
 from .modules import (
-    CustomTFAlbert, ProsodyPredictor, TextEncoder, 
+    CustomAlbert, ProsodyPredictor, TextEncoder, 
     LinearNorm, LayerNorm, AdaLayerNorm, DurationEncoder
 )
 from .istftnet import (
@@ -18,7 +18,7 @@ __all__ = [
     'KModelTF',
     'KModelForONNXTF', 
     'KPipelineTF',
-    'CustomTFAlbert',
+    'CustomAlbert',
     'ProsodyPredictor',
     'TextEncoder',
     'Decoder',

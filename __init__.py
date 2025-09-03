@@ -18,7 +18,7 @@ Note: This is a conversion from PyTorch with several conversion challenges:
 
 from .kokoro import (
     KModelTF, KModelForONNXTF, KPipelineTF,
-    CustomTFAlbert, ProsodyPredictor, TextEncoder, 
+    CustomAlbert, ProsodyPredictor, TextEncoder, 
     LinearNorm, LayerNorm, AdaLayerNorm, DurationEncoder,
     Decoder, Generator, AdaINResBlock1, AdaIN1d, 
     AdainResBlk1d, SineGen, SourceModuleHnNSF,
@@ -33,7 +33,7 @@ __all__ = [
     'KModelTF',
     'KModelForONNXTF', 
     'KPipelineTF',
-    'CustomTFAlbert',
+    'CustomAlbert',
     'ProsodyPredictor',
     'TextEncoder',
     'Decoder',
