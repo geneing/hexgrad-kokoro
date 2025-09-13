@@ -19,11 +19,14 @@ classifiers = [
 requires-python = ">=3.10, <3.14"
 dependencies = [
     "huggingface_hub",
+    "ipykernel>=6.30.1",
+    "ipywidgets>=8.1.7",
     "loguru",
     "misaki[en]>=0.9.4",
     "numpy",
+    "tensorflow>=2.18.1",
     "torch",
-    "transformers"
+    "transformers",
 ]
 
 [project.scripts]

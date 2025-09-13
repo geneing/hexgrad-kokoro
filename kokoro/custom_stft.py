@@ -1,4 +1,4 @@
-from attr import attr
+# from attr import attr
 import numpy as np
 import torch
 import torch.nn as nn
