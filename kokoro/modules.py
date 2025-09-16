@@ -267,103 +267,144 @@ class DurationEncoder(tf.keras.layers.Layer):
 
 
 class ProsodyPredictor(tf.keras.layers.Layer):
-    """Prosody predictor with F0 and energy prediction."""
-    
+    """Prosody predictor with F0 and energy prediction (TensorFlow/Keras version).
+
+    Converted from PyTorch. Major differences / potential mismatches:
+    - Replaces nn.LSTM & nn.ModuleList with tf.keras.layers equivalents and Python lists.
+    - Conv1d (channel-first) replaced by Conv1D operating on channel-last with explicit transposes.
+    - Dropping pack_padded_sequence / pad_packed_sequence logic (approximation for variable lengths).
+    - Dropout semantics differ (PyTorch functional vs tf.nn / layer dropout) -> may change statistics.
+    - Residual AdainResBlk1d imported from iSTFTNet module; ensure shapes [B,C,T].
+    - Duration projection uses LinearNorm (Dense) -> may need weight transpose when loading PT weights.
+    """
     def __init__(self, style_dim: int, d_hid: int, nlayers: int, max_dur: int = 50, dropout: float = 0.1, **kwargs):
         super(ProsodyPredictor, self).__init__(**kwargs)
         self.style_dim = style_dim
         self.d_hid = d_hid
         self.max_dur = max_dur
-        
+        self.nlayers = nlayers
+        self.dropout_rate = dropout
+
+        # Duration text encoder
         self.text_encoder = DurationEncoder(
-            sty_dim=style_dim, 
-            d_model=d_hid, 
-            nlayers=nlayers
+            sty_dim=style_dim,
+            d_model=d_hid,
+            nlayers=nlayers,
+            name="duration_encoder"
         )
-        
-        # LSTM layers
+
+        # LSTM stack (shared for duration path before projection)
         self.lstm = tf.keras.layers.Bidirectional(
             tf.keras.layers.LSTM(d_hid // 2, return_sequences=True),
-            merge_mode='concat'
+            merge_mode='concat',
+            name='duration_bilstm'
         )
-        
-        self.duration_proj = LinearNorm(d_hid, max_dur)
-        
-        self.shared = tf.keras.layers.Bidirectional(
+
+        self.dropout = tf.keras.layers.Dropout(dropout)
+        self.duration_proj = LinearNorm(d_hid, max_dur, name='duration_proj')  # NOTE: Dense vs Conv1d mismatch
+
+        # Shared bi-LSTM for F0 / Noise branches (input will be [B,T,d_hid+style_dim])
+        self.shared_bilstm = tf.keras.layers.Bidirectional(
             tf.keras.layers.LSTM(d_hid // 2, return_sequences=True),
-            merge_mode='concat'
+            merge_mode='concat',
+            name='shared_bilstm'
         )
-        
-    #     # F0 prediction blocks - Note: AdainResBlk1d not implemented here
-    #     # This would need to be implemented based on the istftnet.py conversion
-    #     # For now, using placeholder Dense layers - THIS IS A CONVERSION ISSUE
-    #     self.f0_blocks = []
-    #     self.f0_blocks.append(tf.keras.layers.Dense(d_hid, activation='relu'))  # Placeholder
-    #     self.f0_blocks.append(tf.keras.layers.Dense(d_hid // 2, activation='relu'))  # Placeholder
-    #     self.f0_blocks.append(tf.keras.layers.Dense(d_hid // 2, activation='relu'))  # Placeholder
-        
-    #     # N (energy) prediction blocks - similar placeholder issue
-    #     self.n_blocks = []
-    #     self.n_blocks.append(tf.keras.layers.Dense(d_hid, activation='relu'))  # Placeholder
-    #     self.n_blocks.append(tf.keras.layers.Dense(d_hid // 2, activation='relu'))  # Placeholder  
-    #     self.n_blocks.append(tf.keras.layers.Dense(d_hid // 2, activation='relu'))  # Placeholder
-        
-    #     # Final projection layers
-    #     self.f0_proj = tf.keras.layers.Conv1D(1, 1, padding='same')
-    #     self.n_proj = tf.keras.layers.Conv1D(1, 1, padding='same')
 
-    # def call(self, texts, style, text_lengths, alignment, m, training=None):
-    #     d = self.text_encoder(texts, style, text_lengths, m, training=training)
-        
-    #     # LSTM processing - Note: no pack_padded_sequence equivalent
-    #     x = self.lstm(d, training=training)
-        
-    #     # Duration prediction
-    #     duration = self.duration_proj(tf.nn.dropout(x, rate=0.5 if training else 0.0))
-        
-    #     # Encode for F0/N prediction
-    #     d_transposed = tf.transpose(d, [0, 2, 1])  # [batch, features, seq_len]
-    #     en = tf.matmul(d_transposed, alignment)
-        
-    #     return tf.squeeze(duration, axis=-1), en
+        # Residual stacks (lists of AdainResBlk1d operating on channel-first [B,C,T])
+        from .istftnet import AdainResBlk1d  # local import to avoid circular issues
+        self.F0_blocks = [
+            AdainResBlk1d(d_hid, d_hid, style_dim, dropout_p=dropout, name='F0_blk_0'),
+            AdainResBlk1d(d_hid, d_hid // 2, style_dim, upsample='nearest', dropout_p=dropout, name='F0_blk_1'),  # NOTE: upsample flag semantic differs
+            AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim, dropout_p=dropout, name='F0_blk_2'),
+        ]
+        self.N_blocks = [
+            AdainResBlk1d(d_hid, d_hid, style_dim, dropout_p=dropout, name='N_blk_0'),
+            AdainResBlk1d(d_hid, d_hid // 2, style_dim, upsample='nearest', dropout_p=dropout, name='N_blk_1'),
+            AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim, dropout_p=dropout, name='N_blk_2'),
+        ]
 
-    # def f0n_train(self, x, s, training=None):
-    #     """F0 and N prediction during training."""
-    #     # Shared LSTM processing
-    #     x_transposed = tf.transpose(x, [0, 2, 1])  # [batch, seq_len, features]
-    #     x_lstm, _ = self.shared(x_transposed, training=training)
-        
-    #     # F0 prediction path
-    #     f0 = tf.transpose(x_lstm, [0, 2, 1])  # [batch, features, seq_len]
-    #     for block in self.f0_blocks:
-    #         # Note: These are placeholder Dense layers, not the actual AdainResBlk1d
-    #         # This is a significant conversion issue that needs proper implementation
-    #         f0_reshaped = tf.transpose(f0, [0, 2, 1])  # For Dense layer
-    #         f0_reshaped = block(f0_reshaped)
-    #         f0 = tf.transpose(f0_reshaped, [0, 2, 1])
-        
-    #     f0 = self.f0_proj(tf.transpose(f0, [0, 2, 1]))
-    #     f0 = tf.squeeze(f0, axis=-1)
-        
-    #     # N (energy) prediction path
-    #     n = tf.transpose(x_lstm, [0, 2, 1])  # [batch, features, seq_len]
-    #     for block in self.n_blocks:
-    #         # Note: Same placeholder issue as F0 blocks
-    #         n_reshaped = tf.transpose(n, [0, 2, 1])  # For Dense layer
-    #         n_reshaped = block(n_reshaped)
-    #         n = tf.transpose(n_reshaped, [0, 2, 1])
-        
-    #     n = self.n_proj(tf.transpose(n, [0, 2, 1]))
-    #     n = tf.squeeze(n, axis=-1)
-        
-    #     return f0, n
+        # Projection heads (Conv1D with kernel_size=1). Expect input channel-first -> transpose.
+        self.F0_proj = tf.keras.layers.Conv1D(1, 1, padding='same', name='F0_proj')  # NOTE: weight layout differs from PyTorch Conv1d
+        self.N_proj = tf.keras.layers.Conv1D(1, 1, padding='same', name='N_proj')    # NOTE: same mismatch
+
+    def _channel_first_conv1x1(self, x, conv_layer):
+        """Apply a Conv1D layer to channel-first tensor x: [B,C,T]."""
+        x_perm = tf.transpose(x, [0, 2, 1])  # -> [B,T,C]
+        x_perm = conv_layer(x_perm)
+        return tf.transpose(x_perm, [0, 2, 1])  # -> [B,C,T]
+
+    def call(self, texts, style, text_lengths, alignment, m, training=False):  # replaces forward
+        """Compute duration predictions & encoded features.
+
+        Args:
+            texts: Tensor (implementation-dependent) passed to text_encoder (expected [B,C,T] or similar).
+            style: [B, style_dim]
+            text_lengths: Not used (variable length handling omitted)  # NOTE: pack_padded_sequence removed
+            alignment: [B, T_text, T_aln] (matrix)  # NOTE: shape assumption; verify
+            m: mask tensor used for padding (unused currently)  # NOTE: mask handling differs vs PyTorch
+        Returns:
+            duration_pred: [B, T, max_dur]
+            en: encoded features after alignment multiplication.
+        """
+        d = self.text_encoder(texts, style, training=training)  # NOTE: variable length handling lost
+
+        # BiLSTM over duration features (expects [B,T,C])
+        # if tf.rank(d) == 3 and tf.shape(d)[1] != self.d_hid:  # heuristic check
+        #     x = d
+        # else:
+        #     x = d  # NOTE: shape assumptions; may differ from original
+        x = self.lstm(d, training=training)
+        x = self.dropout(x, training=training)
+        duration = self.duration_proj(x)  # [B,T,max_dur]
+
+        # Alignment energy computation: PyTorch used d.transpose(-1,-2) @ alignment
+        # We assume d: [B,T,C] -> transpose -> [B,C,T]; alignment: [B,T,T_aln] -> need [B,T,C]? Potential mismatch.
+        d_t = tf.transpose(d, [0, 2, 1])  # [B,C,T]
+        en = tf.matmul(d_t, alignment)  # NOTE: requires alignment shape [B,T,C] originally; verify dimension order
+
+        return duration, en  # NOTE: squeeze omitted (shape mismatch potential)
+
+    def f0n_train(self, x, s, training=False):  # replaces F0Ntrain
+        """Predict F0 & noise components.
+
+        Args:
+            x: [B,C,T] (channel-first features)
+            s: [B, style_dim]
+        Returns:
+            F0: [B,T] (after squeeze)
+            N:  [B,T]
+        """
+        # Shared BiLSTM expects [B,T,C]; we transpose from [B,C,T].
+        x_perm = tf.transpose(x, [0, 2, 1])  # [B,T,C]
+        shared_out = self.shared_bilstm(x_perm, training=training)  # [B,T,d_hid]
+        print(f"F0NTrain: {x.shape=} {s.shape=} {x_perm.shape=} {shared_out.shape=}")
+        shared_cf = tf.transpose(shared_out, [0, 2, 1])            # [B,d_hid,T]
+
+        # F0 branch
+        F0_feat = shared_cf
+        for blk in self.F0_blocks:
+            F0_feat = blk(F0_feat, s, training=training)
+        F0_feat = self._channel_first_conv1x1(F0_feat, self.F0_proj)
+
+        # Noise branch
+        N_feat = shared_cf
+        for blk in self.N_blocks:
+            N_feat = blk(N_feat, s, training=training)
+        N_feat = self._channel_first_conv1x1(N_feat, self.N_proj)
+
+        # Remove channel dim if it equals 1
+        F0_out = tf.squeeze(F0_feat, axis=1) if tf.shape(F0_feat)[1] == 1 else F0_feat
+        N_out = tf.squeeze(N_feat, axis=1) if tf.shape(N_feat)[1] == 1 else N_feat
+        return F0_out, N_out
 
     def get_config(self):
         config = super().get_config()
         config.update({
             'style_dim': self.style_dim,
             'd_hid': self.d_hid,
-            'max_dur': self.max_dur
+            'max_dur': self.max_dur,
+            'nlayers': self.nlayers,
+            'dropout_rate': self.dropout_rate
         })
         return config
 

@@ -146,12 +146,12 @@ class KModelTF(tf.keras.Model):
         
         x = self.predictor.lstm(d, training=training)
         duration = self.predictor.duration_proj(x)
-
+        print(f"-- 1 -- {duration=}")
         # Duration processing - Note: TensorFlow operations vs PyTorch
         duration = tf.nn.sigmoid(duration)
         speed = tf.cast(speed, dtype=duration.dtype)
-        print(f"{speed.dtype=} {duration.dtype=}")
         duration = tf.reduce_sum(duration, axis=-1) / speed
+        print(f"-- 2 -- {duration=}")
         pred_dur = tf.round(duration)
         pred_dur = tf.maximum(pred_dur, 1.0)  # Clamp minimum to 1
         pred_dur = tf.cast(pred_dur, tf.int32)
@@ -163,17 +163,18 @@ class KModelTF(tf.keras.Model):
         # en = torch.index_select(input_tensor, 2, expanded_indices)
         
         boundaries = tf.math.cumsum(pred_dur, axis=0)
+        print(f"{boundaries=}")
         values = tf.range(boundaries[-1], dtype=tf.int32)
         expanded_indices = tf.reduce_sum(
             tf.cast(tf.expand_dims(boundaries, axis=1) <= tf.expand_dims(values, axis=0), tf.int32),
             axis=0
         )
         en = tf.gather(input_tensor, expanded_indices, axis=2)
-        
+        print(f"---{boundaries.shape=} {values.shape=} en: {en.shape=} {expanded_indices.shape=}")
         # F0 and N prediction
         F0_pred, N_pred = self.predictor.f0n_train(en, s, training=training)
-        
         return bert_dur, d_en, d, x, expanded_indices, en
+        
         
         # # Text encoder processing
         # t_en = self.text_encoder(input_ids, input_lengths, text_mask, training=training)

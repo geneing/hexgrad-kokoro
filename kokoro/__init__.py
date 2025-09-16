@@ -9,7 +9,7 @@ from .modules import (
     LinearNorm, LayerNorm, AdaLayerNorm, DurationEncoder
 )
 from .istftnet import (
-    Decoder, Generator, AdaINResBlock1, AdaIN1d, 
+    Decoder, Generator, AdaIN1d, 
     AdainResBlk1d, SineGen, SourceModuleHnNSF
 )
 from .custom_stft import CustomSTFT, TorchSTFTTF
@@ -23,7 +23,6 @@ __all__ = [
     #'TextEncoder',
     'Decoder',
     'Generator',
-    'AdaINResBlock1',
     'AdaIN1d',
     'AdainResBlk1d',
     'SineGen',

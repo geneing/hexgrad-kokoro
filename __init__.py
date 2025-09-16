@@ -20,7 +20,7 @@ from .kokoro import (
     KModelTF, KModelForONNXTF, KPipelineTF,
     CustomAlbert, ProsodyPredictor, #TextEncoder, 
     LinearNorm, LayerNorm, AdaLayerNorm, DurationEncoder,
-    Decoder, Generator, AdaINResBlock1, AdaIN1d, 
+    Decoder, Generator, AdaIN1d, 
     AdainResBlk1d, SineGen, SourceModuleHnNSF,
     CustomSTFT, TorchSTFTTF
 )

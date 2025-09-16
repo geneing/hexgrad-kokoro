@@ -2,11 +2,8 @@
 TensorFlow Keras implementation of iSTFTNet decoder and related components.
 Converted from PyTorch implementation with noted conversion issues.
 """
-
-import tensorflow as tf
-import numpy as np
-import math
 from typing import Optional, List
+import tensorflow as tf
 
 
 def get_padding(kernel_size: int, dilation: int = 1) -> int:
@@ -21,10 +18,9 @@ class AdaIN1d(tf.keras.layers.Layer):
         super(AdaIN1d, self).__init__(**kwargs)
         self.style_dim = style_dim
         self.num_features = num_features
-        
-        # Note: TensorFlow doesn't have exact equivalent of PyTorch InstanceNorm1d
-        # Using LayerNormalization as approximation - this is a conversion issue
-        self.norm = tf.keras.layers.LayerNormalization(epsilon=1e-5)
+        # NOTE: Using LayerNormalization over last axis; PyTorch InstanceNorm1d normalizes per-channel across time.
+        # This is a known mismatch and may change output distribution.
+        self.norm = tf.keras.layers.LayerNormalization(epsilon=1e-5, axis=1)
         self.fc = tf.keras.layers.Dense(num_features * 2)
 
     def call(self, x, s):
@@ -48,100 +44,81 @@ class AdaIN1d(tf.keras.layers.Layer):
         return config
 
 
-class AdaINResBlock1(tf.keras.layers.Layer):
-    """Adaptive Instance Normalization Residual Block for 1D convolutions."""
-    
-    def __init__(self, channels: int, kernel_size: int = 3, 
-                 dilation: tuple = (1, 3, 5), style_dim: int = 64, **kwargs):
-        super(AdaINResBlock1, self).__init__(**kwargs)
-        self.channels = channels
-        self.kernel_size = kernel_size
-        self.dilation = dilation
+class AdainResBlk1d(tf.keras.layers.Layer):
+    """TensorFlow/Keras version of AdainResBlk1d.
+
+    Differences / potential mismatches vs PyTorch:
+    - Uses UpSampling1D + Conv1D instead of ConvTranspose1d depthwise for pooling/upsample.
+    - Normalization uses AdaIN1d above (LayerNorm-based) instead of InstanceNorm1d.
+    - Channel ordering conversions performed (PyTorch conv expects [B,C,T], Keras Conv1D expects [B,T,C]).
+    - Dropout placement approximate; may not exactly match training-time semantics.
+    - Scaling by 1/sqrt(2) implemented via tf.math.rsqrt(tf.constant(2.0)).
+    """
+    def __init__(self, dim_in, dim_out, style_dim=64, actv=None, upsample='none', dropout_p=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.dim_in = dim_in
+        self.dim_out = dim_out
         self.style_dim = style_dim
-        
-        # First set of convolutions
-        self.convs1 = []
-        for d in dilation:
-            # Note: TensorFlow Conv1D handles dilation differently than PyTorch
-            # This might be a conversion issue for exact behavior matching
-            conv = tf.keras.layers.Conv1D(
-                filters=channels,
-                kernel_size=kernel_size,
-                dilation_rate=d,
-                padding='same',
-                use_bias=True,
-                kernel_initializer='glorot_uniform'  # Approximate xavier_uniform
-            )
-            self.convs1.append(conv)
-        
-        # Second set of convolutions  
-        self.convs2 = []
-        for _ in dilation:
-            conv = tf.keras.layers.Conv1D(
-                filters=channels,
-                kernel_size=kernel_size,
-                dilation_rate=1,
-                padding='same',
-                use_bias=True,
-                kernel_initializer='glorot_uniform'
-            )
-            self.convs2.append(conv)
-        
-        # Adaptive normalization layers
-        self.adain1 = [AdaIN1d(style_dim, channels) for _ in dilation]
-        self.adain2 = [AdaIN1d(style_dim, channels) for _ in dilation]
-        
-        # Alpha parameters for Snake activation - Note: different from PyTorch implementation
-        self.alpha1 = []
-        self.alpha2 = []
-        for _ in dilation:
-            alpha1 = self.add_weight(
-                name=f'alpha1_{len(self.alpha1)}',
-                shape=(1, channels, 1),
-                initializer='ones',
-                trainable=True
-            )
-            alpha2 = self.add_weight(
-                name=f'alpha2_{len(self.alpha2)}', 
-                shape=(1, channels, 1),
-                initializer='ones',
-                trainable=True
-            )
-            self.alpha1.append(alpha1)
-            self.alpha2.append(alpha2)
+        self.upsample_type = upsample
+        self.learned_sc = dim_in != dim_out
+        self.actv = actv or tf.keras.layers.LeakyReLU(0.2)
+        # Upsample: approximate replacement for ConvTranspose1d depthwise + weight_norm
+        if self.upsample_type != 'none':
+            self.upsample = tf.keras.layers.UpSampling1D(size=2)  # NOTE: Nearest-neighbor; differs from transposed conv
+        else:
+            self.upsample = None
+        # Convolutions (channel-last internally)
+        self.conv1 = tf.keras.layers.Conv1D(dim_out, 3, padding='same')  # NOTE: no weight_norm
+        self.conv2 = tf.keras.layers.Conv1D(dim_out, 3, padding='same')  # NOTE: no weight_norm
+        if self.learned_sc:
+            self.conv1x1 = tf.keras.layers.Conv1D(dim_out, 1, padding='same', use_bias=False)  # NOTE: weight_norm omitted
+        else:
+            self.conv1x1 = None
+        self.norm1 = AdaIN1d(style_dim, dim_in)
+        self.norm2 = AdaIN1d(style_dim, dim_out)
+        self.dropout = tf.keras.layers.Dropout(dropout_p)
 
-    def call(self, x, s, training=None):
-        # x: [batch, time, channels] or [batch, channels, time]
-        # s: [batch, style_dim]
-        
-        for c1, c2, n1, n2, a1, a2 in zip(
-            self.convs1, self.convs2, self.adain1, self.adain2, self.alpha1, self.alpha2
-        ):
-            # First path
-            xt = n1(x, s)
-            # Snake activation - Note: Implementation differs from PyTorch
-            xt = xt + (1 / a1) * (tf.sin(a1 * xt) ** 2)
-            xt = c1(xt, training=training)
-            
-            # Second path
-            xt = n2(xt, s)
-            xt = xt + (1 / a2) * (tf.sin(a2 * xt) ** 2)
-            xt = c2(xt, training=training)
-            
-            # Residual connection
-            x = xt + x
-            
-        return x
+    def _apply_conv(self, x, conv, training=False):
+        # x: [B, C, T] -> transpose -> conv -> transpose back
+        x_perm = tf.transpose(x, [0, 2, 1])  # [B, T, C]
+        x_perm = conv(x_perm, training=training)
+        return tf.transpose(x_perm, [0, 2, 1])
 
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            'channels': self.channels,
-            'kernel_size': self.kernel_size,
-            'dilation': self.dilation,
-            'style_dim': self.style_dim
-        })
-        return config
+    def _shortcut(self, x, training=False):
+        y = x
+        if self.upsample is not None:
+            # Upsample along time dimension (channel-first -> channel-last -> upsample -> back)
+            y_perm = tf.transpose(y, [0, 2, 1])
+            y_perm = self.upsample(y_perm)
+            y = tf.transpose(y_perm, [0, 2, 1])
+        if self.learned_sc:
+            y_perm = tf.transpose(y, [0, 2, 1])
+            y_perm = self.conv1x1(y_perm, training=training)
+            y = tf.transpose(y_perm, [0, 2, 1])
+        return y
+
+    def _residual(self, x, s, training=False):
+        h = self.norm1(x, s)  # NOTE: normalization semantics differ from PyTorch InstanceNorm1d
+        h = self.actv(h)
+        if self.upsample is not None:
+            # PyTorch used depthwise ConvTranspose1d after activation; approximated with UpSampling1D
+            h_perm = tf.transpose(h, [0, 2, 1])
+            h_perm = self.upsample(h_perm)
+            h = tf.transpose(h_perm, [0, 2, 1])
+        # Conv1
+        h = self._apply_conv(self.dropout(h, training=training), self.conv1, training=training)
+        h = self.norm2(h, s)  # NOTE: second AdaIN; semantics mismatch possible
+        h = self.actv(h)
+        # Conv2
+        h = self._apply_conv(self.dropout(h, training=training), self.conv2, training=training)
+        return h
+
+    def call(self, x, s, training=False):
+        out = self._residual(x, s, training=training)
+        sc = self._shortcut(x, training=training)
+        # Scale by 1/sqrt(2) for residual variance preservation
+        out = (out + sc) * tf.math.rsqrt(tf.constant(2.0, dtype=out.dtype))
+        return out
 
 
 class CustomSTFTTF(tf.keras.layers.Layer):
@@ -504,6 +481,28 @@ class Generator(tf.keras.layers.Layer):
         })
         return config
 
+class UpSample1d(tf.keras.layers.Layer):
+    """
+    TensorFlow/Keras equivalent of PyTorch UpSample1d.
+
+    PyTorch behavior:
+        If layer_type != 'none': F.interpolate(x, scale_factor=2, mode='nearest') on [B,C,T].
+
+    Notes / possible mismatches:
+    - Uses tf.repeat along the time axis (last dim) to emulate nearest-neighbor.
+    - Keeps channel-first layout [B,C,T] (avoids transpose cost).
+    - If upstream code switches to channel-last, add transpose externally.
+    - No align_corners flag (not applicable for nearest).
+    """
+    def __init__(self, layer_type: str, **kwargs):
+        super().__init__(**kwargs)
+        self.layer_type = layer_type
+
+    def call(self, x: tf.Tensor, training=False):
+        if self.layer_type == 'none':
+            return x
+        return tf.repeat(x, repeats=2, axis=-1)  # NOTE: Nearest-neighbor emulation; shape [B,C,2*T]
+
 
 class AdainResBlk1d(tf.keras.layers.Layer):
     """Adaptive Instance Normalization Residual Block with upsampling."""
@@ -525,11 +524,11 @@ class AdainResBlk1d(tf.keras.layers.Layer):
             self.actv = tf.keras.layers.Activation(actv)
         
         # Upsampling
+        self.upsample = UpSample1d(upsample)
+        
         if upsample == 'none':
-            self.upsample = tf.keras.layers.Lambda(lambda x: x)
             self.pool = tf.keras.layers.Lambda(lambda x: x)
         else:
-            self.upsample = tf.keras.layers.UpSampling1D(size=2)
             # Note: TensorFlow doesn't have exact equivalent of PyTorch ConvTranspose1d with groups
             # This is a conversion issue
             self.pool = tf.keras.layers.Conv1DTranspose(
@@ -537,18 +536,19 @@ class AdainResBlk1d(tf.keras.layers.Layer):
                 kernel_size=3,
                 strides=2,
                 padding='same',
+                data_format="channels_first",
                 use_bias=True
             )
         
         # Build main layers
-        self.conv1 = tf.keras.layers.Conv1D(dim_out, 3, padding='same')
-        self.conv2 = tf.keras.layers.Conv1D(dim_out, 3, padding='same')
+        self.conv1 = tf.keras.layers.Conv1D(dim_out, 3, padding='same', data_format="channels_first")
+        self.conv2 = tf.keras.layers.Conv1D(dim_out, 3, padding='same', data_format="channels_first")
         self.norm1 = AdaIN1d(style_dim, dim_in)
         self.norm2 = AdaIN1d(style_dim, dim_out)
         self.dropout = tf.keras.layers.Dropout(dropout_p)
         
         if self.learned_sc:
-            self.conv1x1 = tf.keras.layers.Conv1D(dim_out, 1, use_bias=False)
+            self.conv1x1 = tf.keras.layers.Conv1D(dim_out, 1, use_bias=False, data_format="channels_first")
 
     def _shortcut(self, x):
         """Shortcut connection with optional learned projection."""
@@ -560,18 +560,26 @@ class AdainResBlk1d(tf.keras.layers.Layer):
     def _residual(self, x, s, training=None):
         """Residual path through the block."""
         x = self.norm1(x, s)
+        print(f"1: {x.shape=}")
         x = self.actv(x)
+        print(f"2: {x.shape=}")
         x = self.pool(x)
-        x = self.conv1(self.dropout(x, training=training))
+        print(f"3: {x.shape=}")
+        x = self.conv1(x)
+        print(f"4: {x.shape=}")
         x = self.norm2(x, s)
+        print(f"5: {x.shape=}")
         x = self.actv(x)
-        x = self.conv2(self.dropout(x, training=training))
+        print(f"6: {x.shape=}")
+        x = self.conv2(x)
+        print(f"7: {x.shape=}")
         return x
 
     def call(self, x, s, training=None):
         """Forward pass with shortcut and residual connections."""
         out = self._residual(x, s, training)
         shortcut = self._shortcut(x)
+        print(f"{x.shape=} {s.shape=} {out.shape=} {shortcut.shape=}")
         
         # Note: tf.rsqrt for normalization factor
         return (out + shortcut) * tf.math.rsqrt(2.0)
