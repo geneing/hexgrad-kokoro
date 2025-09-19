@@ -378,12 +378,16 @@ class ProsodyPredictor(tf.keras.layers.Layer):
         x_perm = tf.transpose(x, [0, 2, 1])  # [B,T,C]
         shared_out = self.shared_bilstm(x_perm, training=training)  # [B,T,d_hid]
         print(f"F0NTrain: {x.shape=} {s.shape=} {x_perm.shape=} {shared_out.shape=}")
+        print(f"tf: {shared_out[0,0:2,0:3]=}")
+        
         shared_cf = tf.transpose(shared_out, [0, 2, 1])            # [B,d_hid,T]
 
         # F0 branch
         F0_feat = shared_cf
-        for blk in self.F0_blocks:
+        for ii, blk in enumerate(self.F0_blocks):
             F0_feat = blk(F0_feat, s, training=training)
+            print(f"tf: {ii} {F0_feat[0,0:2,0:3]=}\n")
+            
         F0_feat = self._channel_first_conv1x1(F0_feat, self.F0_proj)
 
         # Noise branch

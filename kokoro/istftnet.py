@@ -18,19 +18,16 @@ class AdaIN1d(tf.keras.layers.Layer):
         super(AdaIN1d, self).__init__(**kwargs)
         self.style_dim = style_dim
         self.num_features = num_features
-        # NOTE: Using LayerNormalization over last axis; PyTorch InstanceNorm1d normalizes per-channel across time.
-        # This is a known mismatch and may change output distribution.
-        self.norm = tf.keras.layers.LayerNormalization(epsilon=1e-5, axis=1)
+        # Note: TensorFlow GroupNormalization with groups=-1 approximates InstanceNorm1d
+        self.norm = tf.keras.layers.GroupNormalization(groups=-1, axis=1, center=True, scale=True, epsilon=1e-5)
         self.fc = tf.keras.layers.Dense(num_features * 2)
 
     def call(self, x, s):
         # x: [batch, channels, time] or [batch, time, channels]
         # s: [batch, style_dim]
-        
-        h = self.fc(s)  # [batch, num_features*2]
+        h = self.fc(s)  # [batch, num_features*2]        
         h = tf.expand_dims(h, axis=-1)  # [batch, num_features*2, 1]
         gamma, beta = tf.split(h, 2, axis=1)  # Each: [batch, num_features, 1]
-        
         # Apply normalization - Note: different from PyTorch InstanceNorm1d
         normalized = self.norm(x)
         return (1 + gamma) * normalized + beta
@@ -537,6 +534,7 @@ class AdainResBlk1d(tf.keras.layers.Layer):
                 strides=2,
                 padding='same',
                 data_format="channels_first",
+                groups=dim_in,
                 use_bias=True
             )
         
@@ -560,24 +558,20 @@ class AdainResBlk1d(tf.keras.layers.Layer):
     def _residual(self, x, s, training=None):
         """Residual path through the block."""
         x = self.norm1(x, s)
-        print(f"1: {x.shape=}")
+        print(f"tf: norm1:{x[0,0:2,0:3]=}")
         x = self.actv(x)
-        print(f"2: {x.shape=}")
         x = self.pool(x)
-        print(f"3: {x.shape=}")
+        print(f"tf: pool:{x[0,0:2,0:3]=} {self.pool=}")
         x = self.conv1(x)
-        print(f"4: {x.shape=}")
         x = self.norm2(x, s)
-        print(f"5: {x.shape=}")
         x = self.actv(x)
-        print(f"6: {x.shape=}")
         x = self.conv2(x)
-        print(f"7: {x.shape=}")
         return x
 
     def call(self, x, s, training=None):
         """Forward pass with shortcut and residual connections."""
         out = self._residual(x, s, training)
+        print(f"tf: {out[0,0:2,0:3]=}")
         shortcut = self._shortcut(x)
         print(f"{x.shape=} {s.shape=} {out.shape=} {shortcut.shape=}")
         
