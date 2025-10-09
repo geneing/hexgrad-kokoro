@@ -3,6 +3,10 @@ TensorFlow Keras implementation of iSTFTNet decoder and related components.
 Converted from PyTorch implementation with noted conversion issues.
 """
 from typing import Optional, List
+# from sympy import use
+from tarfile import data_filter
+from huggingface_hub import dataset_info
+import numpy as np
 import tensorflow as tf
 
 
@@ -500,6 +504,62 @@ class UpSample1d(tf.keras.layers.Layer):
             return x
         return tf.repeat(x, repeats=2, axis=-1)  # NOTE: Nearest-neighbor emulation; shape [B,C,2*T]
 
+import tensorflow as tf
+
+# TensorFlow Keras Conv1DTranspose equivalent
+class DepthwiseConv1DTranspose(tf.keras.layers.Layer):
+    def __init__(self, kernel_size, strides=1, padding="same", use_bias=True, **kwargs):
+        super().__init__(**kwargs)
+        self.kernel_size = kernel_size
+        self.strides = strides
+        self.padding = padding.upper()
+        self.use_bias = use_bias
+        
+    def build(self, input_shape):
+        input_shape = [input_shape[0], input_shape[2], input_shape[1]]  # [B, T, C]
+        channels = input_shape[-1]
+        self.kernel = self.add_weight(
+            name="kernel",
+            shape=(self.kernel_size, channels, channels),
+            initializer="zeros",
+            trainable=True,
+        )
+        if self.use_bias:
+            self.bias = self.add_weight(
+                name="bias",
+                shape=(channels,),
+                initializer="zeros",
+                trainable=True,
+            )
+        else:
+            self.bias = None
+        super().build(input_shape)
+        
+    def call(self, inputs_in):
+        inputs = tf.transpose(inputs_in, [0, 2, 1])  # [B, T, C]
+        inputs = tf.concat([inputs, tf.zeros_like(inputs[:, :1, :])], axis=1)      
+        batch = tf.shape(inputs)[0]
+        width = tf.shape(inputs)[1]
+        channels = tf.shape(inputs)[2]
+        output_width = width * self.strides
+        output_shape = tf.stack([batch, output_width, channels])
+        outputs = tf.nn.conv1d_transpose(
+            inputs,
+            self.kernel,
+            output_shape=output_shape,
+            strides=[1, self.strides, 1],
+            padding=self.padding,
+            data_format="NWC",
+        )
+        if self.use_bias:
+            outputs = tf.nn.bias_add(outputs, self.bias, data_format="NWC")
+        outputs = tf.transpose(outputs, [0, 2, 1])  # [B, C, T]
+        return outputs[:,:,1:-1]
+    
+    
+# Example: PyTorch ConvTranspose1d(in_ch, out_ch, k, s, padding, groups=in_ch)
+# becomes:
+# layer = ConvTranspose1dGrouped(out_channels=out_ch, kernel_size=k, strides=s, padding="same", groups=in_ch)
 
 class AdainResBlk1d(tf.keras.layers.Layer):
     """Adaptive Instance Normalization Residual Block with upsampling."""
@@ -528,13 +588,10 @@ class AdainResBlk1d(tf.keras.layers.Layer):
         else:
             # Note: TensorFlow doesn't have exact equivalent of PyTorch ConvTranspose1d with groups
             # This is a conversion issue
-            self.pool = tf.keras.layers.Conv1DTranspose(
-                filters=dim_in,
+            self.pool = DepthwiseConv1DTranspose(
                 kernel_size=3,
                 strides=2,
                 padding='same',
-                data_format="channels_first",
-                groups=dim_in,
                 use_bias=True
             )
         
@@ -558,8 +615,8 @@ class AdainResBlk1d(tf.keras.layers.Layer):
     def _residual(self, x, s, training=None):
         """Residual path through the block."""
         x = self.norm1(x, s)
-        print(f"tf: norm1:{x[0,0:2,0:3]=}")
         x = self.actv(x)
+        print(f"tf: actv:{x[0,0:2,0:3]=}")
         x = self.pool(x)
         print(f"tf: pool:{x[0,0:2,0:3]=} {self.pool=}")
         x = self.conv1(x)

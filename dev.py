@@ -1,9 +1,16 @@
+from multiprocessing import pool
 import os
+
+import keras
+from regex import E
+import torch
+
 os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices'
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 import sys
 import pickle
+import numpy as np
 import tensorflow as tf
 from kokoro_litert.kokoro import KModelTF
 from kokoro_torch.kokoro import KModel
@@ -89,7 +96,6 @@ def copy_weights_bert(model, kmodel_torch, dbg):
     # print(f"{v1-v2}")
     
 def convert_bilstm_weights(pytorch_bilstm, tensorflow_bilstm, hidden_size):
-    import numpy as np
     # Extract PyTorch weights
     pt_state_dict = pytorch_bilstm.state_dict()
 
@@ -165,7 +171,6 @@ def convert_adain(kmodel_torch_predictor, tf_predictor):
         - AdaIN / style modulation: if a PyTorch block exposes fc / style fc weights, we copy to
           similarly named Keras attributes when shapes are compatible.
     """
-    import numpy as np
 
     def copy_conv1d(pt_module, keras_conv):
         if pt_module is None or keras_conv is None:
@@ -189,22 +194,40 @@ def convert_adain(kmodel_torch_predictor, tf_predictor):
         if pt_module is None or keras_conv is None:
             return
         try:
-            w_torch = pt_module.weight.detach().numpy()  # (in,out,k)
-            b_torch = pt_module.bias.detach().numpy() if getattr(pt_module, 'bias', None) is not None else None
-            w_keras = np.transpose(w_torch, (2, 1, 0))   # -> (k,out,in)
+            w = pt_module.weight.detach().numpy()  # (in,out,k)
+            b = pt_module.bias.detach().numpy() if getattr(pt_module, 'bias', None) is not None else None
+            
+            dim_in = w.shape[0]           
+            depthwise_kernel = np.zeros((w.shape[2], dim_in, dim_in), dtype=np.float32)
+            print(f"{w.shape=}")
+            for c in range(dim_in):
+                depthwise_kernel[:, c, c] = w[c, 0, :].astype(np.float32)
+            keras_conv.set_weights([depthwise_kernel, b.astype(np.float32)])
+
+            print(f"[convert_adain] Copied ConvTranspose1d -> Conv1DTranspose weights {w.shape} -> {depthwise_kernel.shape}, {b.shape if b is not None else None}")
+        except Exception as e:
+            print(f"[convert_adain][WARN] convtranspose copy failed: {e}")
+            
+    def copy_dense(pt_module, keras_dense):
+        if pt_module is None or keras_dense is None:
+            return
+        try:
+            w_torch = pt_module.weight.detach().numpy()  # (out,in)
+            b_torch = pt_module.bias.detach().numpy() if pt_module.bias is not None else None
+            w_keras = w_torch.T  # -> (in,out)
             weights = [w_keras]
             if b_torch is not None:
                 weights.append(b_torch)
-            keras_conv.set_weights(weights)
-            print(f"[convert_adain] Copied ConvTranspose1d -> Conv1DTranspose weights {w_torch.shape} -> {w_keras.shape}")
+            keras_dense.set_weights(weights)
+            print(f"[convert_adain] Copied Linear -> Dense weights {w_torch.shape} -> {w_keras.shape}")
         except Exception as e:
-            print(f"[convert_adain][WARN] convtranspose copy failed: {e}")
+            print(f"[convert_adain][WARN] dense copy failed: {e}")
 
     def copy_adain(pt_block, tf_block, tag=""):
         if pt_block is None or tf_block is None:
             return
         # Conv layers (if present)
-        for name_pair in [("conv1", "conv1"), ("conv2", "conv2"), ("shortcut", "shortcut_conv")]:
+        for name_pair in [("conv1", "conv1"), ("conv2", "conv2")]:
             pt_name, tf_name = name_pair
             pt_sub = getattr(pt_block, pt_name, None)
             tf_sub = getattr(tf_block, tf_name, None)
@@ -213,8 +236,10 @@ def convert_adain(kmodel_torch_predictor, tf_predictor):
         # Pool (ConvTranspose1d) if present
         pt_pool = getattr(pt_block, 'pool', None)
         tf_pool = getattr(tf_block, 'pool', None)
-        if pt_pool is not None and tf_pool is not None and hasattr(pt_pool, 'weight') and hasattr(tf_pool, 'kernel'):
+        if pt_pool is not None and tf_pool is not None and hasattr(pt_pool, 'weight'):
             copy_convtranspose1d(pt_pool, tf_pool)
+            print(f"PoolCopy: {tf_pool=} \n{pt_pool=}")
+
         # Style / AdaIN fully-connected(s) at block top-level
         cand_pt = [n for n in ["fc", "style_fc", "style", "mod"] if hasattr(pt_block, n)]
         cand_tf = [n for n in ["fc", "style_fc", "style", "mod"] if hasattr(tf_block, n)]
@@ -338,7 +363,6 @@ def validate_adain(kmodel_torch_predictor, tf_predictor):
     Prints per-layer statistics (max abs diff, mean abs diff, relative max, relative mean)
     for conv1, conv2, shortcut (if any) and style FC layers, plus projection layers.
     """
-    import numpy as np
 
     def stats(name, w_pt, w_tf, already_aligned=False):
         try:
@@ -384,12 +408,9 @@ def validate_adain(kmodel_torch_predictor, tf_predictor):
                 w_pt = pt_pool.weight.detach().numpy()  # (in,out,k)
                 w_pt_cmp = np.transpose(w_pt, (2,1,0))  # -> (k,out,in)
                 w_tf = tf_pool.kernel.numpy()
-                if w_pt_cmp.shape == w_tf.shape:
-                    diff = w_pt_cmp - w_tf
-                    abs_diff = np.abs(diff)
-                    print(f"[validate_adain] {prefix}.pool: max_abs={abs_diff.max():.6g} mean_abs={abs_diff.mean():.6g}")
-                else:
-                    print(f"[validate_adain][SHAPE_MISMATCH] {prefix}.pool pt{w_pt_cmp.shape} tf{w_tf.shape}")
+                diff = w_pt_cmp - w_tf[:,0,:]
+                abs_diff = np.abs(diff)
+                print(f"[validate_adain] {prefix}.pool: max_abs={abs_diff.max():.6g} mean_abs={abs_diff.mean():.6g}")
             except Exception as e:
                 print(f"[validate_adain][WARN] pool stats failed {prefix}: {e}")
         # style FC candidates (top-level)
@@ -487,6 +508,22 @@ def plot_differences(tf, dbg, title):
     plt.savefig(f'{title}.png')
     plt.close()
 
+def plot_plot(tf, title):
+    import matplotlib.pyplot as plt
+    #use png rendering backend
+    plt.switch_backend('Agg')
+    plt.figure(figsize=(10, 6))
+    # bert_dur.numpy().T 
+    # dbg['bert_dur'].last_hidden_state.numpy()
+    plt.imshow(tf, aspect='auto', cmap='bwr')
+    plt.colorbar(label='value')
+    # plt.title('Difference between TensorFlow and PyTorch Outputs')
+    # plt.xlabel('Sequence Length')
+    # plt.ylabel('Hidden Size')
+    plt.savefig(f'{title}.png')
+    plt.close()
+
+
 
 config_file = 'checkpoints/config.json'
 checkpoint_path = 'checkpoints/kokoro-v1_0.pth'
@@ -505,10 +542,29 @@ inputs = {'input_ids': tf.convert_to_tensor(dbg['input_ids'].numpy()),
 #copying weights for bert encoder
 kmodel_torch = KModel(config=config_file, model=checkpoint_path, disable_complex=True)
 
+# ############################################
 output = model( input_ids=tf.convert_to_tensor(dbg['input_ids'].numpy()), 
                 ref_s=tf.convert_to_tensor(dbg['ref_s'].numpy()), 
                 speed=dbg['speed'])
 
+
+# AdainResBlk1d_upsampled = kmodel_torch.predictor.F0[1]
+# pool = AdainResBlk1d_upsampled.pool
+# print(f"{pool=}")
+# w, b = pool.weight.detach().numpy(), pool.bias.detach().numpy()
+# print(f"{w.shape=}, {b.shape=}")
+# print(f"{pool.in_channels=}, {pool.out_channels=}, {pool.kernel_size=}, {pool.stride=}, {pool.padding=}, {pool.output_padding=}, {pool.dilation=}, {pool.groups=}, {pool.bias is not None=}")
+
+# AdainResBlk1d_upsampled_tf = model.predictor.F0_blocks[1]
+# pool_tf = AdainResBlk1d_upsampled_tf.pool.conv
+# print(f"{pool_tf=}")
+# w_tf, b_tf = pool_tf.get_weights()
+# print(f"{w_tf.shape=}, {b_tf.shape=}")
+
+# w_transp = np.transpose(w, (2,1,0))
+# for i in range(w_tf.shape[1]):
+#     w_tf[:,i,:] = w_transp[:,i,:]
+# pool_tf.set_weights([w_tf, b])
 
 model.bert_encoder.set_weights([kmodel_torch.bert_encoder.weight.detach().numpy().T, kmodel_torch.bert_encoder.bias.detach().numpy()])
 
@@ -550,6 +606,53 @@ output = model( input_ids=tf.convert_to_tensor(dbg['input_ids'].numpy()),
                 ref_s=tf.convert_to_tensor(dbg['ref_s'].numpy()), 
                 speed=float(dbg['speed']))
 
+
+
+a = np.zeros([1, 512, 196], dtype=np.float32)
+# a[0,0,0]=1.0
+a=np.ones(a.shape, dtype=a.dtype)
+
+azero = np.zeros([1, 512, 196], dtype=np.float32)
+
+
+AdainResBlk1d_upsampled = kmodel_torch.predictor.F0[1]
+pool = AdainResBlk1d_upsampled.pool
+
+w, b = pool.weight.detach().numpy(), pool.bias.detach().numpy()
+
+pickle.dump((w, b, a, azero, pool(torch.tensor(a)), pool(torch.tensor(azero))), open('temp/pool_values.pkl', 'wb'))
+
+print(f"{w.shape=}, {b.shape=}")
+print(f"{pool.in_channels=}, {pool.out_channels=}, {pool.kernel_size=}, {pool.stride=}, {pool.padding=}, {pool.output_padding=}, {pool.dilation=}, {pool.groups=}, {pool.bias is not None=}")
+
+AdainResBlk1d_upsampled_tf = model.predictor.F0_blocks[1]
+pool_tf = AdainResBlk1d_upsampled_tf.pool
+print(f"{pool_tf=}")
+w_tf, b_tf = pool_tf.get_weights()
+print(f"{w_tf.shape=}, {b_tf.shape=}")
+
+print(f"{b_tf[0:10]=}, {b[0:10]=}")
+print(f"{w_tf[0, 0, 0:3]=}, {w[0:3, 0, 0]=}")
+
+torch_x = pool(torch.tensor(a))-pool(torch.tensor(azero))
+tf_x = pool_tf(a)-pool_tf(azero)
+print(f"{torch_x.shape=}, {tf_x.shape=}")
+print(f"\n\n{torch_x[0,0:10,0]=}, \n\n{tf_x[0,0:10,0]=}")
+
+plot_plot(torch_x.detach().numpy()[0,:,:], 'torch_pool_output')
+plot_plot(tf_x[0,:,:], 'tf_pool_output')
+diff = np.abs(torch_x.detach().numpy()[0,:,:] - tf_x.numpy()[0,:,:])
+print(f"{diff.max()=}, {diff.min()=}, {diff.mean()=}")
+      
+# kmodel_torch.forward_with_tokens( dbg['input_ids'], dbg['ref_s'], dbg['speed'])
+
+# output = model( input_ids=tf.convert_to_tensor(dbg['input_ids'].numpy()), 
+#                 ref_s=tf.convert_to_tensor(dbg['ref_s'].numpy()), 
+#                 speed=float(dbg['speed']))
+
+
+
+
 # print(f"tf shape: {output[0].shape=} {dbg['bert_dur'].last_hidden_state.shape=}")
 # print(f"tf_data: {output[0][0,0,0:10].numpy().T=}")
 # print(f"torch_data: dbg['bert_dur'].last_hidden_state[0,0,0:10]={dbg['bert_dur'].last_hidden_state[0,0,0:10]}")
@@ -581,11 +684,12 @@ output = model( input_ids=tf.convert_to_tensor(dbg['input_ids'].numpy()),
 # print(f"{output[5].shape=} {output[5]=}")
 # print(f"{dbg['en'].shape=} {dbg['en']=}")
 
-print(f"{output[6].shape=} {output[6][0,0:10]=}")
-print(f"{dbg['F0_pred'].shape=} {dbg['F0_pred'][0,0:10]=}")
+#####
+# print(f"{output[6].shape=} {output[6][0,0:10]=}")
+# print(f"{dbg['F0_pred'].shape=} {dbg['F0_pred'][0,0:10]=}")
 
-print(f"{output[7].shape=} {output[7][0,0:10]=}")
-print(f"{dbg['N_pred'].shape=} {dbg['N_pred'][0,0:10]=}")
+# print(f"{output[7].shape=} {output[7][0,0:10]=}")
+# print(f"{dbg['N_pred'].shape=} {dbg['N_pred'][0,0:10]=}")
 
 
 # # output = model.predictor.text_encoder(tf.convert_to_tensor(dbg['d_en'].numpy()), tf.convert_to_tensor(dbg['s'].numpy()), training=False)
