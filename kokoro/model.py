@@ -162,7 +162,7 @@ class KModelTF(tf.keras.Model):
         
         boundaries = tf.math.cumsum(pred_dur, axis=0)
 
-        values = tf.range(boundaries[-1], dtype=tf.int32)
+        values = tf.range(boundaries[-1], dtype=tf.int32)        
         expanded_indices = tf.reduce_sum(
             tf.cast(tf.expand_dims(boundaries, axis=1) <= tf.expand_dims(values, axis=0), tf.int32),
             axis=0

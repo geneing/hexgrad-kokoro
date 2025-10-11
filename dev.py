@@ -227,7 +227,7 @@ def convert_adain(kmodel_torch_predictor, tf_predictor):
         if pt_block is None or tf_block is None:
             return
         # Conv layers (if present)
-        for name_pair in [("conv1", "conv1"), ("conv2", "conv2")]:
+        for name_pair in [("conv1", "conv1"), ("conv2", "conv2"), ("conv1x1", "conv1x1")]:
             pt_name, tf_name = name_pair
             pt_sub = getattr(pt_block, pt_name, None)
             tf_sub = getattr(tf_block, tf_name, None)
@@ -608,56 +608,56 @@ output = model( input_ids=tf.convert_to_tensor(dbg['input_ids'].numpy()),
 
 
 
-a = np.zeros([1, 512, 196], dtype=np.float32)
-# a[0,0,0]=1.0
-a=np.ones(a.shape, dtype=a.dtype)
+# a = np.zeros([1, 512, 196], dtype=np.float32)
+# # a[0,0,0]=1.0
+# a=np.ones(a.shape, dtype=a.dtype)
 
-azero = np.zeros([1, 512, 196], dtype=np.float32)
+# azero = np.zeros([1, 512, 196], dtype=np.float32)
 
 
-AdainResBlk1d_upsampled = kmodel_torch.predictor.F0[1]
-pool = AdainResBlk1d_upsampled.pool
+# AdainResBlk1d_upsampled = kmodel_torch.predictor.F0[1]
+# pool = AdainResBlk1d_upsampled.pool
 
-w, b = pool.weight.detach().numpy(), pool.bias.detach().numpy()
+# w, b = pool.weight.detach().numpy(), pool.bias.detach().numpy()
 
-pickle.dump((w, b, a, azero, pool(torch.tensor(a)), pool(torch.tensor(azero))), open('temp/pool_values.pkl', 'wb'))
+# pickle.dump((w, b, a, azero, pool(torch.tensor(a)), pool(torch.tensor(azero))), open('temp/pool_values.pkl', 'wb'))
 
-print(f"{w.shape=}, {b.shape=}")
-print(f"{pool.in_channels=}, {pool.out_channels=}, {pool.kernel_size=}, {pool.stride=}, {pool.padding=}, {pool.output_padding=}, {pool.dilation=}, {pool.groups=}, {pool.bias is not None=}")
+# print(f"{w.shape=}, {b.shape=}")
+# print(f"{pool.in_channels=}, {pool.out_channels=}, {pool.kernel_size=}, {pool.stride=}, {pool.padding=}, {pool.output_padding=}, {pool.dilation=}, {pool.groups=}, {pool.bias is not None=}")
 
-AdainResBlk1d_upsampled_tf = model.predictor.F0_blocks[1]
-pool_tf = AdainResBlk1d_upsampled_tf.pool
-print(f"{pool_tf=}")
-w_tf, b_tf = pool_tf.get_weights()
-print(f"{w_tf.shape=}, {b_tf.shape=}")
+# AdainResBlk1d_upsampled_tf = model.predictor.F0_blocks[1]
+# pool_tf = AdainResBlk1d_upsampled_tf.pool
+# print(f"{pool_tf=}")
+# w_tf, b_tf = pool_tf.get_weights()
+# print(f"{w_tf.shape=}, {b_tf.shape=}")
 
-print(f"{b_tf[0:10]=}, {b[0:10]=}")
-print(f"{w_tf[0, 0, 0:3]=}, {w[0:3, 0, 0]=}")
+# print(f"{b_tf[0:10]=}, {b[0:10]=}")
+# print(f"{w_tf[0, 0, 0:3]=}, {w[0:3, 0, 0]=}")
 
-torch_x = pool(torch.tensor(a))-pool(torch.tensor(azero))
-tf_x = pool_tf(a)-pool_tf(azero)
-print(f"{torch_x.shape=}, {tf_x.shape=}")
-print(f"\n\n{torch_x[0,0:10,0]=}, \n\n{tf_x[0,0:10,0]=}")
+# torch_x = pool(torch.tensor(a))-pool(torch.tensor(azero))
+# tf_x = pool_tf(a)-pool_tf(azero)
+# print(f"{torch_x.shape=}, {tf_x.shape=}")
+# print(f"\n\n{torch_x[0,0:10,0]=}, \n\n{tf_x[0,0:10,0]=}")
 
-plot_plot(torch_x.detach().numpy()[0,:,:], 'torch_pool_output')
-plot_plot(tf_x[0,:,:], 'tf_pool_output')
-diff = np.abs(torch_x.detach().numpy()[0,:,:] - tf_x.numpy()[0,:,:])
-print(f"{diff.max()=}, {diff.min()=}, {diff.mean()=}")
+# plot_plot(torch_x.detach().numpy()[0,:,:], 'torch_pool_output')
+# plot_plot(tf_x[0,:,:], 'tf_pool_output')
+# diff = np.abs(torch_x.detach().numpy()[0,:,:] - tf_x.numpy()[0,:,:])
+# print(f"{diff.max()=}, {diff.min()=}, {diff.mean()=}")
       
-# kmodel_torch.forward_with_tokens( dbg['input_ids'], dbg['ref_s'], dbg['speed'])
+kmodel_torch.forward_with_tokens( dbg['input_ids'], dbg['ref_s'], dbg['speed'])
 
-# output = model( input_ids=tf.convert_to_tensor(dbg['input_ids'].numpy()), 
-#                 ref_s=tf.convert_to_tensor(dbg['ref_s'].numpy()), 
-#                 speed=float(dbg['speed']))
-
-
+output = model( input_ids=tf.convert_to_tensor(dbg['input_ids'].numpy()), 
+                ref_s=tf.convert_to_tensor(dbg['ref_s'].numpy()), 
+                speed=float(dbg['speed']))
 
 
-# print(f"tf shape: {output[0].shape=} {dbg['bert_dur'].last_hidden_state.shape=}")
-# print(f"tf_data: {output[0][0,0,0:10].numpy().T=}")
-# print(f"torch_data: dbg['bert_dur'].last_hidden_state[0,0,0:10]={dbg['bert_dur'].last_hidden_state[0,0,0:10]}")
-# print(f"max diff: {abs(output[0].numpy().T - dbg['bert_dur'].last_hidden_state.numpy()).max()}")
-# plot_differences(output[0].numpy().T, dbg['bert_dur'].last_hidden_state.numpy(), 'bert_dur_diff_1')
+
+print(f"\n\n\n*************************************************************************************\n\n\n")
+print(f"tf shape: {output[0].shape=} {dbg['bert_dur'].last_hidden_state.shape=}")
+print(f"tf_data: {output[0][0,0,0:10].numpy().T=}")
+print(f"torch_data: dbg['bert_dur'].last_hidden_state[0,0,0:10]={dbg['bert_dur'].last_hidden_state[0,0,0:10]}")
+print(f"max diff: {abs(output[0].numpy().T - dbg['bert_dur'].last_hidden_state.numpy()).max()}")
+plot_differences(output[0].numpy().T, dbg['bert_dur'].last_hidden_state.numpy(), 'bert_dur_diff_1')
 
 # print(f"tf_data: {output[1][0,0,0:10]=}")
 # print(f"torch_data: {dbg['d_en'][0,0,0:10]=}")
@@ -674,7 +674,7 @@ print(f"{diff.max()=}, {diff.min()=}, {diff.mean()=}")
 # print(f"max diff: {abs(output[3].numpy() - dbg['x'].numpy()).max()}")
 # plot_differences(output[3].numpy(), dbg['x'].numpy(), 'x_diff')
 
-# print(f"tf_data: {output[4][0,0,0:10]=}")
+# print(f"tf_data: {output[4][0:10]=}")
 # print(f"torch_data: {dbg['duration'][0,0,0:10]=}")
 # print(f"max diff: {abs(output[4].numpy() - dbg['duration'].numpy()).max()}")
 # plot_differences(output[4].numpy(), dbg['duration'].numpy(), 'duration_diff')
@@ -685,11 +685,11 @@ print(f"{diff.max()=}, {diff.min()=}, {diff.mean()=}")
 # print(f"{dbg['en'].shape=} {dbg['en']=}")
 
 #####
-# print(f"{output[6].shape=} {output[6][0,0:10]=}")
-# print(f"{dbg['F0_pred'].shape=} {dbg['F0_pred'][0,0:10]=}")
+print(f"{output[6].shape=} {output[6][0,0:10]=}")
+print(f"{dbg['F0_pred'].shape=} {dbg['F0_pred'][0,0:10]=}")
 
-# print(f"{output[7].shape=} {output[7][0,0:10]=}")
-# print(f"{dbg['N_pred'].shape=} {dbg['N_pred'][0,0:10]=}")
+print(f"{output[7].shape=} {output[7][0,0:10]=}")
+print(f"{dbg['N_pred'].shape=} {dbg['N_pred'][0,0:10]=}")
 
 
 # # output = model.predictor.text_encoder(tf.convert_to_tensor(dbg['d_en'].numpy()), tf.convert_to_tensor(dbg['s'].numpy()), training=False)
