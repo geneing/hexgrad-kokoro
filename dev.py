@@ -138,7 +138,7 @@ def convert_bilstm_weights(pytorch_bilstm, tensorflow_bilstm, hidden_size):
     bwd_lstm_layer.set_weights([tf_weight_ih_bwd, tf_weight_hh_bwd, tf_bias_bwd])
 
 
-def convert_text_encoder(model, kmodel_torch):
+def convert_predictor_text_encoder(model, kmodel_torch):
     torch_layers = kmodel_torch.predictor.text_encoder.lstms #(d_en, s)
     tf_layers = model.predictor.text_encoder.lstms
     nlayers = kmodel_torch.predictor.text_encoder.nlayers
@@ -155,6 +155,40 @@ def convert_text_encoder(model, kmodel_torch):
         tf_layers.get_layer(index=2*i+1).fc.set_weights(model_weights)
         
         
+def convert_text_encoder(kmodel_torch, model_tf):
+    """Copy TextEncoder weights from PyTorch model to TensorFlow model."""
+
+    torch_encoder = kmodel_torch.text_encoder
+    tf_encoder = model_tf.text_encoder
+
+    # Embedding weights: PyTorch [n_symbols, channels] -> Keras identical layout.
+    embedding_weights = torch_encoder.embedding.weight.detach().numpy()
+    tf_encoder.embedding.set_weights([embedding_weights])
+
+    # CNN blocks: Conv1d (with weight_norm) + LayerNorm.
+    for idx, (torch_block, tf_block) in enumerate(zip(torch_encoder.cnn, tf_encoder.cnn_layers)):
+        torch_conv = torch_block[0]
+        tf_conv = tf_block.layers[0]
+
+        conv_weight = torch_conv.weight.detach().numpy()  # (out_channels, in_channels, kernel)
+        conv_bias = torch_conv.bias.detach().numpy() if torch_conv.bias is not None else None
+        conv_weight_tf = np.transpose(conv_weight, (2, 1, 0))  # -> (kernel, in_channels, out_channels)
+
+        if conv_bias is not None:
+            tf_conv.set_weights([conv_weight_tf, conv_bias])
+        else:
+            tf_conv.set_weights([conv_weight_tf])
+
+        # LayerNorm parameters
+        torch_ln = torch_block[1]
+        tf_ln = tf_block.layers[1]
+        tf_ln.gamma.assign(torch_ln.gamma.detach().numpy())
+        tf_ln.beta.assign(torch_ln.beta.detach().numpy())
+
+    # LSTM weights: reuse shared conversion helper.
+    hidden_size = torch_encoder.lstm.hidden_size
+    convert_bilstm_weights(torch_encoder.lstm, tf_encoder.lstm, hidden_size)
+
         
 def convert_adain(kmodel_torch_predictor, tf_predictor):
     """Convert / copy AdainResBlk1d weights (F0 / N branches + 1x1 projections).
@@ -202,7 +236,11 @@ def convert_adain(kmodel_torch_predictor, tf_predictor):
             print(f"{w.shape=}")
             for c in range(dim_in):
                 depthwise_kernel[:, c, c] = w[c, 0, :].astype(np.float32)
-            keras_conv.set_weights([depthwise_kernel, b.astype(np.float32)])
+            if b is None:
+                bias_tf = np.zeros((depthwise_kernel.shape[2],), dtype=np.float32)
+            else:
+                bias_tf = b.astype(np.float32)
+            keras_conv.set_weights([depthwise_kernel, bias_tf])
 
             print(f"[convert_adain] Copied ConvTranspose1d -> Conv1DTranspose weights {w.shape} -> {depthwise_kernel.shape}, {b.shape if b is not None else None}")
         except Exception as e:
@@ -355,6 +393,9 @@ def convert_adain(kmodel_torch_predictor, tf_predictor):
         print('[convert_adain][WARN] Missing N_proj on one side')
 
     print('[convert_adain] AdaIN weight conversion complete.')
+
+
+
 
 
 def validate_adain(kmodel_torch_predictor, tf_predictor):
@@ -587,7 +628,8 @@ model.bert_encoder.set_weights([kmodel_torch.bert_encoder.weight.detach().numpy(
 hidden_size = kmodel_torch.predictor.lstm.hidden_size
 
 copy_weights_bert(model=model, kmodel_torch=kmodel_torch, dbg=dbg)
-convert_text_encoder(model=model, kmodel_torch=kmodel_torch)
+convert_predictor_text_encoder(model=model, kmodel_torch=kmodel_torch)
+convert_text_encoder(kmodel_torch=kmodel_torch, model_tf=model)
 convert_bilstm_weights(kmodel_torch.predictor.lstm, model.predictor.lstm, hidden_size)
 model.predictor.duration_proj.set_weights([kmodel_torch.predictor.duration_proj.linear_layer.weight.detach().numpy().T, kmodel_torch.predictor.duration_proj.linear_layer.bias.detach().numpy()])
 
@@ -690,6 +732,12 @@ print(f"{dbg['F0_pred'].shape=} {dbg['F0_pred'][0,0:10]=}")
 
 print(f"{output[7].shape=} {output[7][0,0:10]=}")
 print(f"{dbg['N_pred'].shape=} {dbg['N_pred'][0,0:10]=}")
+
+print(f"{output[8].shape=} {output[8][0,0:10]=}")
+print(f"{dbg['t_en'].shape=} {dbg['t_en'][0,0:10]=}")
+
+print(f"{output[9].shape=} {output[9][0,0:10]=}")
+print(f"{dbg['asr'].shape=} {dbg['asr'][0,0:10]=}")
 
 
 # # output = model.predictor.text_encoder(tf.convert_to_tensor(dbg['d_en'].numpy()), tf.convert_to_tensor(dbg['s'].numpy()), training=False)

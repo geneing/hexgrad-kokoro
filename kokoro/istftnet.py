@@ -345,13 +345,13 @@ class Generator(tf.keras.layers.Layer):
         # Source module
         self.m_source = SourceModuleHnNSF(
             sampling_rate=24000,
-            upsample_scale=math.prod(upsample_rates) * gen_istft_hop_size,
+            upsample_scale=np.prod(upsample_rates) * gen_istft_hop_size,
             harmonic_num=8,
             voiced_threshod=10
         )
         
         # F0 upsampling - Note: TensorFlow UpSampling1D vs PyTorch Upsample difference
-        self.f0_upsample_factor = math.prod(upsample_rates) * gen_istft_hop_size
+        self.f0_upsample_factor = np.prod(upsample_rates) * gen_istft_hop_size
         
         # Upsampling layers
         self.ups = []

@@ -73,6 +73,7 @@ class LayerNorm(tf.keras.layers.Layer):
             shape=(self.channels,),
             initializer='zeros'
         )
+        self.layer_nrom = tf.keras.layers.LayerNormalization(epsilon=self.eps)
         super().build(input_shape)
 
     def call(self, x):
@@ -91,93 +92,78 @@ class LayerNorm(tf.keras.layers.Layer):
         return config
 
 
-# class TextEncoder(tf.keras.layers.Layer):
-#     """TensorFlow implementation of TextEncoder."""
+class TextEncoder(tf.keras.layers.Layer):
+    """TensorFlow implementation of TextEncoder."""
     
-#     def __init__(self, channels: int, kernel_size: int, depth: int, n_symbols: int, **kwargs):
-#         super(TextEncoder, self).__init__(**kwargs)
-#         self.channels = channels
-#         self.kernel_size = kernel_size
-#         self.depth = depth
-#         self.n_symbols = n_symbols
+    def __init__(self, channels: int, kernel_size: int, depth: int, n_symbols: int, **kwargs):
+        super(TextEncoder, self).__init__(**kwargs)
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.depth = depth
+        self.n_symbols = n_symbols
         
-#         self.embedding = tf.keras.layers.Embedding(n_symbols, channels)
+        self.embedding = tf.keras.layers.Embedding(n_symbols, channels)
         
-#         # CNN layers
-#         self.cnn_layers = []
-#         for _ in range(depth):
-#             cnn_block = tf.keras.Sequential([
-#                 # Note: TensorFlow Conv1D has different parameter order than PyTorch
-#                 # PyTorch: (in_channels, out_channels, kernel_size)
-#                 # TensorFlow: filters=out_channels, kernel_size, input_shape
-#                 tf.keras.layers.Conv1D(
-#                     filters=channels,
-#                     kernel_size=kernel_size,
-#                     padding='same',
-#                     # Note: Weight normalization not directly available in TF - potential conversion issue
-#                     use_bias=True
-#                 ),
-#                 LayerNorm(channels),
-#                 tf.keras.layers.LeakyReLU(0.2),
-#                 tf.keras.layers.Dropout(0.2),
-#             ])
-#             self.cnn_layers.append(cnn_block)
+        # CNN layers
+        self.cnn_layers = []
+        for _ in range(depth):
+            cnn_block = tf.keras.Sequential([
+                # Note: TensorFlow Conv1D has different parameter order than PyTorch
+                # PyTorch: (in_channels, out_channels, kernel_size)
+                # TensorFlow: filters=out_channels, kernel_size, input_shape
+                tf.keras.layers.Conv1D(
+                    filters=channels,
+                    kernel_size=kernel_size,
+                    padding='same',
+                    data_format="channels_first",
+                    # Note: Weight normalization not directly available in TF - potential conversion issue
+                    use_bias=True
+                ),
+                tf.keras.layers.LayerNormalization(epsilon=1e-5),
+                tf.keras.layers.LeakyReLU(0.2),
+                # tf.keras.layers.Dropout(0.2),
+            ])
+            self.cnn_layers.append(cnn_block)
         
-#         # LSTM layer - note different parameter handling
-#         self.lstm = tf.keras.layers.Bidirectional(
-#             tf.keras.layers.LSTM(channels // 2, return_sequences=True),
-#             merge_mode='concat'
-#         )
+        # LSTM layer - note different parameter handling
+        self.lstm = tf.keras.layers.Bidirectional(
+            tf.keras.layers.LSTM(channels // 2, return_sequences=True),
+            merge_mode='concat'
+        )
 
-#     def call(self, x, input_lengths, m, training=None):
-#         # x: [batch, seq_len] -> embedding -> [batch, seq_len, channels]
-#         x = self.embedding(x)
+    def call(self, x, training=None):
+        # x: [batch, seq_len] -> embedding -> [batch, seq_len, channels]
+        x = self.embedding(x)
         
-#         # Transpose to [batch, channels, seq_len] for Conv1D processing
-#         x = tf.transpose(x, [0, 2, 1])
+        # Transpose to [batch, channels, seq_len] for Conv1D processing
+        x = tf.transpose(x, [0, 2, 1])
         
-#         # Apply mask - TensorFlow handles broadcasting differently
-#         m = tf.expand_dims(m, axis=1)  # [batch, 1, seq_len]
-#         x = tf.where(m, 0.0, x)  # Note: TensorFlow mask logic may need adjustment
-        
-#         # Apply CNN layers
-#         for cnn_layer in self.cnn_layers:
-#             x = cnn_layer(x, training=training)
-#             x = tf.where(m, 0.0, x)
-        
-#         # Transpose back for LSTM: [batch, seq_len, channels]
-#         x = tf.transpose(x, [0, 2, 1])
-        
-#         # Note: TensorFlow LSTM doesn't have pack_padded_sequence equivalent
-#         # This could be a potential conversion issue for variable length sequences
-#         x = self.lstm(x, training=training)
-        
-#         # Transpose back to [batch, channels, seq_len]
-#         x = tf.transpose(x, [0, 2, 1])
-        
-#         # Pad to match mask size if needed
-#         current_length = tf.shape(x)[2]
-#         mask_length = tf.shape(m)[2]
-        
-#         def pad_tensor():
-#             pad_width = mask_length - current_length
-#             padding = tf.stack([[0, 0], [0, 0], [0, pad_width]])
-#             return tf.pad(x, padding)
-        
-#         x = tf.cond(current_length < mask_length, pad_tensor, lambda: x)
-#         x = tf.where(m, 0.0, x)
-        
-#         return x
+     
+        # Apply CNN layers
+        for cnn_layer in self.cnn_layers:
+            x = cnn_layer(x, training=training)
 
-#     def get_config(self):
-#         config = super().get_config()
-#         config.update({
-#             'channels': self.channels,
-#             'kernel_size': self.kernel_size,
-#             'depth': self.depth,
-#             'n_symbols': self.n_symbols
-#         })
-#         return config
+        
+        # Transpose back for LSTM: [batch, seq_len, channels]
+        x = tf.transpose(x, [0, 2, 1])
+        
+        # Note: TensorFlow LSTM doesn't have pack_padded_sequence equivalent
+        # This could be a potential conversion issue for variable length sequences
+        x = self.lstm(x, training=training)
+        
+        # Transpose back to [batch, channels, seq_len]
+        x = tf.transpose(x, [0, 2, 1])
+        return x
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'channels': self.channels,
+            'kernel_size': self.kernel_size,
+            'depth': self.depth,
+            'n_symbols': self.n_symbols
+        })
+        return config
 
 
 class AdaLayerNorm(tf.keras.layers.Layer):

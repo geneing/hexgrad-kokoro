@@ -6,10 +6,10 @@ Converted from PyTorch implementation with TFAlbert replacement.
 import tensorflow as tf
 from transformers import AlbertConfig
 
-from .modules import CustomAlbert, ProsodyPredictor
+from .modules import CustomAlbert, ProsodyPredictor, TextEncoder
 
 # from .modules import CustomTFAlbert, ProsodyPredictor
-# from .istftnet import Decoder
+from .istftnet import Decoder
 from typing import Dict, Optional, Union
 import json
 # import numpy as np
@@ -76,19 +76,19 @@ class KModelTF(tf.keras.Model):
         )
         
         # # Text encoder
-        # self.text_encoder = TextEncoder(
-        #     channels=config['hidden_dim'], 
-        #     kernel_size=config['text_encoder_kernel_size'],
-        #     depth=config['n_layer'], 
-        #     n_symbols=config['n_token']
-        # )
+        self.text_encoder = TextEncoder(
+            channels=config['hidden_dim'], 
+            kernel_size=config['text_encoder_kernel_size'],
+            depth=config['n_layer'], 
+            n_symbols=config['n_token']
+        )
         
         # # Decoder - this will need to be implemented in istftnet.py
         # self.decoder = Decoder(
         #     dim_in=config['hidden_dim'], 
         #     style_dim=config['style_dim'],
         #     dim_out=config['n_mels'], 
-        #     disable_complex=disable_complex, 
+        #     disable_complex=False, 
         #     **config['istftnet']
         # )
         
@@ -171,16 +171,17 @@ class KModelTF(tf.keras.Model):
 
         # F0 and N prediction
         F0_pred, N_pred = self.predictor.f0n_train(en, s, training=training)
-        return bert_dur, d_en, d, x, expanded_indices, en, F0_pred, N_pred
         
         
-        # # Text encoder processing
-        # t_en = self.text_encoder(input_ids, input_lengths, text_mask, training=training)
-        # asr = tf.matmul(t_en, pred_aln_trg)
+        # Text encoder processing
+        t_en = self.text_encoder(input_ids, training=training)
+        asr = tf.gather(t_en, expanded_indices, axis=2)
         
-        # # Audio generation through decoder
+        # # # Audio generation through decoder
         # audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128], training=training)
         # audio = tf.squeeze(audio)
+
+        return bert_dur, d_en, d, x, expanded_indices, en, F0_pred, N_pred, t_en, asr
         
         # return audio, pred_dur
 
