@@ -1,9 +1,11 @@
 from multiprocessing import pool
 import os
+import matplotlib.pyplot as plt
 
 import keras
 from regex import E
 import torch
+from torch.nn.utils import remove_weight_norm
 
 os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices'
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -170,20 +172,52 @@ def convert_text_encoder(kmodel_torch, model_tf):
         torch_conv = torch_block[0]
         tf_conv = tf_block.layers[0]
 
-        conv_weight = torch_conv.weight.detach().numpy()  # (out_channels, in_channels, kernel)
-        conv_bias = torch_conv.bias.detach().numpy() if torch_conv.bias is not None else None
+        torch_conv_r = remove_weight_norm(torch_conv)
+        conv_weight = torch_conv_r.weight.detach().numpy()  # (out_channels, in_channels, kernel)
+        conv_weight_f = torch_conv.weight.detach().numpy()  # (out_channels, in_channels, kernel)
+        conv_bias = torch_conv_r.bias.detach().numpy() 
         conv_weight_tf = np.transpose(conv_weight, (2, 1, 0))  # -> (kernel, in_channels, out_channels)
+        tf_conv.set_weights([conv_weight_tf, conv_bias])
 
-        if conv_bias is not None:
-            tf_conv.set_weights([conv_weight_tf, conv_bias])
-        else:
-            tf_conv.set_weights([conv_weight_tf])
-
+        # x = np.random.randn(1, 512, 78).astype(np.float32)
+        # x [0,10,10] = 1.
+        
+        # y_torch = torch_conv(torch.tensor(x)).detach().numpy()
+        # # x_tf = tf.convert_to_tensor(np.transpose(x, (2, 1, 0)))
+        # # y_tf = tf.transpose(tf_conv(x_tf, training=False), perm=[2, 1, 0]).numpy()
+        
+        # x_tf = tf.convert_to_tensor(x)
+        # y_tf = tf_conv(x_tf, training=False).numpy()
+        
+        # plt.switch_backend('Agg')
+        # plt.figure(figsize=(10, 6))
+        # plt.subplot(3,1,1)
+        # plt.imshow(y_torch[0,0:50,0:70], label='PyTorch Output');plt.colorbar()
+        # plt.subplot(3,1,2)
+        # plt.imshow(y_tf[0,0:50,0:70], label='TensorFlow Output');plt.colorbar()
+        # plt.subplot(3,1,3)
+        # plt.imshow(y_torch[0,0:50,0:70]-y_tf[0,0:50,0:70], label='Difference', cmap='bwr');plt.colorbar()  
+        # plt.legend()
+        # plt.savefig(f'conv1d.png')
+        # print(f"{y_torch.shape=} {y_tf.shape=}\n\n{y_torch[0,0:2,0:2]=}\n{y_tf[0,0:2,0:2]=}\n\n")
+        # print(f"Conv1D Block {idx}: max diff after conv: {np.abs(y_torch - y_tf).max()}")
+        # sys.exit(0)
+        
         # LayerNorm parameters
         torch_ln = torch_block[1]
         tf_ln = tf_block.layers[1]
-        tf_ln.gamma.assign(torch_ln.gamma.detach().numpy())
-        tf_ln.beta.assign(torch_ln.beta.detach().numpy())
+        
+        tf_ln.layer_norm.gamma.assign(torch_ln.gamma.detach().numpy())
+        tf_ln.layer_norm.beta.assign(torch_ln.beta.detach().numpy())
+        
+        # print(f"******** {torch_ln=} {torch_ln.beta[0:5]=}")
+        # print(f"******** {tf_ln=} {tf_ln.layer_norm.beta[0:5]=}")
+
+        # atorch = torch.ones([1,512,78])
+        # atf = tf.ones([1,512,78])
+        # atorch = torch_ln(atorch)
+        # atf = tf_ln(atf, training=False)
+        # print(f"After LN: {atorch[0,0:2,0:2]=} {atf[0,0:2,0:2]=}")
 
     # LSTM weights: reuse shared conversion helper.
     hidden_size = torch_encoder.lstm.hidden_size
@@ -733,11 +767,14 @@ print(f"{dbg['F0_pred'].shape=} {dbg['F0_pred'][0,0:10]=}")
 print(f"{output[7].shape=} {output[7][0,0:10]=}")
 print(f"{dbg['N_pred'].shape=} {dbg['N_pred'][0,0:10]=}")
 
-print(f"{output[8].shape=} {output[8][0,0:10]=}")
-print(f"{dbg['t_en'].shape=} {dbg['t_en'][0,0:10]=}")
+print(f"{output[8].shape=} {output[8][0,0:3,0:3]=}")
+print(f"{dbg['t_en'].shape=} {dbg['t_en'][0,0:3,0:3]=}")
 
-print(f"{output[9].shape=} {output[9][0,0:10]=}")
-print(f"{dbg['asr'].shape=} {dbg['asr'][0,0:10]=}")
+print(f"{output[9].shape=} {output[9][0,0:3,0:3]=}")
+print(f"{dbg['asr'].shape=} {dbg['asr'][0,0:3,0:3]=}")
+
+print(f"{output[10].shape=} {output[9][0,0:3]=}")
+print(f"{dbg['audio'].shape=} {dbg['audio'][0,0:3]=}")
 
 
 # # output = model.predictor.text_encoder(tf.convert_to_tensor(dbg['d_en'].numpy()), tf.convert_to_tensor(dbg['s'].numpy()), training=False)

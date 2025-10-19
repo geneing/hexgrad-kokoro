@@ -84,13 +84,13 @@ class KModelTF(tf.keras.Model):
         )
         
         # # Decoder - this will need to be implemented in istftnet.py
-        # self.decoder = Decoder(
-        #     dim_in=config['hidden_dim'], 
-        #     style_dim=config['style_dim'],
-        #     dim_out=config['n_mels'], 
-        #     disable_complex=False, 
-        #     **config['istftnet']
-        # )
+        self.decoder = Decoder(
+            dim_in=config['hidden_dim'], 
+            style_dim=config['style_dim'],
+            dim_out=config['n_mels'], 
+            disable_complex=False, 
+            **config['istftnet']
+        )
         
         # # Load pre-trained weights if available
         # # Note: Loading PyTorch weights into TensorFlow model is complex
@@ -178,10 +178,10 @@ class KModelTF(tf.keras.Model):
         asr = tf.gather(t_en, expanded_indices, axis=2)
         
         # # # Audio generation through decoder
-        # audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128], training=training)
-        # audio = tf.squeeze(audio)
+        audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128], training=training)
+        audio = tf.squeeze(audio)
 
-        return bert_dur, d_en, d, x, expanded_indices, en, F0_pred, N_pred, t_en, asr
+        return bert_dur, d_en, d, x, expanded_indices, en, F0_pred, N_pred, t_en, asr, audio
         
         # return audio, pred_dur
 

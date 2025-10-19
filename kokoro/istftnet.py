@@ -608,40 +608,26 @@ class AdainResBlk1d(tf.keras.layers.Layer):
     def _shortcut(self, x):
         """Shortcut connection with optional learned projection."""
         x = self.upsample(x)
-        # print(f"tf: upsample:{x[0,0:2,0:3]=} {self.upsample=}")
         if self.learned_sc:
             x = self.conv1x1(x)
-            # print(f"tf: conv1x1:{x[0,0:2,0:3]=}")
         return x
 
     def _residual(self, x, s, training=None):
         """Residual path through the block."""
-        if isinstance(self.pool, DepthwiseConv1DTranspose):
-            print("tf: using DepthwiseConv1DTranspose for upsample")    
         x = self.norm1(x, s)
         x = self.actv(x)
-        # print(f"tf: actv:{x[0,0:2,0:3]=}")
         x = self.pool(x)
-        # print(f"tf: pool:{x[0,0:2,0:3]=} {self.pool=}")
         x = self.conv1(x)
-        # print(f"tf: conv1:{x[0,0:2,0:3]=}")
         x = self.norm2(x, s)
-        # print(f"tf: norm2:{x[0,0:2,0:3]=}")
         x = self.actv(x)
-        # print(f"tf: actv2:{x[0,0:2,0:3]=}")
         x = self.conv2(x)
-        # print(f"tf: conv2:{x[0,0:2,0:3]=}")
         return x
 
     def call(self, x, s, training=None):
         """Forward pass with shortcut and residual connections."""
         out = self._residual(x, s, training)
-        print(f"tf: {out[0,0:2,0:3]=}")
         scut = self._shortcut(x)
-        # print(f"{x.shape=} {s.shape=} {out.shape=} {shortcut.shape=}")
-        print(f"tf: scut:{scut[0,0:2,0:3]=}")
         outp = (out + scut) * tf.math.rsqrt(2.0)
-        print(f"tf: outp:{outp[0,0:2,0:3]=}")
         return outp
 
     def get_config(self):

@@ -3,6 +3,7 @@ TensorFlow Keras implementation of Kokoro TTS modules.
 Converted from PyTorch implementation.
 """
 
+from genericpath import exists
 from regex import F
 import tensorflow as tf
 import tensorflow_models as tfm
@@ -61,25 +62,27 @@ class LayerNorm(tf.keras.layers.Layer):
         super(LayerNorm, self).__init__(**kwargs)
         self.channels = channels
         self.eps = eps
+        self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=self.eps)
         
-    def build(self, input_shape):
-        self.gamma = self.add_weight(
-            name='gamma',
-            shape=(self.channels,),
-            initializer='ones'
-        )
-        self.beta = self.add_weight(
-            name='beta',
-            shape=(self.channels,),
-            initializer='zeros'
-        )
-        self.layer_nrom = tf.keras.layers.LayerNormalization(epsilon=self.eps)
-        super().build(input_shape)
+    # def build(self, input_shape):
+    #     self.gamma = self.add_weight(
+    #         name='gamma',
+    #         shape=(self.channels,),
+    #         initializer='ones'
+    #     )
+    #     self.beta = self.add_weight(
+    #         name='beta',
+    #         shape=(self.channels,),
+    #         initializer='zeros'
+    #     )
+    #     self.layer_norm.build(input_shape)
+    #     super().build(input_shape)
 
     def call(self, x):
         # x shape: [batch, channels, time] -> transpose to [batch, time, channels]
         x = tf.transpose(x, [0, 2, 1])
-        x = tf.nn.layer_norm(x, [self.channels], self.gamma, self.beta, self.eps)
+        print(f"tf: LayerNorm input {x.shape=}")
+        x = self.layer_norm(x) #, [self.channels], self.gamma, self.beta, self.eps
         # Transpose back to [batch, channels, time]
         return tf.transpose(x, [0, 2, 1])
 
@@ -119,7 +122,7 @@ class TextEncoder(tf.keras.layers.Layer):
                     # Note: Weight normalization not directly available in TF - potential conversion issue
                     use_bias=True
                 ),
-                tf.keras.layers.LayerNormalization(epsilon=1e-5),
+                LayerNorm(channels=channels),
                 tf.keras.layers.LeakyReLU(0.2),
                 # tf.keras.layers.Dropout(0.2),
             ])
@@ -138,11 +141,15 @@ class TextEncoder(tf.keras.layers.Layer):
         # Transpose to [batch, channels, seq_len] for Conv1D processing
         x = tf.transpose(x, [0, 2, 1])
         
-     
         # Apply CNN layers
-        for cnn_layer in self.cnn_layers:
-            x = cnn_layer(x, training=training)
-
+        for i,cnn_layer in enumerate(self.cnn_layers):
+            print(f"tf: TextEncoder {i=} {x[0,0:2,0:2]=}")
+            for ii, l in enumerate(cnn_layer.layers):
+                print(f"tf: {l}")
+                print(f"tf:   -layer {ii=} {x.shape=} {x[0,0:2,0:2]=}")
+                x = l(x, training=training) #if hasattr(l, 'call') else l(x)
+                print(f"tf:   +layer {ii=} {l} {x[0,0:2,0:2]=}")
+            #x = cnn_layer(x, training=training)
         
         # Transpose back for LSTM: [batch, seq_len, channels]
         x = tf.transpose(x, [0, 2, 1])
@@ -363,8 +370,6 @@ class ProsodyPredictor(tf.keras.layers.Layer):
         # Shared BiLSTM expects [B,T,C]; we transpose from [B,C,T].
         x_perm = tf.transpose(x, [0, 2, 1])  # [B,T,C]
         shared_out = self.shared_bilstm(x_perm, training=training)  # [B,T,d_hid]
-        print(f"F0NTrain: {x.shape=} {s.shape=} {x_perm.shape=} {shared_out.shape=}")
-        print(f"tf: {shared_out[0,0:2,0:3]=}")
         
         shared_cf = tf.transpose(shared_out, [0, 2, 1])            # [B,d_hid,T]
 
@@ -372,7 +377,6 @@ class ProsodyPredictor(tf.keras.layers.Layer):
         F0_feat = shared_cf
         for ii, blk in enumerate(self.F0_blocks):
             F0_feat = blk(F0_feat, s, training=training)
-            print(f"tf: {ii} {F0_feat[0,0:2,0:3]=}\n")
             
         F0_feat = self._channel_first_conv1x1(F0_feat, self.F0_proj)
 
