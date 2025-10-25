@@ -535,23 +535,27 @@ class Generator(tf.keras.layers.Layer):
             win_length=gen_istft_n_fft
         )
 
-    def call(self, x, s, f0, training=None):
+    def call(self, x, s, f0, dbg, training=None):
         """Forward pass of generator."""
         # F0 processing
         f0_upsampled = self.f0_upsample(
             tf.expand_dims(f0, axis=-1)) # [B, T, 1]
-        print(f"tf 1: {f0_upsampled.shape=}  {self.f0_upsample_factor=}")
-        
+        dbg['f0_upsampled'] = f0_upsampled
+                
         # Generate harmonic source
         har_source, noi_source, uv = self.m_source(f0_upsampled)
-        print(f"tf 2: {har_source.shape=}, {noi_source.shape=}, {uv.shape=}")
+        dbg['har_source'] = har_source
+        dbg['noi_source'] = noi_source
+        dbg['uv'] = uv
+        
         har_source = tf.squeeze(tf.transpose(har_source, [0, 2, 1]), axis=1) 
-        print(f"tf 3: {har_source.shape=}")
+        
         # STFT of harmonic source
         har_spec, har_phase = self.stft(har_source)
-        print(f"tf 4: {har_spec.shape=}, {har_phase.shape=}")
+        dbg['har_spec'] = tf.transpose(har_spec, [0, 2, 1])
+        dbg['har_phase'] = tf.transpose(har_phase, [0, 2, 1])
+        
         har = tf.concat([har_spec, har_phase], axis=-1)
-        print(f"tf 5: {har.shape=}")
         
         # Upsampling and processing
         for i in range(self.num_upsamples):
@@ -559,20 +563,17 @@ class Generator(tf.keras.layers.Layer):
             
             # Process noise/harmonic source
             x_source = self.noise_convs[i](har, training=training)
-            print(f"tf noise conv {i}: {x_source.shape=} {s.shape=}")
+            dbg[f'noise_conv_{i}'] = tf.transpose(x_source, [0, 2, 1])
             x_source = self.noise_res[i](tf.transpose(x_source, [0, 2, 1]), s, training=training)
-            # x_source = tf.transpose(x_source, [0, 2, 1])
-            print(f"tf noise res {i}: {x_source.shape=}")
+            dbg[f'noise_res_{i}'] = x_source
             # Upsample
-            print(f"tf before upsample {i}: {x.shape=}")
             x = self.ups[i](x, training=training)
-            print(f"tf upsample {i}: {x.shape=}")
-            
+            dbg[f'upsample_{i}'] = x            
             # Reflection padding for last layer - Note: TensorFlow padding differs
             # if i == self.num_upsamples - 1:
             #     x = tf.pad(x, [[0, 0], [0, 0], [1, 0]], mode='REFLECT')
             #     print(f"tf reflection pad {i}: {x.shape=}")
-            print(f"tf before add {i}: {x.shape=} {x_source.shape=}")
+            
             x = x + x_source
             
             # Apply residual blocks
@@ -583,20 +584,20 @@ class Generator(tf.keras.layers.Layer):
                     xs = self.resblocks[block_idx](x, s, training=training)
                 else:
                     xs += self.resblocks[block_idx](x, s, training=training)
-            
+                dbg[f'resblock_{i}_{block_idx}'] = xs
             x = xs / self.num_kernels
         
         # Final processing
         x = tf.nn.leaky_relu(x)
-        print(f"tf before conv post: {x.shape=}")
+
         x = self.conv_post(x, training=training)
-        print(f"tf conv post: {x.shape=} {self.post_n_fft=}")
+        dbg['conv_post'] = x
         # Split into magnitude and phase
         spec = tf.transpose(tf.exp(x[:, :self.post_n_fft // 2 + 1, :]), [0, 2, 1])
         phase = tf.transpose(tf.sin(x[:, self.post_n_fft // 2 + 1:, :]), [0, 2, 1])
-        print(f"tf spec and phase: {spec.shape=}, {phase.shape=}")
-        
-        return self.stft.inverse(spec, phase)
+        dbg['spec'] = spec
+        dbg['phase'] = phase
+        return self.stft.inverse(spec, phase), dbg
 
     def get_config(self):
         config = super().get_config()
@@ -824,35 +825,38 @@ class Decoder(tf.keras.layers.Layer):
         )
 
     def call(self, asr, f0_curve, n, s, training=None):
+        dbg = {}
         """Forward pass of the decoder."""
         # Process F0 and N
         f0 = self.f0_conv(tf.expand_dims(f0_curve, axis=1), training=training)
         n_processed = self.n_conv(tf.expand_dims(n, axis=1), training=training)
-        print(f"++++++++ tf: {asr.shape=}, {f0_curve.shape=}, {n.shape=}, {s.shape=}\n{f0.shape=}, {n_processed.shape=}")
-       
+        dbg['F0'] = f0
+        dbg['N'] = n_processed
         # Initial encoding
         x = tf.concat([asr, f0, n_processed], axis=1)
         x = self.encode(x, s, training=training)
+        dbg['x_0'] = x
         
         # ASR residual
         asr_res = self.asr_res(asr, training=training)
-        
+        dbg['asr_res'] = asr_res 
+               
         # Decode through layers
         res = True
-        for block in self.decode:
+        for i, block in enumerate(self.decode):
             if res:
-                print(f"tf: Before cat: { x.shape=}, { asr_res.shape=}, { f0.shape=}, { n_processed.shape=}")
                 x = tf.concat([x, asr_res, f0, n_processed], axis=1)
-                print(f"tf: After cat: {x.shape=}")
             x = block(x, s, training=training)
-            print(f"tf: After block: {block=} {x.shape=} {s.shape=}")
+            dbg[f'x_{i+1}'] = x
             if block.upsample_type != "none":
                 res = False
         
         # Generate final audio
-        print(f"tf: Final generator: {x.shape=}, {s.shape=}, {f0_curve.shape=}")
-        x = self.generator(x, s, f0_curve, training=training)
-        print(f"tf: Generator output: {x.shape=}")
+        x, dbg = self.generator(x, s, f0_curve, dbg, training=training)
+        dbg['x_final'] = x
+        import pickle as pkl
+        with open("debug_decoder_tf.pkl", "wb") as f:
+            pkl.dump(dbg, f)
         return x
 
     def get_config(self):
