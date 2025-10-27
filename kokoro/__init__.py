@@ -12,7 +12,7 @@ from .istftnet import (
     Decoder, Generator, AdaIN1d, 
     AdainResBlk1d, SineGen, SourceModuleHnNSF
 )
-from .custom_stft import CustomSTFT, TorchSTFTTF
+from .custom_stft import CustomSTFT
 
 __all__ = [
     'KModelTF',

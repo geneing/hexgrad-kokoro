@@ -22,7 +22,7 @@ from .kokoro import (
     LinearNorm, LayerNorm, AdaLayerNorm, DurationEncoder,
     Decoder, Generator, AdaIN1d, 
     AdainResBlk1d, SineGen, SourceModuleHnNSF,
-    CustomSTFT, TorchSTFTTF
+    CustomSTFT
 )
 
 __version__ = "1.0.0-tf"

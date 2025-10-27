@@ -11,6 +11,7 @@ import math
 from regex import F
 from sympy import primefactors
 import tensorflow as tf
+from .custom_stft import CustomSTFT
 
 
 def get_padding(kernel_size: int, dilation: int = 1) -> int:
@@ -231,89 +232,6 @@ class AdainResBlk1d(tf.keras.layers.Layer):
         return out
 
 
-class CustomSTFTTF(tf.keras.layers.Layer):
-    """
-    TensorFlow implementation of custom STFT without complex operations.
-    Note: This is a simplified version - full conversion would require more work.
-    """
-    
-    def __init__(self, filter_length: int = 800, hop_length: int = 200,
-                 win_length: int = 800, window: str = "hann", **kwargs):
-        super(CustomSTFTTF, self).__init__(**kwargs)
-        self.filter_length = filter_length
-        self.hop_length = hop_length 
-        self.win_length = win_length
-        self.n_fft = filter_length
-        
-        assert window == 'hann', f"Only hann window supported, got {window}"
-        
-        # Create window - Note: TensorFlow doesn't have hann_window builtin
-        # This is a conversion issue
-        window_np = np.hanning(win_length).astype(np.float32)
-        if win_length < self.n_fft:
-            window_np = np.pad(window_np, (0, self.n_fft - win_length))
-        elif win_length > self.n_fft:
-            window_np = window_np[:self.n_fft]
-            
-        self.window = tf.constant(window_np)
-
-    def call(self, x):
-        """
-        Forward STFT transform.
-        Note: This is a placeholder implementation - full STFT requires more complex logic.
-        """
-        # Note: TensorFlow doesn't have direct equivalent of PyTorch STFT
-        # This would require implementing STFT from scratch or using tf.signal.stft
-        # This is a major conversion issue
-        
-        # Using tf.signal.stft as approximation
-        stft_result = tf.signal.stft(
-            x,
-            frame_length=self.win_length,
-            frame_step=self.hop_length,
-            fft_length=self.filter_length,
-            window_fn=tf.signal.hann_window, 
-            pad_end=True,
-            name='stft_transform'
-        )
-        
-        magnitude = tf.math.abs(stft_result)
-        phase = tf.math.angle(stft_result)
-        
-        return magnitude, phase
-
-    def inverse(self, magnitude, phase):
-        """
-        Inverse STFT transform.
-        Note: Placeholder implementation with conversion issues.
-        """
-        # Reconstruct complex spectrogram
-        phase_complex = tf.complex(tf.zeros_like(phase), phase)
-        magnitude_complex = tf.cast(magnitude, phase_complex.dtype)
-        complex_spec = magnitude_complex * tf.exp(phase_complex)
-        
-        # Inverse STFT
-        reconstructed = tf.signal.inverse_stft(
-            complex_spec,
-            frame_length=self.win_length,
-            frame_step=self.hop_length,
-            fft_length=self.filter_length,
-            window_fn=tf.signal.hann_window
-        )
-        
-        # Add dimension to match PyTorch implementation
-        return tf.expand_dims(reconstructed, axis=-2)
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            'filter_length': self.filter_length,
-            'hop_length': self.hop_length,
-            'win_length': self.win_length
-        })
-        return config
-
-
 class SineGen(tf.keras.layers.Layer):
     """Sine wave generator for neural vocoding."""
     
@@ -495,25 +413,31 @@ class Generator(tf.keras.layers.Layer):
         # Noise convolutions
         self.noise_convs = []
         self.noise_res = []
+        self.noise_conv_pads: list[int] = []
+        print(f"{upsample_rates=} {len(upsample_rates)=}")
         for i in range(len(upsample_rates)):
             c_cur = upsample_initial_channel // (2 ** (i + 1))
             if i + 1 < len(upsample_rates):
                 stride_f0 = math.prod(upsample_rates[i + 1:])
-                print(f"{stride_f0=}")
+                pad = (stride_f0 + 1) // 2
                 noise_conv = tf.keras.layers.Conv1D(
                     filters=c_cur,
                     kernel_size=stride_f0 * 2,
                     strides=stride_f0,
-                    padding='same'
+                    padding='valid',
+                    data_format='channels_first'
                 )
                 noise_res = AdaINResBlock1(c_cur, 7, (1, 3, 5), style_dim)
+                self.noise_conv_pads.append(pad)
             else:
                 noise_conv = tf.keras.layers.Conv1D(
                     filters=c_cur,
                     kernel_size=1,
-                    padding='same'
+                    padding='same', 
+                    data_format='channels_first'
                 )
                 noise_res = AdaINResBlock1(c_cur, 11, (1, 3, 5), style_dim)
+                self.noise_conv_pads.append(0)
             
             self.noise_convs.append(noise_conv)
             self.noise_res.append(noise_res)
@@ -529,7 +453,7 @@ class Generator(tf.keras.layers.Layer):
         )
         
         # STFT layer
-        self.stft = CustomSTFTTF(
+        self.stft = CustomSTFT(
             filter_length=gen_istft_n_fft,
             hop_length=gen_istft_hop_size,
             win_length=gen_istft_n_fft
@@ -549,30 +473,37 @@ class Generator(tf.keras.layers.Layer):
         dbg['uv'] = uv
         
         har_source = tf.squeeze(tf.transpose(har_source, [0, 2, 1]), axis=1) 
-        
+        print(f"++++++{har_source.shape=}")
         # STFT of harmonic source
-        har_spec, har_phase = self.stft(har_source)
-        dbg['har_spec'] = tf.transpose(har_spec, [0, 2, 1])
-        dbg['har_phase'] = tf.transpose(har_phase, [0, 2, 1])
-        
-        har = tf.concat([har_spec, har_phase], axis=-1)
+        har_spec, har_phase = self.stft.transform(har_source)
+        dbg['har_spec'] = har_spec[:,:,:-1]
+        dbg['har_phase'] = har_phase[:,:,:-1]
+        print(f"++++++{har_spec.shape=}")
+        har = tf.concat([har_spec, har_phase], axis=1)
         
         # Upsampling and processing
         for i in range(self.num_upsamples):
             x = tf.nn.leaky_relu(x, alpha=0.1)
             
             # Process noise/harmonic source
-            x_source = self.noise_convs[i](har, training=training)
-            dbg[f'noise_conv_{i}'] = tf.transpose(x_source, [0, 2, 1])
-            x_source = self.noise_res[i](tf.transpose(x_source, [0, 2, 1]), s, training=training)
+            pad = self.noise_conv_pads[i]
+            if pad:
+                har_input = tf.pad(har, [[0, 0], [0, 0], [pad, pad]])
+            else:
+                har_input = har
+            x_source = self.noise_convs[i](har_input, training=training)
+            print(f"++++++{i} {x_source.shape=} {har.shape=}")
+            dbg[f'noise_conv_{i}'] = x_source
+            x_source = self.noise_res[i](x_source, s, training=training)
+            print(f"++++++{i} after resblock {x_source.shape=}")
             dbg[f'noise_res_{i}'] = x_source
             # Upsample
             x = self.ups[i](x, training=training)
             dbg[f'upsample_{i}'] = x            
-            # Reflection padding for last layer - Note: TensorFlow padding differs
-            # if i == self.num_upsamples - 1:
-            #     x = tf.pad(x, [[0, 0], [0, 0], [1, 0]], mode='REFLECT')
-            #     print(f"tf reflection pad {i}: {x.shape=}")
+            # Reflection padding on final stage to mirror PyTorch behavior
+            if i == self.num_upsamples - 1:
+                x = tf.pad(x, [[0, 0], [0, 0], [1, 0]], mode='REFLECT')
+                print(f"tf reflection pad {i}: {x.shape=}")
             
             x = x + x_source
             
@@ -597,6 +528,7 @@ class Generator(tf.keras.layers.Layer):
         phase = tf.transpose(tf.sin(x[:, self.post_n_fft // 2 + 1:, :]), [0, 2, 1])
         dbg['spec'] = spec
         dbg['phase'] = phase
+        print(f"++++++{spec.shape=}, {phase.shape=}")
         return self.stft.inverse(spec, phase), dbg
 
     def get_config(self):
