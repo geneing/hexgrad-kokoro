@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import keras
 from regex import E, F
 from sympy import N
+import pickle as pkl
 import torch
 from torch.nn.utils import remove_weight_norm
 import numpy as np
@@ -182,7 +183,7 @@ def plot_plot(tf, torch, title):
         plt.colorbar(label='value')
     if len(tf.shape) == 1:
         plt.plot(tf, color='blue')
-        plt.plot(torch, color='red')
+        plt.plot(torch, color='red', alpha=.5)
     plt.title(f'{title}')
     # plt.title('Difference between TensorFlow and PyTorch Outputs')
     # plt.xlabel('Sequence Length')
@@ -227,8 +228,40 @@ convert_decoder_weights(kmodel_torch, model)
 audio = model.decoder(asr, F0_pred, N_pred, ref_s[:, :128], training=False)
 print(f"{audio.shape=}")
 
-f0c_torch = kmodel_torch.decoder.F0_conv
-f0c_tf = model.decoder.f0_conv
+ms_torch = kmodel_torch.decoder.generator.m_source
+ms_tf = model.decoder.generator.m_source
+
+with open("debug_decoder_torch.pkl", "rb") as f:
+        dbg = pkl.load(f)
+        
+f0_upsampled = dbg['f0_upsampled']
+
+# har_source_torch, noi_source_torch, uv_torch = ms_torch(f0_upsampled)
+# har_source, noi_source, uv = ms_tf(f0_upsampled)
+# print(f"har_source_torch shape: {har_source_torch.shape}")
+# print(f"har_source shape: {har_source.shape}")
+# plt.switch_backend('Agg')
+# plt.figure(figsize=(10, 6))
+# plt.subplot(2,1,1)
+# plt.plot(har_source_torch.squeeze().detach().cpu().numpy(), label='PyTorch Har Source')
+# plt.subplot(2,1,2)
+# plt.plot(har_source[0,:,0].numpy(), label='TensorFlow Har Source', linestyle='dashed')
+# plt.savefig('har_source_comparison.png')
+
+sine_wavs_t, uv_t, _ = ms_torch.l_sin_gen(f0_upsampled)
+sine_wavs, uv, _ = ms_tf.l_sin_gen(f0_upsampled)
+
+print(f"torch shape: {sine_wavs_t.shape}")
+print(f"tf shape: {sine_wavs.shape}")
+
+plt.switch_backend('Agg')
+plt.figure(figsize=(10, 6))
+plt.subplot(2,1,1)
+plt.plot(sine_wavs_t[0,:,0].detach().cpu().numpy(), label='PyTorch')
+plt.subplot(2,1,2)
+plt.plot(sine_wavs[0,:,0].numpy(), label='TensorFlow', linestyle='dashed')
+plt.savefig('sine_wavs_comparison.png')
+
 # print(f"f0c_torch weight: {f0c_torch.weight.shape=}")
 # print(f"f0c_tf weight: {f0c_tf.kernel.shape=}")
 
@@ -244,39 +277,42 @@ f0c_tf = model.decoder.f0_conv
 # diff = x_tf.numpy() - x_torch.detach().cpu().numpy()
 # print(f"f0c diff: {diff[0,0,:]}, max diff: {np.max(np.abs(diff))}")
 
-# plt.switch_backend('Agg')
-# plt.figure(figsize=(10, 6))
-# plt.subplot(2,1,1)
+plt.switch_backend('Agg')
+plt.figure(figsize=(10, 6))
+plt.subplot(2,1,1)
 # plt.plot(x_tf.numpy()[0,0,:], color='blue')
 # plt.plot(x_torch.detach().cpu().numpy()[0,0,:], color='red')
 
-# # plt.plot(audio_ref[:].detach().cpu().numpy(), label='PyTorch Audio')
-# plt.title('PyTorch Generated Audio')
-# plt.subplot(2,1,2)
+plt.plot(audio_ref[:].detach().cpu().numpy(), label='PyTorch Audio')
+plt.title('PyTorch Generated Audio')
+plt.subplot(2,1,2)
 # plt.plot(diff[0,0,:], label='Difference', color='green')
-# # plt.plot(audio[0,0,:].numpy(), label='TensorFlow Audio', color='orange')
-# plt.title('TensorFlow Generated Audio')
-# plt.savefig('audio_comparison.png')
+plt.plot(audio[0,0,:].numpy(), label='TensorFlow Audio', color='orange')
+plt.title('TensorFlow Generated Audio')
+plt.savefig('audio_comparison.png')
 
-import pickle as pkl
-with open("debug_decoder_tf.pkl", "rb") as f:
-    tf_dbg = pkl.load(f)
-    
-with open("debug_decoder_torch.pkl", "rb") as f:
-    torch_dbg = pkl.load(f)
+def compare1():
+    import pickle as pkl
+    with open("debug_decoder_tf.pkl", "rb") as f:
+        tf_dbg = pkl.load(f)
+        
+    with open("debug_decoder_torch.pkl", "rb") as f:
+        torch_dbg = pkl.load(f)
 
-print(f"tf_dbg keys: {tf_dbg.keys()}")
-for key in tf_dbg.keys():
-    if key in torch_dbg:
-        tf_out = tf_dbg[key].numpy() if isinstance(tf_dbg[key], tf.Tensor) else tf_dbg[key]
-        torch_out = torch_dbg[key].detach().cpu().numpy() if isinstance(torch_dbg[key], torch.Tensor) else torch_dbg[key]
-        plot_plot(tf_out, torch_out, f'tf_{key}')
-        if tf_out.shape == torch_out.shape:
-            diff = tf_out - torch_out
-            max_diff = np.max(np.abs(diff))
-            print(f"{key}: max difference = {max_diff}")
-            plot_differences(tf_out, torch_out, f'diff_{key}')
+    print(f"tf_dbg keys: {tf_dbg.keys()}")
+    for key in tf_dbg.keys():
+        if key in torch_dbg:
+            tf_out = tf_dbg[key].numpy() if isinstance(tf_dbg[key], tf.Tensor) else tf_dbg[key]
+            torch_out = torch_dbg[key].detach().cpu().numpy() if isinstance(torch_dbg[key], torch.Tensor) else torch_dbg[key]
+            plot_plot(tf_out, torch_out, f'tf_{key}')
+            if tf_out.shape == torch_out.shape:
+                diff = tf_out - torch_out
+                max_diff = np.max(np.abs(diff))
+                print(f"{key}: max difference = {max_diff}")
+                plot_differences(tf_out, torch_out, f'diff_{key}')
+            else:
+                print(f"{key}: shape mismatch for {tf_out.shape} vs {torch_out.shape}")
         else:
-            print(f"{key}: shape mismatch for {tf_out.shape} vs {torch_out.shape}")
-    else:
-        print(f"{key}: not found in torch debug data")
+            print(f"{key}: not found in torch debug data")
+            
+# compare1()

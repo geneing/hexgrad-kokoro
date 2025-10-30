@@ -343,6 +343,8 @@ class SourceModuleHnNSF(tf.keras.layers.Layer):
     def call(self, x):
         """Generate harmonic and noise components."""
         sine_wavs, uv, _ = self.l_sin_gen(x)
+        print(f"Sine wavs shape: {sine_wavs.shape}")
+        print(f"tf: {sine_wavs[0,0:10,0]=}")
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
         
         # Generate noise
@@ -524,10 +526,10 @@ class Generator(tf.keras.layers.Layer):
         x = self.conv_post(x, training=training)
         dbg['conv_post'] = x
         # Split into magnitude and phase
-        spec = tf.transpose(tf.exp(x[:, :self.post_n_fft // 2 + 1, :]), [0, 2, 1])
-        phase = tf.transpose(tf.sin(x[:, self.post_n_fft // 2 + 1:, :]), [0, 2, 1])
-        dbg['spec'] = spec
-        dbg['phase'] = phase
+        spec = tf.transpose(tf.exp(x[:, :self.post_n_fft // 2 + 1, :]), [0, 1, 2])
+        phase = tf.transpose(tf.sin(x[:, self.post_n_fft // 2 + 1:, :]), [0, 1, 2])
+        dbg['spec'] = tf.transpose(spec, [0,1,2])
+        dbg['phase'] = tf.transpose(phase, [0,1,2])
         print(f"++++++{spec.shape=}, {phase.shape=}")
         return self.stft.inverse(spec, phase), dbg
 
@@ -727,14 +729,14 @@ class Decoder(tf.keras.layers.Layer):
             filters=1,
             kernel_size=3,
             strides=2,
-            padding='same',
+            padding='valid',
             data_format="channels_first"
         )
         self.n_conv = tf.keras.layers.Conv1D(
             filters=1,
             kernel_size=3,
             strides=2,
-            padding='same',
+            padding='valid',
             data_format="channels_first"
         )
         
@@ -760,8 +762,11 @@ class Decoder(tf.keras.layers.Layer):
         dbg = {}
         """Forward pass of the decoder."""
         # Process F0 and N
-        f0 = self.f0_conv(tf.expand_dims(f0_curve, axis=1), training=training)
-        n_processed = self.n_conv(tf.expand_dims(n, axis=1), training=training)
+        pad_spec = [[0, 0], [0, 0], [1, 1]]
+        f0_input = tf.pad(tf.expand_dims(f0_curve, axis=1), pad_spec)
+        n_input = tf.pad(tf.expand_dims(n, axis=1), pad_spec)
+        f0 = self.f0_conv(f0_input, training=training)
+        n_processed = self.n_conv(n_input, training=training)
         dbg['F0'] = f0
         dbg['N'] = n_processed
         # Initial encoding
