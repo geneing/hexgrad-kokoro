@@ -285,7 +285,7 @@ class SineGen(tf.keras.layers.Layer):
         # Initial phase noise
         batch_size = tf.shape(f0_values)[0]
         dim_size = tf.shape(f0_values)[2]
-        rand_ini = tf.random.uniform([batch_size, dim_size], dtype=f0_values.dtype)
+        rand_ini = 0*tf.random.uniform([batch_size, dim_size], dtype=f0_values.dtype)
         
         # Set fundamental component phase to 0
         rand_ini = tf.concat([tf.zeros_like(rand_ini[:, :1]), rand_ini[:, 1:]], axis=1)
@@ -369,11 +369,10 @@ class SourceModuleHnNSF(tf.keras.layers.Layer):
     def call(self, x):
         """Generate harmonic and noise components."""
         sine_wavs, uv, _ = self.l_sin_gen(x)
-        print(f"{self.l_linear.weights=}")
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
         
         # Generate noise
-        noise = tf.random.normal(tf.shape(uv), dtype=uv.dtype) * self.sine_amp / 3
+        noise = 0*tf.random.normal(tf.shape(uv), dtype=uv.dtype) * self.sine_amp / 3
         
         return sine_merge, noise, uv
 

@@ -156,7 +156,8 @@ class CustomSTFT(tf.keras.layers.Layer):
         # Compute magnitude and phase
         magnitude = tf.sqrt(stft_real**2 + stft_imag**2)
         phase = tf.atan2(stft_imag, stft_real)
-        
+        correction_mask = tf.logical_and(tf.equal(stft_imag, 0.0), stft_real < 0.0)
+        phase = tf.where(correction_mask, tf.cast(np.pi, phase.dtype), phase)
         return magnitude, phase
 
     def inverse(self, magnitude, phase):

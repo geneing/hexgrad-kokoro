@@ -1,5 +1,9 @@
+# CUDA_VISIBLE_DEVICES="" uv run python dev_decoder.py 2>&1 | tee log.log
+
+
 from multiprocessing import pool
 import os
+from turtle import color
 import matplotlib.pyplot as plt
 
 import keras
@@ -121,6 +125,15 @@ def convert_decoder_weights(kmodel_torch, model_tf):
     # ASR residual
     _copy_conv1d_weights(decoder_torch.asr_res[0], decoder_tf.asr_res.layers[0])
 
+    # Source module dense layer
+    try:
+        _copy_dense_weights(
+            decoder_torch.generator.m_source.l_linear,
+            decoder_tf.generator.m_source.l_linear,
+        )
+    except Exception as exc:
+        print(f"[convert_decoder_weights] Skipped m_source.l_linear copy: {exc}")
+
     # Generator post conv (other generator weights pending parity work)
     try:
         _copy_conv1d_weights(decoder_torch.generator.conv_post, decoder_tf.generator.conv_post)
@@ -236,17 +249,17 @@ with open("debug_decoder_torch.pkl", "rb") as f:
         
 f0_upsampled = dbg['f0_upsampled']
 
-# har_source_torch, noi_source_torch, uv_torch = ms_torch(f0_upsampled)
-# har_source, noi_source, uv = ms_tf(f0_upsampled)
-# print(f"har_source_torch shape: {har_source_torch.shape}")
-# print(f"har_source shape: {har_source.shape}")
-# plt.switch_backend('Agg')
-# plt.figure(figsize=(10, 6))
-# plt.subplot(2,1,1)
-# plt.plot(har_source_torch.squeeze().detach().cpu().numpy(), label='PyTorch Har Source')
-# plt.subplot(2,1,2)
-# plt.plot(har_source[0,:,0].numpy(), label='TensorFlow Har Source', linestyle='dashed')
-# plt.savefig('har_source_comparison.png')
+har_source_torch, noi_source_torch, uv_torch = ms_torch(f0_upsampled)
+har_source, noi_source, uv = ms_tf(f0_upsampled)
+print(f"har_source_torch shape: {har_source_torch.shape}")
+print(f"har_source shape: {har_source.shape}")
+plt.switch_backend('Agg')
+plt.figure(figsize=(10, 6))
+plt.subplot(2,1,1)
+plt.plot(har_source_torch.squeeze().detach().cpu().numpy(), label='PyTorch Har Source')
+plt.subplot(2,1,2)
+plt.plot(har_source[0,:,0].numpy(), label='TensorFlow Har Source', linestyle='dashed')
+plt.savefig('har_source_comparison.png')
 
 sine_wavs_t, uv_t, _ = ms_torch.l_sin_gen(f0_upsampled)
 sine_wavs, uv, _ = ms_tf.l_sin_gen(f0_upsampled)
@@ -258,8 +271,10 @@ plt.switch_backend('Agg')
 plt.figure(figsize=(10, 6))
 plt.subplot(2,1,1)
 plt.plot(sine_wavs_t[0,:,0].detach().cpu().numpy(), label='PyTorch')
+plt.plot(sine_wavs[0,:,0].numpy(), label='TensorFlow', color='orange', alpha=0.5)
 plt.subplot(2,1,2)
-plt.plot(sine_wavs[0,:,0].numpy(), label='TensorFlow', linestyle='dashed')
+dff = sine_wavs[0,:,0].numpy() - sine_wavs_t[0,:,0].detach().cpu().numpy()
+plt.plot(dff, label='difference')
 plt.savefig('sine_wavs_comparison.png')
 
 # print(f"f0c_torch weight: {f0c_torch.weight.shape=}")
@@ -315,4 +330,4 @@ def compare1():
         else:
             print(f"{key}: not found in torch debug data")
             
-# compare1()
+compare1()
