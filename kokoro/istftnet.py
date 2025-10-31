@@ -19,6 +19,27 @@ def get_padding(kernel_size: int, dilation: int = 1) -> int:
     return int((kernel_size * dilation - dilation) / 2)
 
 
+def _resize_1d_linear(x: tf.Tensor, scale: float | tf.Tensor) -> tf.Tensor:
+    """Linear interpolation for 1D sequences using TensorFlow to mirror torch.nn.functional.interpolate."""
+    x = tf.convert_to_tensor(x)
+    scale_tensor = tf.cast(scale, tf.float32)
+    length = tf.shape(x)[1]
+    length_float = tf.cast(length, tf.float32)
+    new_length_float = tf.math.maximum(length_float * scale_tensor, 1.0)
+    new_length = tf.cast(tf.math.floor(new_length_float), tf.int32)
+
+    # tf.image.resize expects shape [B, H, W, C]; treat the time axis as height.
+    x_expanded = tf.expand_dims(x, axis=2)
+    resized = tf.image.resize(
+        x_expanded,
+        size=tf.stack([new_length, tf.constant(1, dtype=tf.int32)]),
+        method="bilinear",
+        antialias=False,
+        preserve_aspect_ratio=False,
+    )
+    return tf.squeeze(resized, axis=2)
+
+
 class AdaIN1d(tf.keras.layers.Layer):
     """Adaptive Instance Normalization for 1D convolutions."""
     
@@ -257,7 +278,8 @@ class SineGen(tf.keras.layers.Layer):
         """Convert F0 to sine waves with harmonics."""
         # f0_values: [batch, length, dim]
         
-        # Convert to radians
+        # convert to F0 in rad. The interger part n can be ignored
+        # because 2 * torch.pi * n doesn't affect phase
         rad_values = (f0_values / self.sampling_rate) % 1
         
         # Initial phase noise
@@ -266,8 +288,7 @@ class SineGen(tf.keras.layers.Layer):
         rand_ini = tf.random.uniform([batch_size, dim_size], dtype=f0_values.dtype)
         
         # Set fundamental component phase to 0
-        mask = tf.one_hot(0, dim_size, dtype=f0_values.dtype)
-        rand_ini = rand_ini * (1 - mask)
+        rand_ini = tf.concat([tf.zeros_like(rand_ini[:, :1]), rand_ini[:, 1:]], axis=1)
         
         # Add initial phase
         rad_values = tf.concat([
@@ -276,9 +297,14 @@ class SineGen(tf.keras.layers.Layer):
         ], axis=1)
         
         if not self.flag_for_pulse:
-            # Interpolation and phase computation - simplified version
-            # Note: TensorFlow interpolation differs from PyTorch - conversion issue
-            phase = tf.cumsum(rad_values, axis=1) * 2 * np.pi
+           
+            down_scale = 1.0 / self.upsample_scale
+            # Mirror torch.nn.functional.interpolate sequence (downsample -> cumsum -> upsample)
+            rad_down = _resize_1d_linear(rad_values, down_scale)
+
+            phase = tf.math.cumsum(rad_down, axis=1) * tf.constant(2.0 * np.pi, dtype=f0_values.dtype)
+            phase = _resize_1d_linear(phase * self.upsample_scale, self.upsample_scale)
+           
             sines = tf.sin(phase)
         else:
             # Pulse train generation - complex logic simplified
@@ -299,7 +325,7 @@ class SineGen(tf.keras.layers.Layer):
         harmonic_range = tf.range(1, self.harmonic_num + 2, dtype=f0.dtype)
         harmonic_range = tf.reshape(harmonic_range, [1, 1, -1])
         fn = f0 * harmonic_range
-        
+
         # Generate sine waves
         sine_waves = self._f02sine(fn) * self.sine_amp
         
@@ -343,8 +369,7 @@ class SourceModuleHnNSF(tf.keras.layers.Layer):
     def call(self, x):
         """Generate harmonic and noise components."""
         sine_wavs, uv, _ = self.l_sin_gen(x)
-        print(f"Sine wavs shape: {sine_wavs.shape}")
-        print(f"tf: {sine_wavs[0,0:10,0]=}")
+        print(f"{self.l_linear.weights=}")
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
         
         # Generate noise
