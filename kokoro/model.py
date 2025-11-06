@@ -115,8 +115,8 @@ class KModel(torch.nn.Module):
         
         duration = self.predictor.duration_proj(x)
         dbg['duration']=duration
-
         duration = torch.sigmoid(duration).sum(axis=-1) / speed
+        
         dbg['duration_sigmoid']=duration
         pred_dur = torch.round(duration).clamp(min=1).squeeze()
         dbg['pred_dur']=pred_dur
@@ -133,9 +133,10 @@ class KModel(torch.nn.Module):
         values = torch.arange(boundaries[-1], device=pred_dur.device)
         expanded_indices = torch.sum(boundaries.unsqueeze(1) <= values.unsqueeze(0), dim=0)
         en = torch.index_select(input_tensor, 2, expanded_indices)
+
         dbg['expanded_indices']=expanded_indices
         dbg['en']=en
-
+        print(f"\t{boundaries.shape=} {values.shape=} en: {en.shape=} {expanded_indices.shape=}")
         F0_pred, N_pred = self.predictor.F0Ntrain(en, s)
         dbg['F0_pred']=F0_pred
         dbg['N_pred']=N_pred

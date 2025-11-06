@@ -53,7 +53,7 @@ class CustomSTFT(nn.Module):
         angle = 2 * np.pi * np.outer(k, n) / self.n_fft  # shape (freq_bins, n_fft)
         dft_real = np.cos(angle)
         dft_imag = -np.sin(angle)  # note negative sign
-
+        
         # Combine window and dft => shape (freq_bins, filter_length)
         # We'll make 2 conv weight tensors of shape (freq_bins, 1, filter_length).
         forward_window = window_tensor.numpy()  # shape (n_fft,)
