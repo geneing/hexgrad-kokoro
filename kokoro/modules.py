@@ -43,7 +43,7 @@ class TextEncoder(nn.Module):
                 weight_norm(nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding)),
                 LayerNorm(channels),
                 actv,
-                nn.Dropout(0.2),
+                # nn.Dropout(0.2),
             ))
             # print(f"{kernel_size=}, {padding=}, {channels=}, {depth=}, {n_symbols=}")
             # print(f"{self.cnn[-1]}")
@@ -53,8 +53,11 @@ class TextEncoder(nn.Module):
     def forward(self, x):
         x = self.embedding(x)  # [B, T, emb]
         x = x.transpose(1, 2)  # [B, emb, T]
-        for c in self.cnn:
-            x = c(x)
+        for i,c in enumerate(self.cnn):
+            for ii, l in enumerate(c):
+                x = l(x) 
+            # x = c(x)
+
         x = x.transpose(1, 2)  # [B, T, chn]
         x, _ = self.lstm(x)
         x = x.transpose(-1, -2)
@@ -116,9 +119,11 @@ class ProsodyPredictor(nn.Module):
 
     def F0Ntrain(self, x, s):
         x, _ = self.shared(x.transpose(-1, -2))
+
         F0 = x.transpose(-1, -2)
-        for block in self.F0:
+        for ii, block in enumerate(self.F0):
             F0 = block(F0, s)
+
         F0 = self.F0_proj(F0)
         N = x.transpose(-1, -2)
         for block in self.N:
