@@ -11,7 +11,7 @@ import math
 from regex import F
 from sympy import primefactors
 import tensorflow as tf
-from .custom_stft import CustomSTFT
+from .custom_stft import CustomSTFT, TorchSTFT
 
 
 def get_padding(kernel_size: int, dilation: int = 1) -> int:
@@ -94,29 +94,33 @@ class AdaINResBlock1(tf.keras.layers.Layer):
         self.convs1: list[tf.keras.layers.Layer] = []
         for idx, dil in enumerate(dilation):
             # NOTE: weight norm is not reproduced here; expect discrepancies vs PyTorch.
+            padding = get_padding(kernel_size, dil)
             conv = tf.keras.layers.Conv1D(
                 filters=channels,
                 kernel_size=kernel_size,
                 dilation_rate=dil,
-                padding='same',
+                padding='valid',
                 use_bias=True,
                 kernel_initializer='glorot_uniform',
                 name=f"adain_resblock1_conv1_{idx}"
             )
+            setattr(conv, "_manual_padding", padding)
             self.convs1.append(conv)
 
         # Second convolution stack (three standard convs)
         self.convs2: list[tf.keras.layers.Layer] = []
         for idx in range(len(dilation)):
+            padding = get_padding(kernel_size, 1)
             conv = tf.keras.layers.Conv1D(
                 filters=channels,
                 kernel_size=kernel_size,
                 dilation_rate=1,
-                padding='same',
+                padding='valid',
                 use_bias=True,
                 kernel_initializer='glorot_uniform',
                 name=f"adain_resblock1_conv2_{idx}"
             )
+            setattr(conv, "_manual_padding", padding)
             self.convs2.append(conv)
 
         # Adaptive instance normalization layers for each branch
@@ -146,6 +150,9 @@ class AdaINResBlock1(tf.keras.layers.Layer):
     def _apply_conv(self, x, conv_layer: tf.keras.layers.Layer, training: bool = False):
         """Apply Conv1D assuming channel-first input shape [B, C, T]."""
         x_perm = tf.transpose(x, [0, 2, 1])
+        pad = getattr(conv_layer, "_manual_padding", 0)
+        if pad:
+            x_perm = tf.pad(x_perm, [[0, 0], [pad, pad], [0, 0]])
         x_perm = conv_layer(x_perm, training=training)
         return tf.transpose(x_perm, [0, 2, 1])
 
@@ -162,15 +169,14 @@ class AdaINResBlock1(tf.keras.layers.Layer):
 
     def call(self, x, s, training: bool = False):
         out = x
-        for conv1, conv2, n1, n2, a1, a2 in zip(self.convs1, self.convs2, self.adain1, self.adain2, self.alpha1, self.alpha2):
+
+        for i, (conv1, conv2, n1, n2, a1, a2) in enumerate(zip(self.convs1, self.convs2, self.adain1, self.adain2, self.alpha1, self.alpha2)):
             xt = n1(out, s)  # NOTE: relies on GroupNorm approximation; parity with InstanceNorm is not exact.
             xt = self._snake_activation(xt, a1)
             xt = self._apply_conv(xt, conv1, training=training)
-
             xt = n2(xt, s)
             xt = self._snake_activation(xt, a2)
             xt = self._apply_conv(xt, conv2, training=training)
-
             out = out + xt  # Residual connection per branch
 
         return out
@@ -285,7 +291,7 @@ class SineGen(tf.keras.layers.Layer):
         # Initial phase noise
         batch_size = tf.shape(f0_values)[0]
         dim_size = tf.shape(f0_values)[2]
-        rand_ini = 0*tf.random.uniform([batch_size, dim_size], dtype=f0_values.dtype)
+        rand_ini = tf.random.uniform([batch_size, dim_size], dtype=f0_values.dtype)
         
         # Set fundamental component phase to 0
         rand_ini = tf.concat([tf.zeros_like(rand_ini[:, :1]), rand_ini[:, 1:]], axis=1)
@@ -372,7 +378,7 @@ class SourceModuleHnNSF(tf.keras.layers.Layer):
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
         
         # Generate noise
-        noise = 0*tf.random.normal(tf.shape(uv), dtype=uv.dtype) * self.sine_amp / 3
+        noise = tf.random.normal(tf.shape(uv), dtype=uv.dtype) * self.sine_amp / 3
         
         return sine_merge, noise, uv
 
@@ -479,15 +485,19 @@ class Generator(tf.keras.layers.Layer):
         )
         
         # STFT layer
-        self.stft = CustomSTFT(
-            filter_length=gen_istft_n_fft,
-            hop_length=gen_istft_hop_size,
-            win_length=gen_istft_n_fft
-        )
+        # self.stft = CustomSTFT(
+        #     filter_length=gen_istft_n_fft,
+        #     hop_length=gen_istft_hop_size,
+        #     win_length=gen_istft_n_fft
+        # )
+        
+        self.stft = TorchSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
+        
 
-    def call(self, x, s, f0, dbg, training=None):
+    def call(self, x, s, f0, dbg={}, training=None):
         """Forward pass of generator."""
         # F0 processing
+        dbg['gen_input'] = (x,s,f0)
         f0_upsampled = self.f0_upsample(
             tf.expand_dims(f0, axis=-1)) # [B, T, 1]
         dbg['f0_upsampled'] = f0_upsampled
@@ -501,16 +511,17 @@ class Generator(tf.keras.layers.Layer):
         har_source = tf.squeeze(tf.transpose(har_source, [0, 2, 1]), axis=1) 
         print(f"++++++{har_source.shape=}")
         # STFT of harmonic source
+
         har_spec, har_phase = self.stft.transform(har_source)
-        dbg['har_spec'] = har_spec[:,:,:-1]
-        dbg['har_phase'] = har_phase[:,:,:-1]
+        dbg['har_spec'] = har_spec[:,:,:]
+        dbg['har_phase'] = har_phase[:,:,:]
         print(f"++++++{har_spec.shape=}")
         har = tf.concat([har_spec, har_phase], axis=1)
         
         # Upsampling and processing
         for i in range(self.num_upsamples):
             x = tf.nn.leaky_relu(x, alpha=0.1)
-            
+
             # Process noise/harmonic source
             pad = self.noise_conv_pads[i]
             if pad:
@@ -540,13 +551,16 @@ class Generator(tf.keras.layers.Layer):
                 if xs is None:
                     xs = self.resblocks[block_idx](x, s, training=training)
                 else:
-                    xs += self.resblocks[block_idx](x, s, training=training)
+                    xs = xs + self.resblocks[block_idx](x, s, training=training)
+
                 dbg[f'resblock_{i}_{block_idx}'] = xs
+                dbg[f'resblock_in_x_{i}_{block_idx}'] = x
+                dbg[f'resblock_in_s_{i}_{block_idx}'] = s
             x = xs / self.num_kernels
         
         # Final processing
-        x = tf.nn.leaky_relu(x)
-
+        x = tf.nn.leaky_relu(x, alpha=0.01)
+        dbg['conv_relu'] = x
         x = self.conv_post(x, training=training)
         dbg['conv_post'] = x
         # Split into magnitude and phase

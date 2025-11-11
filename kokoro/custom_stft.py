@@ -38,9 +38,9 @@ class CustomSTFT(tf.keras.layers.Layer):
 
         # Build window
         assert window == 'hann', f"Only hann window supported, got {window}"
-        
-        # Create Hann window using numpy (TensorFlow doesn't have hann_window)
-        window_np = np.hanning(win_length).astype(np.float32)
+
+        # Create Hann window matching torch.hann_window(periodic=True)
+        window_np = np.hanning(win_length + 1).astype(np.float32)[:-1]
         if self.win_length < self.n_fft:
             # Zero-pad up to n_fft
             extra = self.n_fft - self.win_length
@@ -48,6 +48,8 @@ class CustomSTFT(tf.keras.layers.Layer):
         elif self.win_length > self.n_fft:
             window_np = window_np[:self.n_fft]
         
+        self._window_np = window_np
+
         # Register as non-trainable weight
         self.window = tf.Variable(
             window_np, trainable=False, name='window'
@@ -61,7 +63,7 @@ class CustomSTFT(tf.keras.layers.Layer):
         """Build DFT transformation matrices for conv1d operations."""
         # Create DFT basis functions
         n = np.arange(self.n_fft, dtype=np.float32)
-        k = n.reshape(-1, 1)
+        k = np.arange(self.freq_bins, dtype=np.float32).reshape(-1, 1)
         
         # Real and imaginary parts of DFT matrix
         # e^(-j 2π kn/N) = cos(2π kn/N) - j sin(2π kn/N)
@@ -69,9 +71,9 @@ class CustomSTFT(tf.keras.layers.Layer):
         
         # Only keep positive frequencies (onesided=True)
         angle = angle[:self.freq_bins, :]
-        
-        dft_real = np.cos(angle) * self.window.numpy()  # Real part
-        dft_imag = -np.sin(angle) * self.window.numpy()  # Imaginary part
+        window = self._window_np
+        dft_real = np.cos(angle) * window  # Real part
+        dft_imag = -np.sin(angle) * window  # Imaginary part
         
         # Reshape for conv1d: [out_channels, in_channels, kernel_size]
         # For TensorFlow: [kernel_size, in_channels, out_channels]
@@ -116,18 +118,21 @@ class CustomSTFT(tf.keras.layers.Layer):
         # Padding for center=True
         if self.center:
             pad_length = self.n_fft // 2
-            # Note: TensorFlow padding mode differences from PyTorch
-            if self.pad_mode == "reflect":
-                # TensorFlow reflect padding
-                input_data = tf.pad(
-                    input_data, [[0, 0], [pad_length, pad_length]], 
-                    mode='REFLECT'
-                )
-            else:  # constant padding
-                input_data = tf.pad(
-                    input_data, [[0, 0], [pad_length, pad_length]], 
-                    mode='CONSTANT'
-                )
+            if pad_length > 0:
+                if self.pad_mode == "replicate":
+                    left = tf.repeat(input_data[:, :1], pad_length, axis=1)
+                    right = tf.repeat(input_data[:, -1:], pad_length, axis=1)
+                    input_data = tf.concat([left, input_data, right], axis=1)
+                elif self.pad_mode == "reflect":
+                    input_data = tf.pad(
+                        input_data, [[0, 0], [pad_length, pad_length]], 
+                        mode='REFLECT'
+                    )
+                else:  # constant padding
+                    input_data = tf.pad(
+                        input_data, [[0, 0], [pad_length, pad_length]], 
+                        mode='CONSTANT'
+                    )
 
         # Add channel dimension for conv1d: [batch, time] -> [batch, time, 1]
         input_data = tf.expand_dims(input_data, axis=1)
@@ -144,7 +149,7 @@ class CustomSTFT(tf.keras.layers.Layer):
         stft_imag = tf.nn.conv1d(
             input_data, 
             self.dft_imag, 
-            stride=self.hop_length, 
+            stride=self.hop_length,
             padding='VALID', 
             data_format='NCW'
         )
@@ -154,9 +159,17 @@ class CustomSTFT(tf.keras.layers.Layer):
         # stft_imag = tf.transpose(stft_imag, [0, 2, 1])
         
         # Compute magnitude and phase
-        magnitude = tf.sqrt(stft_real**2 + stft_imag**2)
+        magnitude = tf.sqrt(stft_real**2 + stft_imag**2 + 1e-14)
         phase = tf.atan2(stft_imag, stft_real)
-        correction_mask = tf.logical_and(tf.equal(stft_imag, 0.0), stft_real < 0.0)
+
+        # Match PyTorch's atan2 branch handling:
+        # when imag ~= 0 and real < 0, PyTorch returns +pi whereas TensorFlow returns -pi.
+        imag_close_to_zero = tf.math.less_equal(
+            tf.math.abs(stft_imag),
+            tf.cast(1e-8, stft_imag.dtype) + tf.cast(1e-4, stft_imag.dtype) * magnitude
+        )
+        real_negative = tf.math.less(stft_real, tf.zeros_like(stft_real))
+        correction_mask = tf.math.logical_and(imag_close_to_zero, real_negative)
         phase = tf.where(correction_mask, tf.cast(np.pi, phase.dtype), phase)
         return magnitude, phase
 
@@ -178,7 +191,6 @@ class CustomSTFT(tf.keras.layers.Layer):
         # Transpose for conv operations: [batch, time_frames, freq_bins]
         stft_real = tf.transpose(stft_real, [0, 2, 1])
         stft_imag = tf.transpose(stft_imag, [0, 2, 1])
-        print(f"++++++{stft_real.shape=}, {stft_imag.shape=}")
                
         # Inverse transform using conv_transpose1d
         # Note: TensorFlow conv1d_transpose vs PyTorch conv_transpose1d differences
@@ -233,7 +245,7 @@ class CustomSTFT(tf.keras.layers.Layer):
         return config
 
 
-class TorchSTFTTF(tf.keras.layers.Layer):
+class TorchSTFT(tf.keras.layers.Layer):
     """
     TensorFlow equivalent of PyTorch STFT using tf.signal.
     Simpler but may have different behavior than custom implementation.
@@ -241,43 +253,84 @@ class TorchSTFTTF(tf.keras.layers.Layer):
 
     def __init__(self, filter_length: int = 800, hop_length: int = 200, 
                  win_length: int = 800, window: str = 'hann', **kwargs):
-        super(TorchSTFTTF, self).__init__(**kwargs)
+        super(TorchSTFT, self).__init__(**kwargs)
         self.filter_length = filter_length
         self.hop_length = hop_length
         self.win_length = win_length
         
         assert window == 'hann', f"Only hann window supported, got {window}"
+        
+        # Create and store window tensor to match PyTorch behavior
+        # PyTorch uses periodic=True for Hann window
+        self.window = tf.signal.hann_window(win_length, periodic=True, dtype=tf.float32)
 
     def transform(self, input_data):
-        """Forward STFT using tf.signal.stft."""
-        # Note: TensorFlow STFT parameters differ from PyTorch
-        stft_result = tf.signal.stft(
+        """Forward STFT using tf.signal.stft.
+        
+        PyTorch torch.stft uses center=True by default, adding reflection padding.
+        TensorFlow tf.signal.stft has no center parameter, so we add padding manually.
+        """
+        # Add reflection padding to match PyTorch center=True behavior
+        # PyTorch pads by n_fft // 2 on each side
+        pad_length = self.filter_length // 2
+        input_padded = tf.pad(
             input_data,
+            [[0, 0], [pad_length, pad_length]],
+            mode='REFLECT'
+        )
+        
+        stft_result = tf.signal.stft(
+            input_padded,
             frame_length=self.win_length,
             frame_step=self.hop_length,
             fft_length=self.filter_length,
             window_fn=tf.signal.hann_window,
-            pad_end=True
+            pad_end=False
         )
+        # Transpose to [batch, freq_bins, time_frames] to match PyTorch layout
+        stft_result = tf.transpose(stft_result, [0, 2, 1])
         
-        magnitude = tf.abs(stft_result)
-        phase = tf.angle(stft_result)
+        # Extract magnitude and phase
+        magnitude = tf.math.abs(stft_result)
+        phase = tf.math.angle(stft_result)
         
         return magnitude, phase
 
     def inverse(self, magnitude, phase):
-        """Inverse STFT using tf.signal.inverse_stft."""
-        # Reconstruct complex spectrogram
-        complex_spec = magnitude * tf.exp(1j * phase)
+        """Inverse STFT using tf.signal.inverse_stft.
         
-        # Inverse STFT
+        CRITICAL: PyTorch uses different normalization than TensorFlow's default.
+        PyTorch uses the same window for both directions with specific normalization.
+        TensorFlow's inverse_stft_window_fn creates a different window for perfect reconstruction.
+        
+        To match PyTorch: we need to use the inverse_stft_window_fn which handles
+        overlap-add normalization correctly.
+        """
+        # Reconstruct complex spectrogram
+        # Convert magnitude to complex first, then multiply
+        magnitude_complex = tf.cast(magnitude, tf.complex64)
+        complex_spec = magnitude_complex * tf.exp(tf.complex(tf.zeros_like(phase), phase))
+        
+        # Transpose to [batch, time_frames, freq_bins] for tf.signal.inverse_stft
+        complex_spec = tf.transpose(complex_spec, [0, 2, 1])
+        
+        # Use inverse_stft_window_fn for proper overlap-add reconstruction
+        # This should match PyTorch's internal normalization behavior
         reconstructed = tf.signal.inverse_stft(
             complex_spec,
             frame_length=self.win_length,
             frame_step=self.hop_length,
             fft_length=self.filter_length,
-            window_fn=tf.signal.hann_window
+            window_fn=tf.signal.inverse_stft_window_fn(
+                self.hop_length,
+                forward_window_fn=tf.signal.hann_window
+            )
         )
+        
+        # Remove padding added during forward transform (center=True behavior)
+        # We added filter_length // 2 padding on each side
+        pad_length = self.filter_length // 2
+        reconstructed = reconstructed[:, pad_length:-pad_length]
         
         # Add dimension to stay consistent with conv_transpose1d implementation
         return tf.expand_dims(reconstructed, axis=-2)
