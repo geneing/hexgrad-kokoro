@@ -22,7 +22,7 @@ from .kokoro import (
     LinearNorm, LayerNorm, AdaLayerNorm, DurationEncoder,
     Decoder, Generator, AdaIN1d, 
     AdainResBlk1d, SineGen, SourceModuleHnNSF,
-    CustomSTFT
+    TorchSTFT
 )
 
 __version__ = "1.0.0-tf"
@@ -38,8 +38,7 @@ __all__ = [
     #'TextEncoder',
     'Decoder',
     'Generator',
-    'CustomSTFT',
-    'TorchSTFTTF'
+    'TorchSTFT'
 ]
 
 # Conversion notes for users

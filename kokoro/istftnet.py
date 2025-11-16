@@ -11,7 +11,7 @@ import math
 from regex import F
 from sympy import primefactors
 import tensorflow as tf
-from .custom_stft import CustomSTFT, TorchSTFT
+from .custom_stft import TorchSTFT
 
 
 def get_padding(kernel_size: int, dilation: int = 1) -> int:
@@ -480,7 +480,8 @@ class Generator(tf.keras.layers.Layer):
             kernel_initializer='glorot_uniform'
         )
         
-        # STFT layer
+        # STFT layer - using TorchSTFT for accurate complex STFT (requires Flex delegate)
+        # CustomSTFT alternative exists but is not accurate enough for production
         # self.stft = CustomSTFT(
         #     filter_length=gen_istft_n_fft,
         #     hop_length=gen_istft_hop_size,

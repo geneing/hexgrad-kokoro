@@ -12,7 +12,7 @@ from .istftnet import (
     Decoder, Generator, AdaIN1d, 
     AdainResBlk1d, SineGen, SourceModuleHnNSF
 )
-from .custom_stft import CustomSTFT
+from .custom_stft import TorchSTFT
 
 __all__ = [
     'KModelTF',
@@ -31,6 +31,5 @@ __all__ = [
     'LayerNorm',
     'AdaLayerNorm',
     'DurationEncoder',
-    'CustomSTFT',
-    'TorchSTFTTF'
+    'TorchSTFT'
 ]

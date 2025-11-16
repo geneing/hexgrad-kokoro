@@ -758,15 +758,106 @@ try:
 except Exception as convert_err:
     raise RuntimeError(f"TFLite conversion failed: {convert_err}")
 
-with open('kokoro.tflite', 'wb') as f:
+tflite_path = 'kokoro.tflite'
+with open(tflite_path, 'wb') as f:
   f.write(tflite_model)
+
+print(f"\n{'='*80}")
+print("Testing TFLite model inference...")
+print('='*80)
+
+# Load and test TFLite model
+interpreter = tf.lite.Interpreter(model_path=tflite_path)
+interpreter.allocate_tensors()
+
+# Get input and output details
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+print(f"TFLite model inputs: {len(input_details)}")
+for i, detail in enumerate(input_details):
+    print(f"  Input {i}: {detail['name']}, shape={detail['shape']}, dtype={detail['dtype']}")
+
+print(f"TFLite model outputs: {len(output_details)}")
+for i, detail in enumerate(output_details):
+    print(f"  Output {i}: {detail['name']}, shape={detail['shape']}, dtype={detail['dtype']}")
+
+# Prepare test inputs
+test_input_ids = dbg['input_ids'].numpy()
+test_ref_s = dbg['ref_s'].numpy()
+test_speed = np.array(dbg['speed'], dtype=np.float32)
+
+# Set input tensors
+interpreter.set_tensor(input_details[0]['index'], test_input_ids)
+interpreter.set_tensor(input_details[1]['index'], test_ref_s)
+interpreter.set_tensor(input_details[2]['index'], test_speed)
+
+# Run inference
+print("\nRunning TFLite inference...")
+interpreter.invoke()
+
+# Get output
+tflite_audio = interpreter.get_tensor(output_details[0]['index'])
+
+# Compare with TensorFlow model output
+print(f"\nTensorFlow audio shape: {audio.shape}")
+print(f"TFLite audio shape:     {tflite_audio.shape}")
+
+# Calculate comparison metrics
+audio_np = audio.numpy()
+mse = np.mean((audio_np - tflite_audio) ** 2)
+mae = np.mean(np.abs(audio_np - tflite_audio))
+max_diff = np.max(np.abs(audio_np - tflite_audio))
+corr = np.corrcoef(audio_np.flatten(), tflite_audio.flatten())[0, 1]
+
+print(f"\nComparison metrics:")
+print(f"  Mean Squared Error:  {mse:.6e}")
+print(f"  Mean Absolute Error: {mae:.6e}")
+print(f"  Max Absolute Diff:   {max_diff:.6e}")
+print(f"  Correlation:         {corr:.6f}")
+
+# Visual comparison
+plt.figure(figsize=(14, 8))
+plt.subplot(3, 1, 1)
+plt.plot(audio_np[0, :], label='TensorFlow Audio', alpha=0.7)
+plt.plot(tflite_audio[0, :], label='TFLite Audio', alpha=0.7, linestyle='--')
+plt.title('Audio Waveform Comparison (first 10000 samples)')
+plt.legend()
+plt.xlim(0, 10000)
+plt.grid(True, alpha=0.3)
+
+plt.subplot(3, 1, 2)
+diff = audio_np[0, :] - tflite_audio[0, :]
+plt.plot(diff, label='Difference', color='red', alpha=0.7)
+plt.title('Absolute Difference')
+plt.legend()
+plt.xlim(0, 10000)
+plt.grid(True, alpha=0.3)
+
+plt.subplot(3, 1, 3)
+plt.plot(audio_ref[0, :].detach().cpu().numpy(), label='PyTorch Reference', alpha=0.7)
+plt.title('PyTorch Reference Audio')
+plt.legend()
+plt.xlim(0, 10000)
+plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('tflite_audio_comparison.png', dpi=150)
+print(f"\nSaved comparison plot to tflite_audio_comparison.png")
+
+# Determine if models match closely enough
+threshold_corr = 0.99
+if corr > threshold_corr and mae < 0.01:
+    print(f"\n✓ TFLite model matches TensorFlow model (correlation={corr:.6f}, MAE={mae:.6e})")
+else:
+    print(f"\n✗ WARNING: TFLite model differs from TensorFlow model (correlation={corr:.6f}, MAE={mae:.6e})")
 
 try:
     save_path = 'kokoro'
     # model.save(save_path+'.h5', include_optimizer=False)
     model.save(save_path+'.keras', include_optimizer=False)
     # model.export("kokoro")
-    print(f"Saved TF model to {save_path}")
+    print(f"\nSaved TF model to {save_path}")
 except Exception as e:
     print(f"[ERROR] Failed to save TF model: {e}")
 

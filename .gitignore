@@ -1,10 +1,2 @@
-__pycache__/__init__.cpython-312.pyc
-__pycache__/__init__.cpython-313.pyc
-kokoro/__pycache__/__init__.cpython-312.pyc
-kokoro/__pycache__/__init__.cpython-313.pyc
-kokoro/__pycache__/custom_stft.cpython-312.pyc
-kokoro/__pycache__/istftnet.cpython-312.pyc
-kokoro/__pycache__/model.cpython-312.pyc
-kokoro/__pycache__/model.cpython-313.pyc
-kokoro/__pycache__/modules.cpython-312.pyc
-kokoro/__pycache__/pipeline.cpython-312.pyc
+*.pyc
+kokoro/custom_stft.py.broken
