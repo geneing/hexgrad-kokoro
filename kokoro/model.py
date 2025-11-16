@@ -19,7 +19,6 @@ from loguru import logger
 # import os
 
 
-
 class KModelTF(tf.keras.Model):
     """
     TensorFlow Keras implementation of KModel.
@@ -155,11 +154,6 @@ class KModelTF(tf.keras.Model):
         pred_dur = tf.cast(pred_dur, tf.int32)
         pred_dur = tf.squeeze(pred_dur)
         
-        # boundaries = torch.cumsum(pred_dur, dim=0)
-        # values = torch.arange(boundaries[-1], device=pred_dur.device)
-        # expanded_indices = torch.sum(boundaries.unsqueeze(1) <= values.unsqueeze(0), dim=0)
-        # en = torch.index_select(input_tensor, 2, expanded_indices)
-        
         boundaries = tf.math.cumsum(pred_dur, axis=0)
 
         values = tf.range(boundaries[-1], dtype=tf.int32)        
@@ -172,7 +166,6 @@ class KModelTF(tf.keras.Model):
         # F0 and N prediction
         F0_pred, N_pred = self.predictor.f0n_train(en, s, training=training)
         
-        
         # Text encoder processing
         t_en = self.text_encoder(input_ids, training=training)
         asr = tf.gather(t_en, expanded_indices, axis=2)
@@ -181,9 +174,9 @@ class KModelTF(tf.keras.Model):
         audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128], training=training)
         audio = tf.squeeze(audio)
 
-        return bert_dur, d_en, d, x, expanded_indices, en, F0_pred, N_pred, t_en, asr, audio
+        # return bert_dur, d_en, d, x, expanded_indices, en, F0_pred, N_pred, t_en, asr, audio
         
-        # return audio, pred_dur
+        return audio
 
     # def predict_text(
     #     self,

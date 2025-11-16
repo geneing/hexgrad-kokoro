@@ -56,35 +56,17 @@ class LinearNorm(tf.keras.layers.Layer):
 
 
 class LayerNorm(tf.keras.layers.Layer):
-    """Custom layer normalization for 1D convolution outputs."""
-    
+    """LayerNorm that keeps channel-last layout for TFLite compatibility."""
+
     def __init__(self, channels: int, eps: float = 1e-5, **kwargs):
         super(LayerNorm, self).__init__(**kwargs)
         self.channels = channels
         self.eps = eps
-        self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=self.eps)
-        
-    # def build(self, input_shape):
-    #     self.gamma = self.add_weight(
-    #         name='gamma',
-    #         shape=(self.channels,),
-    #         initializer='ones'
-    #     )
-    #     self.beta = self.add_weight(
-    #         name='beta',
-    #         shape=(self.channels,),
-    #         initializer='zeros'
-    #     )
-    #     self.layer_norm.build(input_shape)
-    #     super().build(input_shape)
+        # Channel axis stays last throughout the TF port to avoid transpose ops during export.
+        self.layer_norm = tf.keras.layers.LayerNormalization(axis=-1, epsilon=self.eps)
 
-    def call(self, x):
-        # x shape: [batch, channels, time] -> transpose to [batch, time, channels]
-        x = tf.transpose(x, [0, 2, 1])
-        print(f"tf: LayerNorm input {x.shape=}")
-        x = self.layer_norm(x) #, [self.channels], self.gamma, self.beta, self.eps
-        # Transpose back to [batch, channels, time]
-        return tf.transpose(x, [0, 2, 1])
+    def call(self, x, training=None):
+        return self.layer_norm(x)
 
     def get_config(self):
         config = super().get_config()
@@ -106,20 +88,15 @@ class TextEncoder(tf.keras.layers.Layer):
         self.n_symbols = n_symbols
         
         self.embedding = tf.keras.layers.Embedding(n_symbols, channels)
-        
-        # CNN layers
+
+        # CNN layers operate on channel-last tensors to match TF/TFLite expectations.
         self.cnn_layers = []
         for _ in range(depth):
             cnn_block = tf.keras.Sequential([
-                # Note: TensorFlow Conv1D has different parameter order than PyTorch
-                # PyTorch: (in_channels, out_channels, kernel_size)
-                # TensorFlow: filters=out_channels, kernel_size, input_shape
                 tf.keras.layers.Conv1D(
                     filters=channels,
                     kernel_size=kernel_size,
                     padding='same',
-                    data_format="channels_first",
-                    # Note: Weight normalization not directly available in TF - potential conversion issue
                     use_bias=True
                 ),
                 LayerNorm(channels=channels),
@@ -137,28 +114,15 @@ class TextEncoder(tf.keras.layers.Layer):
     def call(self, x, training=None):
         # x: [batch, seq_len] -> embedding -> [batch, seq_len, channels]
         x = self.embedding(x)
-        
-        # Transpose to [batch, channels, seq_len] for Conv1D processing
-        x = tf.transpose(x, [0, 2, 1])
-        
-        # Apply CNN layers
-        for i,cnn_layer in enumerate(self.cnn_layers):
-            print(f"tf: TextEncoder {i=} {x[0,0:2,0:2]=}")
-            for ii, l in enumerate(cnn_layer.layers):
-                print(f"tf: {l}")
-                print(f"tf:   -layer {ii=} {x.shape=} {x[0,0:2,0:2]=}")
-                x = l(x, training=training) #if hasattr(l, 'call') else l(x)
-                print(f"tf:   +layer {ii=} {l} {x[0,0:2,0:2]=}")
-            #x = cnn_layer(x, training=training)
-        
-        # Transpose back for LSTM: [batch, seq_len, channels]
-        x = tf.transpose(x, [0, 2, 1])
-        
-        # Note: TensorFlow LSTM doesn't have pack_padded_sequence equivalent
-        # This could be a potential conversion issue for variable length sequences
+
+        # Apply CNN layers (all channel-last)
+        for cnn_layer in self.cnn_layers:
+            x = cnn_layer(x, training=training)
+
+        # LSTM expects [batch, seq_len, channels]
         x = self.lstm(x, training=training)
-        
-        # Transpose back to [batch, channels, seq_len]
+
+        # Transpose to [batch, channels, seq_len] for parity with Torch implementation.
         x = tf.transpose(x, [0, 2, 1])
         return x
 
@@ -386,9 +350,11 @@ class ProsodyPredictor(tf.keras.layers.Layer):
             N_feat = blk(N_feat, s, training=training)
         N_feat = self._channel_first_conv1x1(N_feat, self.N_proj)
 
-        # Remove channel dim if it equals 1
-        F0_out = tf.squeeze(F0_feat, axis=1) if tf.shape(F0_feat)[1] == 1 else F0_feat
-        N_out = tf.squeeze(N_feat, axis=1) if tf.shape(N_feat)[1] == 1 else N_feat
+        # Remove the singleton channel dimension introduced by the 1x1 projections.
+        F0_feat = tf.ensure_shape(F0_feat, (None, 1, None))
+        N_feat = tf.ensure_shape(N_feat, (None, 1, None))
+        F0_out = tf.squeeze(F0_feat, axis=1)
+        N_out = tf.squeeze(N_feat, axis=1)
         return F0_out, N_out
 
     def get_config(self):

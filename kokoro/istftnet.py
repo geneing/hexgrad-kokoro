@@ -419,7 +419,7 @@ class Generator(tf.keras.layers.Layer):
         
         self.f0_upsample = tf.keras.layers.UpSampling1D(size=self.f0_upsample_factor)
         
-        # Upsampling layers
+        # Upsampling layers - use channel-last for TFLite
         self.ups = []
         for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
             # Note: TensorFlow Conv1DTranspose vs PyTorch ConvTranspose1d parameter differences
@@ -429,8 +429,7 @@ class Generator(tf.keras.layers.Layer):
                 strides=u,
                 padding='same',
                 use_bias=True,
-                kernel_initializer='glorot_uniform',
-                data_format='channels_first'
+                kernel_initializer='glorot_uniform'
             )
             self.ups.append(up_layer)
         
@@ -456,8 +455,7 @@ class Generator(tf.keras.layers.Layer):
                     filters=c_cur,
                     kernel_size=stride_f0 * 2,
                     strides=stride_f0,
-                    padding='valid',
-                    data_format='channels_first'
+                    padding='valid'
                 )
                 noise_res = AdaINResBlock1(c_cur, 7, (1, 3, 5), style_dim)
                 self.noise_conv_pads.append(pad)
@@ -465,8 +463,7 @@ class Generator(tf.keras.layers.Layer):
                 noise_conv = tf.keras.layers.Conv1D(
                     filters=c_cur,
                     kernel_size=1,
-                    padding='same', 
-                    data_format='channels_first'
+                    padding='same'
                 )
                 noise_res = AdaINResBlock1(c_cur, 11, (1, 3, 5), style_dim)
                 self.noise_conv_pads.append(0)
@@ -474,14 +471,13 @@ class Generator(tf.keras.layers.Layer):
             self.noise_convs.append(noise_conv)
             self.noise_res.append(noise_res)
         
-        # Final convolution
+        # Final convolution - use channel-last for TFLite
         self.post_n_fft = gen_istft_n_fft
         self.conv_post = tf.keras.layers.Conv1D(
             filters=self.post_n_fft + 2,
             kernel_size=7,
             padding='same',
-            kernel_initializer='glorot_uniform', 
-            data_format='channels_first'
+            kernel_initializer='glorot_uniform'
         )
         
         # STFT layer
@@ -494,57 +490,48 @@ class Generator(tf.keras.layers.Layer):
         self.stft = TorchSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
         
 
-    def call(self, x, s, f0, dbg={}, training=None):
-        """Forward pass of generator."""
+    def call(self, x, s, f0, training=None):
+        """Forward pass of generator. x is [B,C,T] channel-first."""
         # F0 processing
-        dbg['gen_input'] = (x,s,f0)
         f0_upsampled = self.f0_upsample(
             tf.expand_dims(f0, axis=-1)) # [B, T, 1]
-        dbg['f0_upsampled'] = f0_upsampled
                 
         # Generate harmonic source
         har_source, noi_source, uv = self.m_source(f0_upsampled)
-        dbg['har_source'] = har_source
-        dbg['noi_source'] = noi_source
-        dbg['uv'] = uv
-        
         har_source = tf.squeeze(tf.transpose(har_source, [0, 2, 1]), axis=1) 
-        print(f"++++++{har_source.shape=}")
         # STFT of harmonic source
 
         har_spec, har_phase = self.stft.transform(har_source)
-        dbg['har_spec'] = har_spec[:,:,:]
-        dbg['har_phase'] = har_phase[:,:,:]
-        print(f"++++++{har_spec.shape=}")
-        har = tf.concat([har_spec, har_phase], axis=1)
+        har = tf.concat([har_spec, har_phase], axis=1)  # [B,C,T] channel-first
         
         # Upsampling and processing
         for i in range(self.num_upsamples):
             x = tf.nn.leaky_relu(x, alpha=0.1)
 
-            # Process noise/harmonic source
+            # Process noise/harmonic source - har is [B,C,T]
             pad = self.noise_conv_pads[i]
             if pad:
                 har_input = tf.pad(har, [[0, 0], [0, 0], [pad, pad]])
             else:
                 har_input = har
-            x_source = self.noise_convs[i](har_input, training=training)
-            print(f"++++++{i} {x_source.shape=} {har.shape=}")
-            dbg[f'noise_conv_{i}'] = x_source
-            x_source = self.noise_res[i](x_source, s, training=training)
-            print(f"++++++{i} after resblock {x_source.shape=}")
-            dbg[f'noise_res_{i}'] = x_source
-            # Upsample
-            x = self.ups[i](x, training=training)
-            dbg[f'upsample_{i}'] = x            
+            # noise_conv expects [B,T,C]
+            har_input = tf.transpose(har_input, [0, 2, 1])
+            x_source = self.noise_convs[i](har_input, training=training)  # [B,T',C]
+            x_source = tf.transpose(x_source, [0, 2, 1])  # [B,C,T']
+            x_source = self.noise_res[i](x_source, s, training=training)  # [B,C,T']
+            
+            # Upsample - x is [B,C,T], ups expects [B,T,C]
+            x = tf.transpose(x, [0, 2, 1])
+            x = self.ups[i](x, training=training)  # [B,T',C]
+            x = tf.transpose(x, [0, 2, 1])  # [B,C,T']
+            
             # Reflection padding on final stage to mirror PyTorch behavior
             if i == self.num_upsamples - 1:
                 x = tf.pad(x, [[0, 0], [0, 0], [1, 0]], mode='REFLECT')
-                print(f"tf reflection pad {i}: {x.shape=}")
             
             x = x + x_source
             
-            # Apply residual blocks
+            # Apply residual blocks - expect [B,C,T]
             xs = None
             for j in range(self.num_kernels):
                 block_idx = i * self.num_kernels + j
@@ -553,23 +540,19 @@ class Generator(tf.keras.layers.Layer):
                 else:
                     xs = xs + self.resblocks[block_idx](x, s, training=training)
 
-                dbg[f'resblock_{i}_{block_idx}'] = xs
-                dbg[f'resblock_in_x_{i}_{block_idx}'] = x
-                dbg[f'resblock_in_s_{i}_{block_idx}'] = s
             x = xs / self.num_kernels
         
-        # Final processing
+        # Final processing - x is [B,C,T]
         x = tf.nn.leaky_relu(x, alpha=0.01)
-        dbg['conv_relu'] = x
-        x = self.conv_post(x, training=training)
-        dbg['conv_post'] = x
+        # conv_post expects [B,T,C]
+        x = tf.transpose(x, [0, 2, 1])
+        x = self.conv_post(x, training=training)  # [B,T,C]
+        x = tf.transpose(x, [0, 2, 1])  # [B,C,T]
+        
         # Split into magnitude and phase
-        spec = tf.transpose(tf.exp(x[:, :self.post_n_fft // 2 + 1, :]), [0, 1, 2])
-        phase = tf.transpose(tf.sin(x[:, self.post_n_fft // 2 + 1:, :]), [0, 1, 2])
-        dbg['spec'] = tf.transpose(spec, [0,1,2])
-        dbg['phase'] = tf.transpose(phase, [0,1,2])
-        print(f"++++++{spec.shape=}, {phase.shape=}")
-        return self.stft.inverse(spec, phase), dbg
+        spec = tf.exp(x[:, :self.post_n_fft // 2 + 1, :])
+        phase = tf.sin(x[:, self.post_n_fft // 2 + 1:, :])
+        return self.stft.inverse(spec, phase)
 
     def get_config(self):
         config = super().get_config()
@@ -693,32 +676,41 @@ class AdainResBlk1d(tf.keras.layers.Layer):
                 use_bias=True
             )
         
-        # Build main layers
-        self.conv1 = tf.keras.layers.Conv1D(dim_out, 3, padding='same', data_format="channels_first")
-        self.conv2 = tf.keras.layers.Conv1D(dim_out, 3, padding='same', data_format="channels_first")
+        # Build main layers - use channel-last Conv1D for TFLite compatibility
+        self.conv1 = tf.keras.layers.Conv1D(dim_out, 3, padding='same')
+        self.conv2 = tf.keras.layers.Conv1D(dim_out, 3, padding='same')
         self.norm1 = AdaIN1d(style_dim, dim_in)
         self.norm2 = AdaIN1d(style_dim, dim_out)
         self.dropout = tf.keras.layers.Dropout(dropout_p)
         
         if self.learned_sc:
-            self.conv1x1 = tf.keras.layers.Conv1D(dim_out, 1, use_bias=False, data_format="channels_first")
+            self.conv1x1 = tf.keras.layers.Conv1D(dim_out, 1, use_bias=False)
 
     def _shortcut(self, x):
         """Shortcut connection with optional learned projection."""
         x = self.upsample(x)
         if self.learned_sc:
+            # x: [B,C,T] -> [B,T,C] -> conv1x1 -> [B,T,C] -> [B,C,T]
+            x = tf.transpose(x, [0, 2, 1])
             x = self.conv1x1(x)
+            x = tf.transpose(x, [0, 2, 1])
         return x
 
     def _residual(self, x, s, training=None):
         """Residual path through the block."""
-        x = self.norm1(x, s)
+        x = self.norm1(x, s)  # expects [B,C,T]
         x = self.actv(x)
-        x = self.pool(x)
+        x = self.pool(x)  # expects [B,C,T], outputs [B,C,T]
+        # conv1: [B,C,T] -> [B,T,C] -> conv -> [B,T,C] -> [B,C,T]
+        x = tf.transpose(x, [0, 2, 1])
         x = self.conv1(x)
+        x = tf.transpose(x, [0, 2, 1])
         x = self.norm2(x, s)
         x = self.actv(x)
+        # conv2: [B,C,T] -> [B,T,C] -> conv -> [B,T,C] -> [B,C,T]
+        x = tf.transpose(x, [0, 2, 1])
         x = self.conv2(x)
+        x = tf.transpose(x, [0, 2, 1])
         return x
 
     def call(self, x, s, training=None):
@@ -762,25 +754,23 @@ class Decoder(tf.keras.layers.Layer):
         self.decode.append(AdainResBlk1d(1024 + 2 + 64, 1024, style_dim))
         self.decode.append(AdainResBlk1d(1024 + 2 + 64, 512, style_dim, upsample='upsample'))
         
-        # F0 and N processing
+        # F0 and N processing - use channel-last for TFLite
         self.f0_conv = tf.keras.layers.Conv1D(
             filters=1,
             kernel_size=3,
             strides=2,
-            padding='valid',
-            data_format="channels_first"
+            padding='valid'
         )
         self.n_conv = tf.keras.layers.Conv1D(
             filters=1,
             kernel_size=3,
             strides=2,
-            padding='valid',
-            data_format="channels_first"
+            padding='valid'
         )
         
-        # ASR residual processing
+        # ASR residual processing - use channel-last for TFLite
         self.asr_res = tf.keras.Sequential([
-            tf.keras.layers.Conv1D(64, 1, padding='same', data_format="channels_first"),
+            tf.keras.layers.Conv1D(64, 1, padding='same'),
         ])
         
         # Generator
@@ -797,24 +787,26 @@ class Decoder(tf.keras.layers.Layer):
         )
 
     def call(self, asr, f0_curve, n, s, training=None):
-        dbg = {}
         """Forward pass of the decoder."""
         # Process F0 and N
         pad_spec = [[0, 0], [0, 0], [1, 1]]
-        f0_input = tf.pad(tf.expand_dims(f0_curve, axis=1), pad_spec)
-        n_input = tf.pad(tf.expand_dims(n, axis=1), pad_spec)
-        f0 = self.f0_conv(f0_input, training=training)
-        n_processed = self.n_conv(n_input, training=training)
-        dbg['F0'] = f0
-        dbg['N'] = n_processed
+        f0_input = tf.pad(tf.expand_dims(f0_curve, axis=1), pad_spec)  # [B,1,T]
+        n_input = tf.pad(tf.expand_dims(n, axis=1), pad_spec)  # [B,1,T]
+        # Conv1D expects [B,T,C], so transpose
+        f0 = tf.transpose(f0_input, [0, 2, 1])  # [B,T,1]
+        f0 = self.f0_conv(f0, training=training)  # [B,T',1]
+        f0 = tf.transpose(f0, [0, 2, 1])  # [B,1,T']
+        n_processed = tf.transpose(n_input, [0, 2, 1])  # [B,T,1]
+        n_processed = self.n_conv(n_processed, training=training)  # [B,T',1]
+        n_processed = tf.transpose(n_processed, [0, 2, 1])  # [B,1,T']
         # Initial encoding
-        x = tf.concat([asr, f0, n_processed], axis=1)
-        x = self.encode(x, s, training=training)
-        dbg['x_0'] = x
+        x = tf.concat([asr, f0, n_processed], axis=1)  # [B,C,T]
+        x = self.encode(x, s, training=training)  # expects [B,C,T]
         
-        # ASR residual
-        asr_res = self.asr_res(asr, training=training)
-        dbg['asr_res'] = asr_res 
+        # ASR residual: asr is [B,C,T], conv expects [B,T,C]
+        asr_t = tf.transpose(asr, [0, 2, 1])
+        asr_res = self.asr_res(asr_t, training=training)
+        asr_res = tf.transpose(asr_res, [0, 2, 1])  # back to [B,C,T]
                
         # Decode through layers
         res = True
@@ -822,16 +814,11 @@ class Decoder(tf.keras.layers.Layer):
             if res:
                 x = tf.concat([x, asr_res, f0, n_processed], axis=1)
             x = block(x, s, training=training)
-            dbg[f'x_{i+1}'] = x
             if block.upsample_type != "none":
                 res = False
         
         # Generate final audio
-        x, dbg = self.generator(x, s, f0_curve, dbg, training=training)
-        dbg['x_final'] = x
-        import pickle as pkl
-        with open("debug_decoder_tf.pkl", "wb") as f:
-            pkl.dump(dbg, f)
+        x = self.generator(x, s, f0_curve, training=training)
         return x
 
     def get_config(self):
