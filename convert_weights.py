@@ -14,6 +14,7 @@ import sys
 import pickle
 import numpy as np
 import tensorflow as tf
+from ai_edge_litert.interpreter import Interpreter
 from kokoro_litert.kokoro import KModelTF
 from kokoro_torch.kokoro import KModel
 from kokoro_litert.kokoro.istftnet import DepthwiseConv1DTranspose
@@ -733,6 +734,27 @@ plt.plot(audio[:].numpy(), label='TensorFlow Audio', color='orange')
 plt.title('TensorFlow Generated Audio')
 plt.savefig('audio_comparison.png')
 
+print("\n" + "="*80)
+print("SUCCESS: TensorFlow model forward pass completed!")
+print("="*80)
+print(f"Audio comparison plot saved to audio_comparison.png")
+
+print("\nTrying to save Keras model...")
+try:
+    save_path = 'kokoro'
+    model.save(save_path+'.keras', include_optimizer=False)
+    print(f"Saved TF model to {save_path}.keras")
+except Exception as e:
+    print(f"[WARNING] Failed to save TF model: {e}")
+
+# ============================================================================
+# TFLite Conversion
+# ============================================================================
+
+print("\n" + "="*80)
+print("Attempting TFLite conversion...")
+print("="*80)
+
 seq_len = dbg['input_ids'].shape[1]
 style_dim = dbg['ref_s'].shape[1]
 
@@ -741,125 +763,137 @@ def _serving_step(input_ids, ref_s, speed):
     # Wrap the model call with a concrete input signature for TFLite tracing.
     return model(input_ids=input_ids, ref_s=ref_s, speed=speed, training=False)
 
+
 concrete_fn = _serving_step.get_concrete_function(
     tf.TensorSpec(shape=(1, seq_len), dtype=tf.int32, name="input_ids"),
     tf.TensorSpec(shape=(1, style_dim), dtype=tf.float32, name="ref_s"),
-    tf.TensorSpec(shape=(), dtype=tf.float32, name="speed"),
+    tf.TensorSpec(shape=(1,1), dtype=tf.float32, name="speed"),
 )
 
+print("Creating TFLite converter...")
 converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete_fn], model)
+
+# First try with SELECT_TF_OPS (allows more TF ops)
 converter.target_spec.supported_ops = [
     tf.lite.OpsSet.TFLITE_BUILTINS,
     tf.lite.OpsSet.SELECT_TF_OPS,
 ]
+# converter.optimizations = [tf.lite.Optimize.DEFAULT]
 
-try:
-    tflite_model = converter.convert()
-except Exception as convert_err:
-    raise RuntimeError(f"TFLite conversion failed: {convert_err}")
+print("Converting to TFLite (with SELECT_TF_OPS)...")
+tflite_model = converter.convert()
 
 tflite_path = 'kokoro.tflite'
 with open(tflite_path, 'wb') as f:
-  f.write(tflite_model)
+    f.write(tflite_model)
 
-print(f"\n{'='*80}")
-print("Testing TFLite model inference...")
-print('='*80)
+print(f"✓ Successfully saved TFLite model to {tflite_path}")
+print(f"  Model size: {len(tflite_model) / 1024 / 1024:.2f} MB")
+    
 
-# Load and test TFLite model
-interpreter = tf.lite.Interpreter(model_path=tflite_path)
-interpreter.allocate_tensors()
+# ============================================================================
+# TFLite Testing (if conversion succeeded)
+# ============================================================================
 
-# Get input and output details
-input_details = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
+if tflite_path and os.path.exists(tflite_path):
+    print(f"\n{'='*80}")
+    print("Testing TFLite model inference...")
+    print('='*80)
+    
+    try:
+        # Load and test TFLite model
+        interpreter = Interpreter(model_path=tflite_path)
+        interpreter.allocate_tensors()
+        
+        # Get input and output details
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        
+        print(f"TFLite model inputs: {len(input_details)}")
+        for i, detail in enumerate(input_details):
+            print(f"  Input {i}: {detail['name']}, shape={detail['shape']}, dtype={detail['dtype']}")
+        
+        print(f"TFLite model outputs: {len(output_details)}")
+        for i, detail in enumerate(output_details):
+            print(f"  Output {i}: {detail['name']}, shape={detail['shape']}, dtype={detail['dtype']}")
+        
+        # Prepare test inputs
+        test_input_ids = dbg['input_ids'].numpy().astype(np.int32)
+        test_ref_s = dbg['ref_s'].numpy().astype(np.float32)
+        test_speed = np.array([dbg['speed']], dtype=np.float32)
+        
+        # Set input tensors
+        interpreter.set_tensor(input_details[0]['index'], test_input_ids)
+        interpreter.set_tensor(input_details[1]['index'], test_ref_s)
+        interpreter.set_tensor(input_details[2]['index'], test_speed)
+        
+        # Run inference
+        print("\nRunning TFLite inference...")
+        interpreter.invoke()
+        
+        # Get output
+        tflite_audio = interpreter.get_tensor(output_details[0]['index'])
+        
+        # Compare with TensorFlow model output
+        print(f"\nTensorFlow audio shape: {audio.shape}")
+        print(f"TFLite audio shape:     {tflite_audio.shape}")
+        
+        # Calculate comparison metrics
+        audio_np = audio.numpy()
+        print(f"{np.mean(audio_np)=}")
+        print(f"{np.mean(tflite_audio)=}")
+        # mse = np.((audio_np - tflite_audio))
+        mae = np.mean(np.abs(audio_np - tflite_audio))
+        max_diff = np.max(np.abs(audio_np - tflite_audio))
+        corr = np.corrcoef(audio_np.flatten(), tflite_audio.flatten())[0, 1]
+        
+        print(f"\nComparison metrics:")
+        # print(f"  Mean Squared Error:  {mse:.6e}")
+        print(f"  Mean Absolute Error: {mae:.6e}")
+        print(f"  Max Absolute Diff:   {max_diff:.6e}")
+        print(f"  Correlation:         {corr:.6f}")
+        
+        # Visual comparison
+        plt.figure(figsize=(14, 8))
+        plt.subplot(3, 1, 1)
+        plt.plot(audio_np.flatten(), label='TensorFlow Audio', alpha=0.7)
+        plt.plot(tflite_audio.flatten(), label='TFLite Audio', alpha=0.7, linestyle='--')
+        plt.title('Audio Waveform Comparison ')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        plt.subplot(3, 1, 2)
+        diff = audio_np - tflite_audio
+        plt.plot(diff.flatten(), label='Difference', color='red', alpha=0.7)
+        plt.title('Absolute Difference')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        plt.subplot(3, 1, 3)
+        plt.plot(audio_ref.squeeze().detach().cpu().numpy(), label='PyTorch Reference', alpha=0.7)
+        plt.title('PyTorch Reference Audio')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig('tflite_audio_comparison.png', dpi=150)
+        print(f"\nSaved comparison plot to tflite_audio_comparison.png")
+        
+        # Determine if models match closely enough
+        threshold_corr = 0.99
+        if corr > threshold_corr and mae < 0.01:
+            print(f"\n✓ TFLite model matches TensorFlow model (correlation={corr:.6f}, MAE={mae:.6e})")
+        else:
+            print(f"\n✗ WARNING: TFLite model differs from TensorFlow model (correlation={corr:.6f}, MAE={mae:.6e})")
+    
+    
+    except Exception as e:
+        print(f"\n✗ TFLite inference test failed: {e}")
+        import traceback
+        traceback.print_exc()
 
-print(f"TFLite model inputs: {len(input_details)}")
-for i, detail in enumerate(input_details):
-    print(f"  Input {i}: {detail['name']}, shape={detail['shape']}, dtype={detail['dtype']}")
-
-print(f"TFLite model outputs: {len(output_details)}")
-for i, detail in enumerate(output_details):
-    print(f"  Output {i}: {detail['name']}, shape={detail['shape']}, dtype={detail['dtype']}")
-
-# Prepare test inputs
-test_input_ids = dbg['input_ids'].numpy()
-test_ref_s = dbg['ref_s'].numpy()
-test_speed = np.array(dbg['speed'], dtype=np.float32)
-
-# Set input tensors
-interpreter.set_tensor(input_details[0]['index'], test_input_ids)
-interpreter.set_tensor(input_details[1]['index'], test_ref_s)
-interpreter.set_tensor(input_details[2]['index'], test_speed)
-
-# Run inference
-print("\nRunning TFLite inference...")
-interpreter.invoke()
-
-# Get output
-tflite_audio = interpreter.get_tensor(output_details[0]['index'])
-
-# Compare with TensorFlow model output
-print(f"\nTensorFlow audio shape: {audio.shape}")
-print(f"TFLite audio shape:     {tflite_audio.shape}")
-
-# Calculate comparison metrics
-audio_np = audio.numpy()
-mse = np.mean((audio_np - tflite_audio) ** 2)
-mae = np.mean(np.abs(audio_np - tflite_audio))
-max_diff = np.max(np.abs(audio_np - tflite_audio))
-corr = np.corrcoef(audio_np.flatten(), tflite_audio.flatten())[0, 1]
-
-print(f"\nComparison metrics:")
-print(f"  Mean Squared Error:  {mse:.6e}")
-print(f"  Mean Absolute Error: {mae:.6e}")
-print(f"  Max Absolute Diff:   {max_diff:.6e}")
-print(f"  Correlation:         {corr:.6f}")
-
-# Visual comparison
-plt.figure(figsize=(14, 8))
-plt.subplot(3, 1, 1)
-plt.plot(audio_np[0, :], label='TensorFlow Audio', alpha=0.7)
-plt.plot(tflite_audio[0, :], label='TFLite Audio', alpha=0.7, linestyle='--')
-plt.title('Audio Waveform Comparison (first 10000 samples)')
-plt.legend()
-plt.xlim(0, 10000)
-plt.grid(True, alpha=0.3)
-
-plt.subplot(3, 1, 2)
-diff = audio_np[0, :] - tflite_audio[0, :]
-plt.plot(diff, label='Difference', color='red', alpha=0.7)
-plt.title('Absolute Difference')
-plt.legend()
-plt.xlim(0, 10000)
-plt.grid(True, alpha=0.3)
-
-plt.subplot(3, 1, 3)
-plt.plot(audio_ref[0, :].detach().cpu().numpy(), label='PyTorch Reference', alpha=0.7)
-plt.title('PyTorch Reference Audio')
-plt.legend()
-plt.xlim(0, 10000)
-plt.grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.savefig('tflite_audio_comparison.png', dpi=150)
-print(f"\nSaved comparison plot to tflite_audio_comparison.png")
-
-# Determine if models match closely enough
-threshold_corr = 0.99
-if corr > threshold_corr and mae < 0.01:
-    print(f"\n✓ TFLite model matches TensorFlow model (correlation={corr:.6f}, MAE={mae:.6e})")
-else:
-    print(f"\n✗ WARNING: TFLite model differs from TensorFlow model (correlation={corr:.6f}, MAE={mae:.6e})")
-
-try:
-    save_path = 'kokoro'
-    # model.save(save_path+'.h5', include_optimizer=False)
-    model.save(save_path+'.keras', include_optimizer=False)
-    # model.export("kokoro")
-    print(f"\nSaved TF model to {save_path}")
-except Exception as e:
-    print(f"[ERROR] Failed to save TF model: {e}")
-
+print("\n" + "="*80)
+print("Conversion process completed!")
+print("="*80)
 
 
