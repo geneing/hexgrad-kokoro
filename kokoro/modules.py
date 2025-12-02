@@ -149,6 +149,29 @@ class AdaLayerNorm(tf.keras.layers.Layer):
         self.fc = tf.keras.layers.Dense(channels * 2)
         self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=self.eps)
 
+    def build(self, input_shape):
+        if isinstance(input_shape, (list, tuple)) and len(input_shape) == 2:
+            x_shape, style_shape = input_shape
+        else:
+            x_shape = input_shape
+            style_shape = tf.TensorShape([None, self.style_dim])
+
+        x_shape = tf.TensorShape(x_shape)
+        style_shape = tf.TensorShape(style_shape)
+
+        # Validate the incoming style embedding dimension matches expectations.
+        if style_shape.rank is not None and style_shape[-1] is not None and style_shape[-1] != self.style_dim:
+            raise ValueError(
+                f"AdaLayerNorm expected style dimension {self.style_dim}, received {style_shape[-1]}."
+            )
+
+        if not self.fc.built:
+            self.fc.build(style_shape)
+        if not self.layer_norm.built:
+            self.layer_norm.build(x_shape)
+
+        super(AdaLayerNorm, self).build(input_shape)
+
     def call(self, x, s):
         # x: [batch, channels, seq_len], s: [batch, style_dim]
         h = self.fc(s)  # [batch, channels*2]
@@ -191,6 +214,48 @@ class DurationEncoder(tf.keras.layers.Layer):
             # Adaptive Layer Norm
             ada_norm = AdaLayerNorm(sty_dim, d_model, name=f"AdaLayerNorm_fc_{i}")
             self.lstms.add(ada_norm)
+
+    def build(self, input_shape):
+        if isinstance(input_shape, (tuple, list)) and len(input_shape) == 2:
+            x_shape, style_shape = input_shape
+        else:
+            x_shape = input_shape
+            style_shape = tf.TensorShape([None, self.sty_dim])
+
+        x_shape = tf.TensorShape(x_shape)
+        style_shape = tf.TensorShape(style_shape)
+
+        # DurationEncoder expects x_in shaped [B, C, T]; transpose -> [B, T, C].
+        batch_dim = x_shape[0]
+        time_dim = x_shape[-1]
+        feature_dim = x_shape[-2]
+
+        if style_shape.rank is not None and style_shape.rank > 0:
+            style_dim = style_shape[-1]
+            if style_dim is not None and style_dim != self.sty_dim:
+                raise ValueError(
+                    f"DurationEncoder expected style dimension {self.sty_dim}, got {style_dim}."
+                )
+
+        lstm_input_channels = None if feature_dim is None else feature_dim + self.sty_dim
+        current_shape = tf.TensorShape([batch_dim, time_dim, lstm_input_channels])
+
+        for layer_idx in range(self.nlayers):
+            lstm_layer = self.lstms.get_layer(index=2 * layer_idx)
+            if not lstm_layer.built:
+                lstm_layer.build(current_shape)
+            current_shape = tf.TensorShape(lstm_layer.compute_output_shape(current_shape))
+
+            ada_layer = self.lstms.get_layer(index=2 * layer_idx + 1)
+            if not ada_layer.built:
+                ada_layer.build([current_shape, style_shape])
+
+            merged_dim = current_shape[-1]
+            if merged_dim is not None:
+                merged_dim += self.sty_dim
+            current_shape = tf.TensorShape([current_shape[0], current_shape[1], merged_dim])
+
+        super(DurationEncoder, self).build(input_shape)
 
     def call(self, x_in, style, training=False):
         x = tf.transpose(x_in, [0, 2, 1]) # [B, C, T] -> [B, T, C]

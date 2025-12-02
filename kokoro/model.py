@@ -16,9 +16,9 @@ import json
 from dataclasses import dataclass
 # from huggingface_hub import hf_hub_download
 from loguru import logger
-# import os
+import keras
 
-
+@keras.saving.register_keras_serializable()
 class KModelTF(tf.keras.Model):
     """
     TensorFlow Keras implementation of KModel.
@@ -116,7 +116,94 @@ class KModelTF(tf.keras.Model):
         audio: tf.Tensor
         pred_dur: Optional[tf.Tensor] = None
 
-    def call(self, input_ids: tf.Tensor, ref_s: tf.Tensor, speed: tf.float32 = 1.0, training=False):
+    def build(self, input_shape):
+        """Configure dynamic input shapes for the model and pre-build submodules.
+
+        The caller may pass the shapes either as a dict (SavedModel style) or as
+        a tuple/list following the positional argument order of ``call``.  The
+        ``seq_len`` dimension in ``input_ids`` must remain dynamic, while
+        ``ref_s`` keeps a known channel size.  ``speed`` is treated as a scalar
+        float input.
+        """
+
+        # Normalize the incoming shape signature into TensorShape objects.
+        if isinstance(input_shape, dict):
+            shape_spec = {key: tf.TensorShape(value) for key, value in input_shape.items()}
+            try:
+                input_ids_shape = shape_spec['input_ids']
+                ref_s_shape = shape_spec['ref_s']
+            except KeyError as exc:
+                raise ValueError("KModelTF.build expects 'input_ids' and 'ref_s' shapes") from exc
+            speed_shape = shape_spec.get('speed', tf.TensorShape([]))
+            shape_structure = 'dict'
+        else:
+            if not isinstance(input_shape, (tuple, list)):
+                raise ValueError("KModelTF.build expects a dict or a tuple/list of shapes")
+            shapes = list(input_shape)
+            if len(shapes) < 2:
+                raise ValueError("KModelTF.build requires at least input_ids and ref_s shapes")
+            if len(shapes) == 2:
+                shapes.append(())  # default scalar for speed
+            input_ids_shape = tf.TensorShape(shapes[0])
+            ref_s_shape = tf.TensorShape(shapes[1])
+            speed_shape = tf.TensorShape(shapes[2])
+            shape_structure = 'list'
+
+        # Normalize shapes to rank-2 (batch, feature) while keeping seq_len dynamic.
+        if input_ids_shape.rank is None:
+            input_ids_shape = tf.TensorShape([None, None])
+        elif input_ids_shape.rank == 1:
+            seq_len_dim = input_ids_shape.as_list()[0]
+            input_ids_shape = tf.TensorShape([None, seq_len_dim])
+        if ref_s_shape.rank is None:
+            raise ValueError("ref_s shape must be known up to rank; received unknown rank")
+        elif ref_s_shape.rank == 1:
+            style_dim = ref_s_shape.as_list()[0]
+            ref_s_shape = tf.TensorShape([None, style_dim])
+        if input_ids_shape.rank != 2:
+            raise ValueError(f"input_ids must be rank-2, got shape {input_ids_shape}")
+        if ref_s_shape.rank != 2:
+            raise ValueError(f"ref_s must be rank-2, got shape {ref_s_shape}")
+
+        batch_dim = input_ids_shape[0]
+        ref_dim = ref_s_shape[-1]
+        if ref_dim is None:
+            raise ValueError("ref_s last dimension must be known when building KModelTF")
+
+        # seq_len remains dynamic (None) regardless of the build-time shape.
+        dynamic_input_ids_shape = tf.TensorShape([batch_dim, None])
+        dynamic_ref_s_shape = tf.TensorShape([batch_dim, ref_dim])
+
+        # speed is treated as a scalar float input. Allow (), (1,), or unknown rank 0.
+        if speed_shape.rank in (None, 0):
+            scalar_shape = tf.TensorShape([])
+        elif speed_shape.rank == 1:
+            shape_list = speed_shape.as_list()
+            first_dim_value = shape_list[0] if shape_list else None
+            if first_dim_value not in (None, 1):
+                raise ValueError(f"speed must be scalar, received shape {speed_shape}")
+            scalar_shape = tf.TensorShape([])
+        else:
+            raise ValueError(f"speed must be scalar, received shape {speed_shape}")
+
+        # Register InputSpecs so Keras shape checks honour the dynamic sequence length.
+        # Pre-build simple submodules whose weight shapes are known statically.
+        if not self.bert_encoder.built:
+            self.bert_encoder.build(tf.TensorShape([None, self.bert.config.hidden_size]))
+
+        # Propagate the adjusted shapes to the superclass so Keras marks the model as built.
+        if shape_structure == 'dict':
+            normalized_shapes = {
+                'input_ids': dynamic_input_ids_shape,
+                'ref_s': dynamic_ref_s_shape,
+                'speed': scalar_shape,
+            }
+        else:
+            normalized_shapes = [dynamic_input_ids_shape, dynamic_ref_s_shape, scalar_shape]
+
+        super(KModelTF, self).build(normalized_shapes)
+
+    def call(self, input_ids: tf.Tensor, ref_s: tf.Tensor, n_inputs: tf.int32, speed: tf.float32 = 1.0, training=False):
         """
         Main forward pass of the model.
         
@@ -128,6 +215,8 @@ class KModelTF(tf.keras.Model):
         """
         
         # BERT processing
+        n_inputs = tf.cast(tf.squeeze(n_inputs), tf.int32)
+        input_ids = tf.slice(input_ids, [0, 0], [1, n_inputs])
         inputs = {'input_ids': input_ids, 'token_type_ids': tf.zeros_like(input_ids)}
         bert_dur = self.bert(inputs, training=training)
         bert_dur = bert_dur.last_hidden_state

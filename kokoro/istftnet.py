@@ -48,7 +48,7 @@ class AdaIN1d(tf.keras.layers.Layer):
         self.style_dim = style_dim
         self.num_features = num_features
         # Note: TensorFlow GroupNormalization with groups=-1 approximates InstanceNorm1d
-        self.norm = tf.keras.layers.GroupNormalization(groups=-1, axis=1, center=True, scale=True, epsilon=1e-5)
+        self.norm = tf.keras.layers.GroupNormalization(groups=num_features, axis=1, center=True, scale=True, epsilon=1e-5)
         self.fc = tf.keras.layers.Dense(num_features * 2)
 
     def call(self, x, s):

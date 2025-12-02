@@ -6,6 +6,7 @@ import keras
 from regex import E
 import torch
 from torch.nn.utils import remove_weight_norm
+from typing import cast
 
 os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices'
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -678,6 +679,12 @@ with open('temp/dbg.pkl', 'rb') as f:
 
 model = KModelTF(config_file)
 
+inputs_shapes = {'input_ids': (1, 510),           
+          'ref_s': (1, 256), 'speed': (1)}
+
+print(f"[INFO] Building model with input shapes: {inputs_shapes}")
+model.build(inputs_shapes)
+
 inputs = {'input_ids': tf.convert_to_tensor(dbg['input_ids'].numpy()), 
           'input_mask': tf.cast(tf.math.not_equal(dbg['input_ids'], 0), tf.int32), 
           'ref_s': tf.convert_to_tensor(dbg['ref_s'].numpy()), 'input_type_ids': tf.zeros_like(dbg['input_ids'])}
@@ -687,10 +694,64 @@ inputs = {'input_ids': tf.convert_to_tensor(dbg['input_ids'].numpy()),
 #copying weights for bert encoder
 kmodel_torch = KModel(config=config_file, model=checkpoint_path, disable_complex=True)
 
+# Prepare export inputs for both TensorFlow inference and TFLite conversion.
+seq_len = 510  # dbg['input_ids'].shape[1]
+style_dim = dbg['ref_s'].shape[1]
+
+# Ensure the requested export length does not exceed BERT's positional capacity.
+max_context_len = getattr(model, 'context_length', 512)
+if seq_len > max_context_len:
+    print(f"[INFO] Requested seq_len={seq_len} exceeds model context_length={max_context_len}. "
+          f"Clamping to {max_context_len}.")
+seq_len = min(seq_len, max_context_len)
+
+
+def _pad_or_truncate(np_input_ids: np.ndarray, target_len: int) -> np.ndarray:
+    """Pad with zeros or truncate tokens to match the target sequence length."""
+    current_len = np_input_ids.shape[1]
+    if current_len == target_len:
+        return np_input_ids
+    if current_len > target_len:
+        print(f"[INFO] Truncating input_ids from {current_len} to {target_len} tokens")
+        return np_input_ids[:, :target_len]
+    pad_width = target_len - current_len
+    print(f"[INFO] Padding input_ids from {current_len} to {target_len} tokens")
+    pad_block = np.zeros((np_input_ids.shape[0], pad_width), dtype=np_input_ids.dtype)
+    return np.concatenate([np_input_ids, pad_block], axis=1)
+
+
+def _to_numpy(value: torch.Tensor | tf.Tensor | np.ndarray | float | int) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    if isinstance(value, tf.Tensor):
+        return np.asarray(value)
+    return np.asarray(value)
+
+
+dbg_input_ids_np = _to_numpy(dbg['input_ids'])
+n_inputs = dbg_input_ids_np.shape[1]
+export_input_ids_np = _pad_or_truncate(dbg_input_ids_np, seq_len)
+
+
+def _torch_from_numpy(np_input: np.ndarray) -> torch.LongTensor:
+    return cast(torch.LongTensor, torch.from_numpy(np_input).long())
+
+
+export_input_ids_torch = _torch_from_numpy(export_input_ids_np)
+export_input_ids_tf = tf.convert_to_tensor(export_input_ids_np.astype(np.int32))
+export_ref_s_np = _to_numpy(dbg['ref_s']).astype(np.float32)
+export_ref_s_tf = tf.convert_to_tensor(export_ref_s_np)
+speed_value = float(np.asarray(dbg['speed']).item())
+export_speed_tf = tf.constant([[speed_value]], dtype=tf.float32)
+export_n_inputs_tf = tf.constant([[n_inputs]], dtype=tf.int32)
+
 # ############################################
-output = model( input_ids=tf.convert_to_tensor(dbg['input_ids'].numpy()), 
-                ref_s=tf.convert_to_tensor(dbg['ref_s'].numpy()), 
-                speed=dbg['speed'])
+output = model(
+    input_ids=export_input_ids_tf,
+    ref_s=export_ref_s_tf,
+    n_inputs=n_inputs,
+    speed=speed_value
+)
 
 
 model.bert_encoder.set_weights([kmodel_torch.bert_encoder.weight.detach().numpy().T, kmodel_torch.bert_encoder.bias.detach().numpy()])
@@ -713,12 +774,15 @@ except Exception as e:
 
 convert_decoder_weights(kmodel_torch, model)
 
-audio_ref = kmodel_torch.forward_with_tokens( dbg['input_ids'], dbg['ref_s'], dbg['speed'])
+audio_ref = kmodel_torch.forward_with_tokens(export_input_ids_torch, dbg['ref_s'], dbg['speed'])
 
 
-audio = model( input_ids=tf.convert_to_tensor(dbg['input_ids'].numpy()), 
-                ref_s=tf.convert_to_tensor(dbg['ref_s'].numpy()), 
-                speed=float(dbg['speed']))
+audio = model(
+    input_ids=export_input_ids_tf,
+    ref_s=export_ref_s_tf,
+    n_inputs=n_inputs,
+    speed=speed_value
+)
 
 plt.switch_backend('Agg')
 plt.figure(figsize=(10, 6))
@@ -726,11 +790,15 @@ plt.subplot(2,1,1)
 # plt.plot(x_tf.numpy()[0,0,:], color='blue')
 # plt.plot(x_torch.detach().cpu().numpy()[0,0,:], color='red')
 
-plt.plot(audio_ref[:].detach().cpu().numpy(), label='PyTorch Audio')
+audio_ref_waveform = audio_ref[0] if isinstance(audio_ref, (tuple, list)) else audio_ref
+audio_ref_np = _to_numpy(audio_ref_waveform)
+audio_tf_np = _to_numpy(audio)
+
+plt.plot(audio_ref_np.squeeze(), label='PyTorch Audio')
 plt.title('PyTorch Generated Audio')
 plt.subplot(2,1,2)
 # plt.plot(diff[0,0,:], label='Difference', color='green')
-plt.plot(audio[:].numpy(), label='TensorFlow Audio', color='orange')
+plt.plot(audio_tf_np.squeeze(), label='TensorFlow Audio', color='orange')
 plt.title('TensorFlow Generated Audio')
 plt.savefig('audio_comparison.png')
 
@@ -743,6 +811,7 @@ print("\nTrying to save Keras model...")
 try:
     save_path = 'kokoro'
     model.save(save_path+'.keras', include_optimizer=False)
+    # tf.saved_model.save(model, save_path+'/tf_savedmodel')
     print(f"Saved TF model to {save_path}.keras")
 except Exception as e:
     print(f"[WARNING] Failed to save TF model: {e}")
@@ -755,23 +824,28 @@ print("\n" + "="*80)
 print("Attempting TFLite conversion...")
 print("="*80)
 
-seq_len = dbg['input_ids'].shape[1]
-style_dim = dbg['ref_s'].shape[1]
-
-@tf.function
-def _serving_step(input_ids, ref_s, speed):
+@tf.function(input_signature=[
+    tf.TensorSpec(shape=(1, 510), dtype=tf.int32, name='input_ids'),
+    tf.TensorSpec(shape=(1, 256), dtype=tf.float32, name='ref_s'),
+    tf.TensorSpec(shape=(1,1), dtype=tf.int32, name='n_inputs'),
+    tf.TensorSpec(shape=(1,1), dtype=tf.float32, name='speed'),
+])
+def _serving_step(input_ids, ref_s, n_inputs, speed):
     # Wrap the model call with a concrete input signature for TFLite tracing.
-    return model(input_ids=input_ids, ref_s=ref_s, speed=speed, training=False)
+    return model(input_ids=input_ids, ref_s=ref_s, n_inputs=n_inputs, speed=speed, training=False)
 
 
 concrete_fn = _serving_step.get_concrete_function(
-    tf.TensorSpec(shape=(1, seq_len), dtype=tf.int32, name="input_ids"),
-    tf.TensorSpec(shape=(1, style_dim), dtype=tf.float32, name="ref_s"),
-    tf.TensorSpec(shape=(1,1), dtype=tf.float32, name="speed"),
+    export_input_ids_tf,
+    export_ref_s_tf,
+    export_n_inputs_tf,
+    export_speed_tf,
 )
 
 print("Creating TFLite converter...")
 converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete_fn], model)
+# converter = tf.lite.TFLiteConverter.from_keras_model(model)
+
 
 # First try with SELECT_TF_OPS (allows more TF ops)
 converter.target_spec.supported_ops = [
@@ -782,13 +856,14 @@ converter.target_spec.supported_ops = [
 
 print("Converting to TFLite (with SELECT_TF_OPS)...")
 tflite_model = converter.convert()
+tflite_model_bytes = cast(bytes, tflite_model)
 
 tflite_path = 'kokoro.tflite'
 with open(tflite_path, 'wb') as f:
-    f.write(tflite_model)
+    f.write(tflite_model_bytes)
 
 print(f"✓ Successfully saved TFLite model to {tflite_path}")
-print(f"  Model size: {len(tflite_model) / 1024 / 1024:.2f} MB")
+print(f"  Model size: {len(tflite_model_bytes) / 1024 / 1024:.2f} MB")
     
 
 # ============================================================================
@@ -803,29 +878,44 @@ if tflite_path and os.path.exists(tflite_path):
     try:
         # Load and test TFLite model
         interpreter = Interpreter(model_path=tflite_path)
+
+        # Resize tensors to match the export shapes when necessary before allocating buffers.
+        input_details = interpreter.get_input_details()
+        target_shapes = [
+            [1, export_input_ids_np.shape[1]],
+            [1, style_dim],
+            [1, 1],
+            [1, 1],
+        ]
+        for detail, target_shape in zip(input_details, target_shapes):
+            if list(detail['shape']) != target_shape:
+                interpreter.resize_tensor_input(detail['index'], target_shape)
+
         interpreter.allocate_tensors()
-        
-        # Get input and output details
+
+        # Fetch final tensor metadata for logging.
         input_details = interpreter.get_input_details()
         output_details = interpreter.get_output_details()
-        
+
         print(f"TFLite model inputs: {len(input_details)}")
         for i, detail in enumerate(input_details):
             print(f"  Input {i}: {detail['name']}, shape={detail['shape']}, dtype={detail['dtype']}")
-        
+
         print(f"TFLite model outputs: {len(output_details)}")
         for i, detail in enumerate(output_details):
             print(f"  Output {i}: {detail['name']}, shape={detail['shape']}, dtype={detail['dtype']}")
-        
-        # Prepare test inputs
-        test_input_ids = dbg['input_ids'].numpy().astype(np.int32)
-        test_ref_s = dbg['ref_s'].numpy().astype(np.float32)
-        test_speed = np.array([dbg['speed']], dtype=np.float32)
-        
+
+        # Prepare test inputs aligned with the export shapes.
+        test_input_ids = export_input_ids_np.astype(np.int32)
+        test_ref_s = export_ref_s_np.astype(np.float32)
+        test_n_inputs = np.array([[n_inputs]], dtype=np.int32)
+        test_speed = np.array([[speed_value]], dtype=np.float32)
+
         # Set input tensors
         interpreter.set_tensor(input_details[0]['index'], test_input_ids)
         interpreter.set_tensor(input_details[1]['index'], test_ref_s)
-        interpreter.set_tensor(input_details[2]['index'], test_speed)
+        interpreter.set_tensor(input_details[2]['index'], test_n_inputs)
+        interpreter.set_tensor(input_details[3]['index'], test_speed)
         
         # Run inference
         print("\nRunning TFLite inference...")
@@ -839,7 +929,7 @@ if tflite_path and os.path.exists(tflite_path):
         print(f"TFLite audio shape:     {tflite_audio.shape}")
         
         # Calculate comparison metrics
-        audio_np = audio.numpy()
+        audio_np = audio_tf_np
         print(f"{np.mean(audio_np)=}")
         print(f"{np.mean(tflite_audio)=}")
         # mse = np.((audio_np - tflite_audio))
@@ -870,7 +960,7 @@ if tflite_path and os.path.exists(tflite_path):
         plt.grid(True, alpha=0.3)
         
         plt.subplot(3, 1, 3)
-        plt.plot(audio_ref.squeeze().detach().cpu().numpy(), label='PyTorch Reference', alpha=0.7)
+        plt.plot(audio_ref_np.squeeze(), label='PyTorch Reference', alpha=0.7)
         plt.title('PyTorch Reference Audio')
         plt.legend()
         plt.grid(True, alpha=0.3)
