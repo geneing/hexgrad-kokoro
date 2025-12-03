@@ -40,6 +40,64 @@ def _resize_1d_linear(x: tf.Tensor, scale: float | tf.Tensor) -> tf.Tensor:
     return tf.squeeze(resized, axis=2)
 
 
+class InstanceNorm1D(tf.keras.layers.Layer):
+    """Minimal InstanceNorm1d analogue that keeps channel semantics explicit."""
+
+    def __init__(self, num_features: int, epsilon: float = 1e-5, channel_axis: int = 1, **kwargs):
+        super().__init__(**kwargs)
+        self.num_features = num_features
+        self.epsilon = epsilon
+        self.channel_axis = channel_axis if channel_axis != -1 else 2
+
+    def build(self, input_shape):
+        self.gamma = self.add_weight(
+            name="gamma",
+            shape=(self.num_features,),
+            initializer="ones",
+            trainable=True,
+        )
+        self.beta = self.add_weight(
+            name="beta",
+            shape=(self.num_features,),
+            initializer="zeros",
+            trainable=True,
+        )
+        super().build(input_shape)
+
+    def call(self, x: tf.Tensor) -> tf.Tensor:
+        if x.shape.rank != 3:
+            raise ValueError("InstanceNorm1D expects rank-3 inputs [B, C, T] or [B, T, C]")
+
+        if self.channel_axis == 1:
+            reduce_axes = [2]
+            broadcast_shape = (1, self.num_features, 1)
+        elif self.channel_axis == 2:
+            reduce_axes = [1]
+            broadcast_shape = (1, 1, self.num_features)
+        else:
+            raise ValueError(f"Unsupported channel axis {self.channel_axis} for InstanceNorm1D")
+
+        mean = tf.reduce_mean(x, axis=reduce_axes, keepdims=True)
+        var = tf.reduce_mean(tf.square(x - mean), axis=reduce_axes, keepdims=True)
+        inv_std = tf.math.rsqrt(var + self.epsilon)
+
+        gamma = tf.reshape(tf.cast(self.gamma, x.dtype), broadcast_shape)
+        beta = tf.reshape(tf.cast(self.beta, x.dtype), broadcast_shape)
+
+        return (x - mean) * inv_std * gamma + beta
+
+    def get_config(self):
+        config = super().get_config()
+        config.update(
+            {
+                "num_features": self.num_features,
+                "epsilon": self.epsilon,
+                "channel_axis": self.channel_axis,
+            }
+        )
+        return config
+
+
 class AdaIN1d(tf.keras.layers.Layer):
     """Adaptive Instance Normalization for 1D convolutions."""
     
@@ -47,8 +105,7 @@ class AdaIN1d(tf.keras.layers.Layer):
         super(AdaIN1d, self).__init__(**kwargs)
         self.style_dim = style_dim
         self.num_features = num_features
-        # Note: TensorFlow GroupNormalization with groups=-1 approximates InstanceNorm1d
-        self.norm = tf.keras.layers.GroupNormalization(groups=num_features, axis=1, center=True, scale=True, epsilon=1e-5)
+        self.norm = InstanceNorm1D(num_features, channel_axis=1)
         self.fc = tf.keras.layers.Dense(num_features * 2)
 
     def call(self, x, s):
@@ -57,9 +114,17 @@ class AdaIN1d(tf.keras.layers.Layer):
         h = self.fc(s)  # [batch, num_features*2]        
         h = tf.expand_dims(h, axis=-1)  # [batch, num_features*2, 1]
         gamma, beta = tf.split(h, 2, axis=1)  # Each: [batch, num_features, 1]
-        # Apply normalization - Note: different from PyTorch InstanceNorm1d
+        # Ensure channel-first layout for normalization when possible.
+        transpose_back = False
+        if x.shape.rank == 3 and x.shape[1] != self.num_features and x.shape[-1] == self.num_features:
+            x = tf.transpose(x, [0, 2, 1])
+            transpose_back = True
+
         normalized = self.norm(x)
-        return (1 + gamma) * normalized + beta
+        output = (1 + gamma) * normalized + beta
+        if transpose_back:
+            output = tf.transpose(output, [0, 2, 1])
+        return output
 
     def get_config(self):
         config = super().get_config()
@@ -76,8 +141,8 @@ class AdaINResBlock1(tf.keras.layers.Layer):
     Conversion notes / potential mismatches:
     - PyTorch uses `weight_norm` on every Conv1d; Keras Conv1D here omits weight norm. Expect different statistics
       unless weight normalization is re-applied manually via custom wrappers.
-    - InstanceNorm1d is approximated via `GroupNormalization(groups=-1)` inside `AdaIN1d`; channel semantics may
-      drift, especially on small batch sizes.
+        - Instance normalization uses a hand-rolled variant (`InstanceNorm1D`) to keep channel-first semantics while
+            supporting dynamic shapes for TFLite tracing.
     - PyTorch evaluates the Snake1D activation with learnable `alpha` parameters; we recreate it with
       `tf.math.divide_no_nan` to avoid division by zero, but numerical behavior can still diverge.
     - All convolutions operate on channel-last internally, requiring explicit transposes around each call.
@@ -171,7 +236,7 @@ class AdaINResBlock1(tf.keras.layers.Layer):
         out = x
 
         for i, (conv1, conv2, n1, n2, a1, a2) in enumerate(zip(self.convs1, self.convs2, self.adain1, self.adain2, self.alpha1, self.alpha2)):
-            xt = n1(out, s)  # NOTE: relies on GroupNorm approximation; parity with InstanceNorm is not exact.
+            xt = n1(out, s)
             xt = self._snake_activation(xt, a1)
             xt = self._apply_conv(xt, conv1, training=training)
             xt = n2(xt, s)
@@ -187,7 +252,7 @@ class AdainResBlk1d(tf.keras.layers.Layer):
 
     Differences / potential mismatches vs PyTorch:
     - Uses UpSampling1D + Conv1D instead of ConvTranspose1d depthwise for pooling/upsample.
-    - Normalization uses AdaIN1d above (LayerNorm-based) instead of InstanceNorm1d.
+    - Normalization uses AdaIN1d above (custom InstanceNorm-backed) instead of PyTorch's InstanceNorm1d with weight norm.
     - Channel ordering conversions performed (PyTorch conv expects [B,C,T], Keras Conv1D expects [B,T,C]).
     - Dropout placement approximate; may not exactly match training-time semantics.
     - Scaling by 1/sqrt(2) implemented via tf.math.rsqrt(tf.constant(2.0)).

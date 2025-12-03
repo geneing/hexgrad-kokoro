@@ -502,17 +502,18 @@ def _ensure_dense_built(layer, in_features):
     layer.build((None, in_features))
 
 
-def _copy_group_norm(torch_norm, tf_norm):
+def _copy_instance_norm(torch_norm, tf_norm):
     gamma = torch_norm.weight.detach().cpu().numpy()
     beta = torch_norm.bias.detach().cpu().numpy()
     if not tf_norm.built:
         tf_norm.build((None, gamma.shape[0], None))
-    tf_norm.set_weights([gamma.astype(np.float32), beta.astype(np.float32)])
+    tf_norm.gamma.assign(gamma.astype(np.float32))
+    tf_norm.beta.assign(beta.astype(np.float32))
 
 
 def _convert_adain1d(torch_adain, tf_adain):
     _copy_dense_weights(torch_adain.fc, tf_adain.fc)
-    _copy_group_norm(torch_adain.norm, tf_adain.norm)
+    _copy_instance_norm(torch_adain.norm, tf_adain.norm)
 
 
 def _convert_adain_resblock1(torch_block, tf_block):
