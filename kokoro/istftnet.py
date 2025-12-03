@@ -14,6 +14,50 @@ import tensorflow as tf
 from .custom_stft import TorchSTFT
 
 
+class PointwiseConv1D(tf.keras.layers.Layer):
+    """1x1 convolution implemented with matrix multiplications for TFLite."""
+
+    def __init__(self, filters: int, use_bias: bool = True, **kwargs):
+        super().__init__(**kwargs)
+        self.filters = filters
+        self.use_bias = use_bias
+
+    def build(self, input_shape):
+        input_shape = tf.TensorShape(input_shape)
+        in_channels = int(input_shape[-1])
+        self.kernel = self.add_weight(
+            name="kernel",
+            shape=(1, in_channels, self.filters),
+            initializer="glorot_uniform",
+            trainable=True,
+        )
+        if self.use_bias:
+            self.bias = self.add_weight(
+                name="bias",
+                shape=(self.filters,),
+                initializer="zeros",
+                trainable=True,
+            )
+        else:
+            self.bias = None
+        super().build(input_shape)
+
+    def call(self, inputs):
+        kernel = tf.squeeze(self.kernel, axis=0)
+        output = tf.linalg.matmul(inputs, kernel)
+        if self.bias is not None:
+            output = tf.nn.bias_add(output, self.bias)
+        return output
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'filters': self.filters,
+            'use_bias': self.use_bias,
+        })
+        return config
+
+
 def get_padding(kernel_size: int, dilation: int = 1) -> int:
     """Calculate padding for convolution to maintain size."""
     return int((kernel_size * dilation - dilation) / 2)
@@ -274,7 +318,7 @@ class AdainResBlk1d(tf.keras.layers.Layer):
         self.conv1 = tf.keras.layers.Conv1D(dim_out, 3, padding='same')  # NOTE: no weight_norm
         self.conv2 = tf.keras.layers.Conv1D(dim_out, 3, padding='same')  # NOTE: no weight_norm
         if self.learned_sc:
-            self.conv1x1 = tf.keras.layers.Conv1D(dim_out, 1, padding='same', use_bias=False)  # NOTE: weight_norm omitted
+            self.conv1x1 = PointwiseConv1D(dim_out, use_bias=False, name=f"{self.name}_pw" if self.name else None)
         else:
             self.conv1x1 = None
         self.norm1 = AdaIN1d(style_dim, dim_in)
@@ -750,7 +794,7 @@ class AdainResBlk1d(tf.keras.layers.Layer):
         self.dropout = tf.keras.layers.Dropout(dropout_p)
         
         if self.learned_sc:
-            self.conv1x1 = tf.keras.layers.Conv1D(dim_out, 1, use_bias=False)
+            self.conv1x1 = PointwiseConv1D(dim_out, use_bias=False, name=f"{self.name}_pw" if self.name else None)
 
     def _shortcut(self, x):
         """Shortcut connection with optional learned projection."""
@@ -834,9 +878,9 @@ class Decoder(tf.keras.layers.Layer):
             padding='valid'
         )
         
-        # ASR residual processing - use channel-last for TFLite
+        # ASR residual processing - 1x1 conv implemented via pointwise dense op
         self.asr_res = tf.keras.Sequential([
-            tf.keras.layers.Conv1D(64, 1, padding='same'),
+            PointwiseConv1D(64, name='asr_res_linear')
         ])
         
         # Generator

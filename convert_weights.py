@@ -18,7 +18,7 @@ import tensorflow as tf
 from ai_edge_litert.interpreter import Interpreter
 from kokoro_litert.kokoro import KModelTF
 from kokoro_torch.kokoro import KModel
-from kokoro_litert.kokoro.istftnet import DepthwiseConv1DTranspose
+from kokoro_litert.kokoro.istftnet import DepthwiseConv1DTranspose, PointwiseConv1D
 import csv
 import json
 
@@ -134,15 +134,17 @@ def convert_bilstm_weights(pytorch_bilstm, tensorflow_bilstm, hidden_size):
     tf_weight_hh_bwd = split_weights_and_reorder(pt_weight_hh_bwd, hidden_size).T
     tf_bias_bwd = split_weights_and_reorder(pt_bias_ih_bwd + pt_bias_hh_bwd, hidden_size)
 
-    # The TensorFlow BiDirectional layer holds two LSTM layers
+    def _assign_weights(tf_layer, kernel, recurrent, bias):
+        if hasattr(tf_layer, 'set_block_weights'):
+            tf_layer.set_block_weights(kernel, recurrent, bias)
+        else:
+            tf_layer.set_weights([kernel, recurrent, bias])
+
     fwd_lstm_layer = tensorflow_bilstm.forward_layer
     bwd_lstm_layer = tensorflow_bilstm.backward_layer
 
-    # Assign weights for the forward layer
-    fwd_lstm_layer.set_weights([tf_weight_ih_fwd, tf_weight_hh_fwd, tf_bias_fwd])
-
-    # Assign weights for the backward layer
-    bwd_lstm_layer.set_weights([tf_weight_ih_bwd, tf_weight_hh_bwd, tf_bias_bwd])
+    _assign_weights(fwd_lstm_layer, tf_weight_ih_fwd, tf_weight_hh_fwd, tf_bias_fwd)
+    _assign_weights(bwd_lstm_layer, tf_weight_ih_bwd, tf_weight_hh_bwd, tf_bias_bwd)
 
 
 def convert_predictor_text_encoder(model, kmodel_torch):
@@ -445,7 +447,7 @@ def _ensure_conv1d_built(layer, in_channels):
 
 
 def _copy_conv1d_weights(torch_conv, tf_conv):
-    
+
     weight = torch_conv.weight.detach().cpu().numpy()
     bias = torch_conv.bias.detach().cpu().numpy() if torch_conv.bias is not None else None
     print(f"[DIAG] Torch weight shape: {weight.shape}, min: {weight.min()}, max: {weight.max()}, mean: {weight.mean()}")
@@ -846,16 +848,13 @@ concrete_fn = _serving_step.get_concrete_function(
 print("Creating TFLite converter...")
 converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete_fn], model)
 # converter = tf.lite.TFLiteConverter.from_keras_model(model)
+converter._experimental_lower_tensor_list_ops = True
 
 
-# First try with SELECT_TF_OPS (allows more TF ops)
-converter.target_spec.supported_ops = [
-    tf.lite.OpsSet.TFLITE_BUILTINS,
-    tf.lite.OpsSet.SELECT_TF_OPS,
-]
+converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
 # converter.optimizations = [tf.lite.Optimize.DEFAULT]
 
-print("Converting to TFLite (with SELECT_TF_OPS)...")
+print("Converting to TFLite...")
 tflite_model = converter.convert()
 tflite_model_bytes = cast(bytes, tflite_model)
 
@@ -986,5 +985,3 @@ if tflite_path and os.path.exists(tflite_path):
 print("\n" + "="*80)
 print("Conversion process completed!")
 print("="*80)
-
-

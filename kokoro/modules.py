@@ -14,6 +14,13 @@ import numpy as np
 import math
 from typing import Dict, Optional, Union, Tuple
 
+
+def _ensure_batch1_seq(x: tf.Tensor, channels: int) -> tf.Tensor:
+    """Reshape input to enforce a batch size of 1 with a known channel dimension."""
+    x = tf.reshape(x, [1, -1, channels])
+    x.set_shape([1, None, channels])
+    return x
+
 # https://github.com/yl4579/StyleTTS2/blob/main/Utils/PLBERT/util.py
 class CustomAlbert(TFAlbertModel):
     def __init__(self, *args, **kwargs):
@@ -77,6 +84,113 @@ class LayerNorm(tf.keras.layers.Layer):
         return config
 
 
+class StaticLSTM(tf.keras.layers.Layer):
+    """Simple LSTM without TensorList ops (batch size fixed to 1)."""
+
+    def __init__(self, units: int, go_backwards: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+        self.go_backwards = go_backwards
+        self.input_dim = None
+
+    def build(self, input_shape):
+        input_shape = tf.TensorShape(input_shape)
+        self.input_dim = input_shape[-1]
+        self.kernel = self.add_weight(
+            name='kernel',
+            shape=(self.input_dim, self.units * 4),
+            initializer='glorot_uniform',
+            trainable=True
+        )
+        self.recurrent_kernel = self.add_weight(
+            name='recurrent_kernel',
+            shape=(self.units, self.units * 4),
+            initializer='orthogonal',
+            trainable=True
+        )
+        self.bias = self.add_weight(
+            name='bias',
+            shape=(self.units * 4,),
+            initializer='zeros',
+            trainable=True
+        )
+        super().build(input_shape)
+
+    def call(self, inputs, training=None):
+        del training
+        inputs = tf.reshape(inputs, [1, -1, self.input_dim])
+        inputs.set_shape([1, None, self.input_dim])
+        if self.go_backwards:
+            inputs = tf.reverse(inputs, axis=[1])
+        time_steps = tf.shape(inputs)[1]
+        state_h = tf.zeros([1, self.units], dtype=inputs.dtype)
+        state_c = tf.zeros_like(state_h)
+        ta = tf.TensorArray(
+            dtype=inputs.dtype,
+            size=time_steps,
+            element_shape=tf.TensorShape([1, self.units])
+        )
+
+        def body(t, h, c, ta):
+            x_t = tf.gather(inputs, t, axis=1)
+            z = tf.matmul(x_t, self.kernel) + tf.matmul(h, self.recurrent_kernel) + self.bias
+            z0, z1, z2, z3 = tf.split(z, 4, axis=1)
+            i = tf.sigmoid(z0)
+            f = tf.sigmoid(z1)
+            g = tf.tanh(z2)
+            o = tf.sigmoid(z3)
+            c = f * c + i * g
+            h = o * tf.tanh(c)
+            ta = ta.write(t, h)
+            return t + 1, h, c, ta
+
+        _, _, _, ta = tf.while_loop(
+            lambda t, *_: t < time_steps,
+            body,
+            loop_vars=(0, state_h, state_c, ta),
+        )
+
+        outputs = ta.stack()
+        outputs = tf.transpose(outputs, [1, 0, 2])
+        if self.go_backwards:
+            outputs = tf.reverse(outputs, axis=[1])
+        return outputs
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'units': self.units, 'go_backwards': self.go_backwards})
+        return config
+
+
+class StaticBiLSTM(tf.keras.layers.Layer):
+    """Bidirectional LSTM composed of two StaticLSTM instances."""
+
+    def __init__(self, units: int, **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+        self.forward_layer = StaticLSTM(units)
+        self.backward_layer = StaticLSTM(units, go_backwards=True)
+
+    def build(self, input_shape):
+        self.forward_layer.build(input_shape)
+        self.backward_layer.build(input_shape)
+        super().build(input_shape)
+
+    def call(self, inputs, training=None):
+        fwd = self.forward_layer(inputs, training=training)
+        bwd = self.backward_layer(inputs, training=training)
+        return tf.concat([fwd, bwd], axis=-1)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'units': self.units})
+        return config
+
+
+
+
+
+
 class TextEncoder(tf.keras.layers.Layer):
     """TensorFlow implementation of TextEncoder."""
     
@@ -120,6 +234,7 @@ class TextEncoder(tf.keras.layers.Layer):
             x = cnn_layer(x, training=training)
 
         # LSTM expects [batch, seq_len, channels]
+        x = _ensure_batch1_seq(x, self.channels)
         x = self.lstm(x, training=training)
 
         # Transpose to [batch, channels, seq_len] for parity with Torch implementation.
@@ -259,22 +374,27 @@ class DurationEncoder(tf.keras.layers.Layer):
 
     def call(self, x_in, style, training=False):
         x = tf.transpose(x_in, [0, 2, 1]) # [B, C, T] -> [B, T, C]
-        batch_size = tf.shape(x)[0]
         seq_len = tf.shape(x)[1]
+        x = _ensure_batch1_seq(x, self.d_model)
+        style = tf.reshape(style, [1, self.sty_dim])
+        style.set_shape([1, self.sty_dim])
         
         # Expand style to match sequence
         s = tf.broadcast_to(
-            tf.expand_dims(style, axis=0), 
-            [batch_size, seq_len, self.sty_dim]
+            tf.expand_dims(style, axis=1), 
+            [1, seq_len, self.sty_dim]
         ) # [B, C] -> [B, T, C]
         
         # Concatenate x and style
         x = tf.concat([x, s], axis=-1) # [B, T, C+S]
+        x = _ensure_batch1_seq(x, self.d_model + self.sty_dim)
 
         for i in range(self.nlayers):
+            x = _ensure_batch1_seq(x, self.d_model + self.sty_dim)
             x = self.lstms.get_layer(index=2*i)(x, training=training)
             x = self.lstms.get_layer(index=2*i+1)(x, style)
             x = tf.concat([x, s], axis=-1) # [B, T, C+S]
+        x = _ensure_batch1_seq(x, self.d_model + self.sty_dim)
         return x 
 
     def get_config(self):
@@ -375,6 +495,7 @@ class ProsodyPredictor(tf.keras.layers.Layer):
         #     x = d
         # else:
         #     x = d  # NOTE: shape assumptions; may differ from original
+        d = _ensure_batch1_seq(d, self.d_hid + self.style_dim)
         x = self.lstm(d, training=training)
         x = self.dropout(x, training=training)
         duration = self.duration_proj(x)  # [B,T,max_dur]
@@ -398,6 +519,7 @@ class ProsodyPredictor(tf.keras.layers.Layer):
         """
         # Shared BiLSTM expects [B,T,C]; we transpose from [B,C,T].
         x_perm = tf.transpose(x, [0, 2, 1])  # [B,T,C]
+        x_perm = _ensure_batch1_seq(x_perm, self.d_hid + self.style_dim)
         shared_out = self.shared_bilstm(x_perm, training=training)  # [B,T,d_hid]
         
         shared_cf = tf.transpose(shared_out, [0, 2, 1])            # [B,d_hid,T]
@@ -416,8 +538,6 @@ class ProsodyPredictor(tf.keras.layers.Layer):
         N_feat = self._channel_first_conv1x1(N_feat, self.N_proj)
 
         # Remove the singleton channel dimension introduced by the 1x1 projections.
-        F0_feat = tf.ensure_shape(F0_feat, (None, 1, None))
-        N_feat = tf.ensure_shape(N_feat, (None, 1, None))
         F0_out = tf.squeeze(F0_feat, axis=1)
         N_out = tf.squeeze(N_feat, axis=1)
         return F0_out, N_out
@@ -432,5 +552,3 @@ class ProsodyPredictor(tf.keras.layers.Layer):
             'dropout_rate': self.dropout_rate
         })
         return config
-
-
