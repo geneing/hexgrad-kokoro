@@ -16,14 +16,28 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent"
 ]
-requires-python = ">=3.10, <3.14"
+requires-python = ">=3.10, <3.13"
 dependencies = [
     "huggingface_hub",
+    "ipykernel>=7.1.0",
+    "ipywidgets>=8.1.8",
     "loguru",
     "misaki[en]>=0.9.4",
     "numpy",
+    "onnx-graphsurgeon>=0.5.8",
+    "onnx2tf>=1.28.7",
+    "onnxruntime>=1.23.2",
+    "onnxsim>=0.4.36",
+    "pip>=25.3",
+    "sounddevice>=0.5.3",
+    "soundfile>=0.13.1",
+    "tensorflow[and-cuda]>=2.20.0",
+    "tf-keras>=2.20.1",
     "torch",
-    "transformers"
+    "transformers",
+    "onnx==1.19.1",
+    "ai-edge-litert>=2.1.0",
+    "sng4onnx>=1.0.4",
 ]
 
 [project.scripts]
