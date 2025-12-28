@@ -144,8 +144,8 @@ class KModelForONNX(torch.nn.Module):
     def forward(
         self,
         input_ids: torch.LongTensor,
-        ref_s: torch.FloatTensor,
+        style: torch.FloatTensor,
         speed: float = 1
     ) -> tuple[torch.FloatTensor, torch.LongTensor]:
-        waveform, duration = self.kmodel.forward_with_tokens(input_ids, ref_s, speed)
+        waveform, duration = self.kmodel.forward_with_tokens(input_ids, style, speed)
         return waveform, duration
