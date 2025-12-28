@@ -1,5 +1,5 @@
 # ADAPTED from https://github.com/yl4579/StyleTTS2/blob/main/Modules/istftnet.py
-from kokoro.custom_stft import CustomSTFT
+from .custom_stft import CustomSTFT, TorchSTFT
 from torch.nn.utils.parametrizations import weight_norm
 import math
 import torch
@@ -28,7 +28,8 @@ class AdaIN1d(nn.Module):
         h = self.fc(s)
         h = h.view(h.size(0), h.size(1), 1)
         gamma, beta = torch.chunk(h, chunks=2, dim=1)
-        return (1 + gamma) * self.norm(x) + beta
+        normalized = self.norm(x)
+        return (1 + gamma) * normalized + beta
 
 
 class AdaINResBlock1(nn.Module):
@@ -66,7 +67,7 @@ class AdaINResBlock1(nn.Module):
         self.alpha2 = nn.ParameterList([nn.Parameter(torch.ones(1, channels, 1)) for i in range(len(self.convs2))])
 
     def forward(self, x, s):
-        for c1, c2, n1, n2, a1, a2 in zip(self.convs1, self.convs2, self.adain1, self.adain2, self.alpha1, self.alpha2):
+        for i, (c1, c2, n1, n2, a1, a2) in enumerate(zip(self.convs1, self.convs2, self.adain1, self.adain2, self.alpha1, self.alpha2)):
             xt = n1(x, s)
             xt = xt + (1 / a1) * (torch.sin(a1 * xt) ** 2)  # Snake1D
             xt = c1(xt)
@@ -75,34 +76,6 @@ class AdaINResBlock1(nn.Module):
             xt = c2(xt)
             x = xt + x
         return x
-
-
-class TorchSTFT(nn.Module):
-    def __init__(self, filter_length=800, hop_length=200, win_length=800, window='hann'):
-        super().__init__()
-        self.filter_length = filter_length
-        self.hop_length = hop_length
-        self.win_length = win_length
-        assert window == 'hann', window
-        self.window = torch.hann_window(win_length, periodic=True, dtype=torch.float32)
-
-    def transform(self, input_data):
-        forward_transform = torch.stft(
-            input_data,
-            self.filter_length, self.hop_length, self.win_length, window=self.window.to(input_data.device),
-            return_complex=True)
-        return torch.abs(forward_transform), torch.angle(forward_transform)
-
-    def inverse(self, magnitude, phase):
-        inverse_transform = torch.istft(
-            magnitude * torch.exp(phase * 1j),
-            self.filter_length, self.hop_length, self.win_length, window=self.window.to(magnitude.device))
-        return inverse_transform.unsqueeze(-2)  # unsqueeze to stay consistent with conv_transpose1d implementation
-
-    def forward(self, input_data):
-        self.magnitude, self.phase = self.transform(input_data)
-        reconstruction = self.inverse(self.magnitude, self.phase)
-        return reconstruction
 
 
 class SineGen(nn.Module):
@@ -146,15 +119,20 @@ class SineGen(nn.Module):
         # convert to F0 in rad. The interger part n can be ignored
         # because 2 * torch.pi * n doesn't affect phase
         rad_values = (f0_values / self.sampling_rate) % 1
+        
+        
         # initial phase noise (no noise for fundamental component)
         rand_ini = torch.rand(f0_values.shape[0], f0_values.shape[2], device=f0_values.device)
         rand_ini[:, 0] = 0
         rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
         # instantanouse phase sine[t] = sin(2*pi \sum_i=1 ^{t} rad)
+        
         if not self.flag_for_pulse:
             rad_values = F.interpolate(rad_values.transpose(1, 2), scale_factor=1/self.upsample_scale, mode="linear").transpose(1, 2)
             phase = torch.cumsum(rad_values, dim=1) * 2 * torch.pi
             phase = F.interpolate(phase.transpose(1, 2) * self.upsample_scale, scale_factor=self.upsample_scale, mode="linear").transpose(1, 2)
+            print(f"torch: Phase shape: {phase.shape}")
+            print(f"torch: {phase[0,0:10,0]=}")
             sines = torch.sin(phase)
         else:
             # If necessary, make sure that the first time step of every
@@ -162,6 +140,8 @@ class SineGen(nn.Module):
             # This is used for pulse-train generation
             # identify the last time step in unvoiced segments
             uv = self._f02uv(f0_values)
+            print(f"torch: uv shape: {uv.shape}")
+            
             uv_1 = torch.roll(uv, shifts=-1, dims=1)
             uv_1[:, -1, :] = 1
             u_loc = (uv < 1) * (uv_1 > 0)
@@ -192,8 +172,11 @@ class SineGen(nn.Module):
         f0_buf = torch.zeros(f0.shape[0], f0.shape[1], self.dim, device=f0.device)
         # fundamental component
         fn = torch.multiply(f0, torch.FloatTensor([[range(1, self.harmonic_num + 2)]]).to(f0.device))
+        
         # generate sine waveforms
         sine_waves = self._f02sine(fn) * self.sine_amp
+        
+        
         # generate uv signal
         # uv = torch.ones(f0.shape)
         # uv = uv * (f0 > self.voiced_threshold)
@@ -205,7 +188,7 @@ class SineGen(nn.Module):
         noise = noise_amp * torch.randn_like(sine_waves)
         # first: set the unvoiced part to 0 by uv
         # then: additive noise
-        sine_waves = sine_waves * uv + noise
+        #ei sine_waves = sine_waves * uv + noise
         return sine_waves, uv, noise
 
 
@@ -248,6 +231,8 @@ class SourceModuleHnNSF(nn.Module):
         # source for harmonic branch
         with torch.no_grad():
             sine_wavs, uv, _ = self.l_sin_gen(x)
+        print(f"torch: {self.l_linear.weight=}")
+        
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
         # source for noise branch, in the same shape as uv
         noise = torch.randn_like(uv) * self.sine_amp / 3
@@ -279,6 +264,7 @@ class Generator(nn.Module):
             c_cur = upsample_initial_channel // (2 ** (i + 1))
             if i + 1 < len(upsample_rates):
                 stride_f0 = math.prod(upsample_rates[i + 1:])
+                print(f"torch: {stride_f0=} {c_cur=}" )
                 self.noise_convs.append(nn.Conv1d(
                     gen_istft_n_fft + 2, c_cur, kernel_size=stride_f0 * 2, stride=stride_f0, padding=(stride_f0+1) // 2))
                 self.noise_res.append(AdaINResBlock1(c_cur, 7, [1,3,5], style_dim))
@@ -290,39 +276,69 @@ class Generator(nn.Module):
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
-        self.stft = (
-            CustomSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
-            if disable_complex
-            else TorchSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
-        )
+        # self.stft = (
+        #     CustomSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
+        #     if disable_complex
+        #     else TorchSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
+        # )
+        
+        self.stft = TorchSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
 
-    def forward(self, x, s, f0):
+    def forward(self, x, s, f0, dbg):
         with torch.no_grad():
+            dbg['gen_input'] = (x, s, f0)
             f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
+            dbg['f0_upsampled'] = f0
             har_source, noi_source, uv = self.m_source(f0)
+            dbg['har_source'] = har_source
+            dbg['noi_source'] = noi_source
+            dbg['uv'] = uv
             har_source = har_source.transpose(1, 2).squeeze(1)
+            print(f"torch ++++++{har_source.shape=}")
             har_spec, har_phase = self.stft.transform(har_source)
+            dbg['har_spec'] = har_spec[:,:,:]
+            dbg['har_phase'] = har_phase[:,:,:]
+            print(f"++++++{har_spec.shape=}")
             har = torch.cat([har_spec, har_phase], dim=1)
+            
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, negative_slope=0.1) 
+
             x_source = self.noise_convs[i](har)
+            print(f"torch ++++++{i} {x_source.shape=} {har.shape=}")
+
+            dbg[f'noise_conv_{i}'] = x_source
+            
             x_source = self.noise_res[i](x_source, s)
+            dbg[f'noise_res_{i}'] = x_source
+            print(f"torch ++++++{i} after resblock {x_source.shape=}")
             x = self.ups[i](x)
+            dbg[f'upsample_{i}'] = x
             if i == self.num_upsamples - 1:
                 x = self.reflection_pad(x)
+                
             x = x + x_source
             xs = None
             for j in range(self.num_kernels):
                 if xs is None:
                     xs = self.resblocks[i*self.num_kernels+j](x, s)
                 else:
-                    xs += self.resblocks[i*self.num_kernels+j](x, s)
+                    xs = xs + self.resblocks[i*self.num_kernels+j](x, s)
+
+                dbg[f'resblock_{i}_{i*self.num_kernels+j}'] = xs
+                dbg[f'resblock_in_x_{i}_{i*self.num_kernels+j}'] = x
+                dbg[f'resblock_in_s_{i}_{i*self.num_kernels+j}'] = s
             x = xs / self.num_kernels
         x = F.leaky_relu(x)
+        dbg['conv_relu'] = x
         x = self.conv_post(x)
+        dbg['conv_post'] = x
         spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :])
         phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
-        return self.stft.inverse(spec, phase)
+        dbg['spec'] = spec
+        dbg['phase'] = phase
+        print(f"{self.stft=}")
+        return self.stft.inverse(spec, phase), dbg
 
 
 class UpSample1d(nn.Module):
@@ -357,7 +373,7 @@ class AdainResBlk1d(nn.Module):
         self.norm1 = AdaIN1d(style_dim, dim_in)
         self.norm2 = AdaIN1d(style_dim, dim_out)
         if self.learned_sc:
-            self.conv1x1 = weight_norm(nn.Conv1d(dim_in, dim_out, 1, 1, 0, bias=False))
+            self.conv1x1 = weight_norm(nn.Conv1d(in_channels=dim_in, out_channels=dim_out, kernel_size=1, stride=1, padding=0, bias=False))
 
     def _shortcut(self, x):
         x = self.upsample(x)
@@ -377,8 +393,9 @@ class AdainResBlk1d(nn.Module):
 
     def forward(self, x, s):
         out = self._residual(x, s)
-        out = (out + self._shortcut(x)) * torch.rsqrt(torch.tensor(2))
-        return out
+        scut = self._shortcut(x)
+        outp = (out + scut) * torch.rsqrt(torch.tensor(2))
+        return outp
 
 
 class Decoder(nn.Module):
@@ -405,17 +422,32 @@ class Decoder(nn.Module):
                                    upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, disable_complex=disable_complex)
 
     def forward(self, asr, F0_curve, N, s):
+        dbg = {}
         F0 = self.F0_conv(F0_curve.unsqueeze(1))
         N = self.N_conv(N.unsqueeze(1))
+        dbg['F0'] = F0
+        dbg['N'] = N
+
         x = torch.cat([asr, F0, N], axis=1)
         x = self.encode(x, s)
+        dbg['x_0'] = x
+        
         asr_res = self.asr_res(asr)
+        dbg['asr_res'] = asr_res
         res = True
-        for block in self.decode:
+        for i, block in enumerate(self.decode):
             if res:
+                # print(f"torch: Before cat: {x.shape=}, {asr_res.shape=}, {F0.shape=}, {N.shape=}")
                 x = torch.cat([x, asr_res, F0, N], axis=1)
             x = block(x, s)
+            dbg[f'x_{i+1}'] = x
+            # print(f"torch: After block: {block=} {x.shape=} {s.shape=}")
             if block.upsample_type != "none":
                 res = False
-        x = self.generator(x, s, F0_curve)
+
+        x, dbg = self.generator(x, s, F0_curve, dbg)
+        dbg['x_final'] = x
+        import pickle as pkl
+        with open("debug_decoder_torch.pkl", "wb") as f:
+            pkl.dump(dbg, f)
         return x

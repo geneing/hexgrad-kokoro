@@ -1,4 +1,4 @@
-from attr import attr
+# from attr import attr
 import numpy as np
 import torch
 import torch.nn as nn
@@ -53,7 +53,7 @@ class CustomSTFT(nn.Module):
         angle = 2 * np.pi * np.outer(k, n) / self.n_fft  # shape (freq_bins, n_fft)
         dft_real = np.cos(angle)
         dft_imag = -np.sin(angle)  # note negative sign
-
+        
         # Combine window and dft => shape (freq_bins, filter_length)
         # We'll make 2 conv weight tensors of shape (freq_bins, 1, filter_length).
         forward_window = window_tensor.numpy()  # shape (n_fft,)
@@ -195,3 +195,31 @@ class CustomSTFT(nn.Module):
         """
         mag, phase = self.transform(x)
         return self.inverse(mag, phase, length=x.shape[-1])
+
+
+class TorchSTFT(nn.Module):
+    def __init__(self, filter_length=800, hop_length=200, win_length=800, window='hann'):
+        super().__init__()
+        self.filter_length = filter_length
+        self.hop_length = hop_length
+        self.win_length = win_length
+        assert window == 'hann', window
+        self.window = torch.hann_window(win_length, periodic=True, dtype=torch.float32)
+
+    def transform(self, input_data):
+        forward_transform = torch.stft(
+            input_data,
+            self.filter_length, self.hop_length, self.win_length, window=self.window.to(input_data.device),
+            return_complex=True)
+        return torch.abs(forward_transform), torch.angle(forward_transform)
+
+    def inverse(self, magnitude, phase):
+        inverse_transform = torch.istft(
+            magnitude * torch.exp(phase * 1j),
+            self.filter_length, self.hop_length, self.win_length, window=self.window.to(magnitude.device))
+        return inverse_transform.unsqueeze(-2)  # unsqueeze to stay consistent with conv_transpose1d implementation
+
+    def forward(self, input_data):
+        self.magnitude, self.phase = self.transform(input_data)
+        reconstruction = self.inverse(self.magnitude, self.phase)
+        return reconstruction
