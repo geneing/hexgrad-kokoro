@@ -4,17 +4,22 @@ import torch
 import onnx
 import onnxruntime as ort
 import sounddevice as sd
+from torch.export import Dim
 
 from kokoro import KModel, KPipeline
 from kokoro.model import KModelForONNX
+import matplotlib
 
 def export_onnx(model, output):
     onnx_file = output + "/" + "kokoro.onnx"
 
-    input_ids = torch.randint(1, 100, (48,)).numpy()
+    input_ids = torch.randint(1, 100, (502,)).numpy()
     input_ids = torch.LongTensor([[0, *input_ids, 0]])
     style = torch.randn(1, 256)
     speed = torch.randint(1, 10, (1,)).int()
+    
+    batch_size = Dim.STATIC #Dim("batch_size", min=1, max=32)
+    input_ids_len = Dim("seq_length", min=2, max=510)
 
     torch.onnx.export(
         model, 
@@ -24,14 +29,15 @@ def export_onnx(model, output):
         verbose = True, 
         input_names = [ 'input_ids', 'style', 'speed' ], 
         output_names = [ 'waveform', 'duration' ],
-        opset_version = 17, 
-        dynamic_axes = {
-            'input_ids': {0: "batch_size", 1: 'input_ids_len' }, 
-            'style': {0: "batch_size"}, 
-            "speed": {0: "batch_size"}
+        opset_version = 24, 
+        dynamic_shapes = {
+            'input_ids': {0: batch_size, 1: input_ids_len }, 
+            'style': {0: batch_size}, 
+            "speed": {0: batch_size}
         }, 
         do_constant_folding = True, 
         dynamo = False,
+        # report = True,
     )
 
     print('export kokoro.onnx ok!')
@@ -99,9 +105,19 @@ def inference_onnx(model, output):
     print(f'output: {output.shape}')
     print(output)
 
+    # audio = output.numpy()
+    # sd.play(audio, 24000)
+    # sd.wait()
     audio = output.numpy()
-    sd.play(audio, 24000)
-    sd.wait()
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(12, 4))
+    plt.plot(audio)
+    plt.savefig('audio.png')
+    plt.close()
+
+    import scipy.io.wavfile as wavfile
+    wavfile.write('audio.wav', 24000, (audio * 32767).astype('int16'))
 
 def check_model(model):
     input_ids, style, speed = load_sample(model)
@@ -112,8 +128,15 @@ def check_model(model):
     print(output)
 
     audio = output.numpy()
-    sd.play(audio, 24000)
-    sd.wait()
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(12, 4))
+    plt.plot(audio)
+    plt.savefig('audio.png')
+    plt.close()
+    import scipy.io.wavfile as wavfile
+    wavfile.write('audio.wav', 24000, (audio * 32767).astype('int16'))
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Export kokoro Model to ONNX", add_help=True)

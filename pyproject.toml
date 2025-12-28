@@ -38,6 +38,8 @@ dependencies = [
     "onnx==1.19.1",
     "ai-edge-litert>=2.1.0",
     "sng4onnx>=1.0.4",
+    "olive-ai[gpu]>=0.10.1",
+    "scipy>=1.15.3",
 ]
 
 [project.scripts]
