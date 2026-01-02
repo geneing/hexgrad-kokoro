@@ -206,16 +206,42 @@ class TorchSTFT(nn.Module):
         assert window == 'hann', window
         self.window = torch.hann_window(win_length, periodic=True, dtype=torch.float32)
 
+    # Avoid complex-only ops so ONNX can lower these to real ops.
+    @staticmethod
+    def _complex_to_real_imag(z: torch.Tensor):
+        real_imag = torch.view_as_real(z)
+        return real_imag[..., 0], real_imag[..., 1]
+
+    @staticmethod
+    def _complex_abs(z: torch.Tensor):
+        real, imag = TorchSTFT._complex_to_real_imag(z)
+        return torch.sqrt(real * real + imag * imag)
+
+    @staticmethod
+    def _complex_angle(z: torch.Tensor):
+        real, imag = TorchSTFT._complex_to_real_imag(z)
+        angle = torch.atan2(imag, real)
+        # Match PyTorch angle() for the (imag == 0, real < 0) case.
+        correction_mask = (imag == 0) & (real < 0)
+        pi = torch.full_like(angle, torch.pi)
+        return torch.where(correction_mask, pi, angle)
+
+    @staticmethod
+    def _complex_exp(z: torch.Tensor):
+        real, imag = TorchSTFT._complex_to_real_imag(z)
+        exp_real = torch.exp(real)
+        return torch.complex(exp_real * torch.cos(imag), exp_real * torch.sin(imag))
+
     def transform(self, input_data):
         forward_transform = torch.stft(
             input_data,
             self.filter_length, self.hop_length, self.win_length, window=self.window.to(input_data.device),
             return_complex=True)
-        return torch.abs(forward_transform), torch.angle(forward_transform)
+        return self._complex_abs(forward_transform), self._complex_angle(forward_transform)
 
     def inverse(self, magnitude, phase):
         inverse_transform = torch.istft(
-            magnitude * torch.exp(phase * 1j),
+            magnitude * self._complex_exp(phase * 1j),
             self.filter_length, self.hop_length, self.win_length, window=self.window.to(magnitude.device))
         return inverse_transform.unsqueeze(-2)  # unsqueeze to stay consistent with conv_transpose1d implementation
 

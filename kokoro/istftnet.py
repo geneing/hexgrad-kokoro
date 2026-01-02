@@ -128,11 +128,21 @@ class SineGen(nn.Module):
         # instantanouse phase sine[t] = sin(2*pi \sum_i=1 ^{t} rad)
         
         if not self.flag_for_pulse:
-            rad_values = F.interpolate(rad_values.transpose(1, 2), scale_factor=1/self.upsample_scale, mode="linear").transpose(1, 2)
+            base_len = f0_values.shape[1]
+            down_len = base_len // self.upsample_scale
+            rad_values = F.interpolate(
+                rad_values.transpose(1, 2),
+                size=down_len,
+                mode="linear",
+            ).transpose(1, 2)
             phase = torch.cumsum(rad_values, dim=1) * 2 * torch.pi
-            phase = F.interpolate(phase.transpose(1, 2) * self.upsample_scale, scale_factor=self.upsample_scale, mode="linear").transpose(1, 2)
-            print(f"torch: Phase shape: {phase.shape}")
-            print(f"torch: {phase[0,0:10,0]=}")
+            phase = F.interpolate(
+                (phase.transpose(1, 2) * self.upsample_scale),
+                size=base_len,
+                mode="linear",
+            ).transpose(1, 2)
+            # print(f"torch: Phase shape: {phase.shape}")
+            # print(f"torch: {phase[0,0:10,0]=}")
             sines = torch.sin(phase)
         else:
             # If necessary, make sure that the first time step of every
@@ -140,7 +150,7 @@ class SineGen(nn.Module):
             # This is used for pulse-train generation
             # identify the last time step in unvoiced segments
             uv = self._f02uv(f0_values)
-            print(f"torch: uv shape: {uv.shape}")
+            # print(f"torch: uv shape: {uv.shape}")
             
             uv_1 = torch.roll(uv, shifts=-1, dims=1)
             uv_1[:, -1, :] = 1
@@ -231,7 +241,6 @@ class SourceModuleHnNSF(nn.Module):
         # source for harmonic branch
         with torch.no_grad():
             sine_wavs, uv, _ = self.l_sin_gen(x)
-        print(f"torch: {self.l_linear.weight=}")
         
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
         # source for noise branch, in the same shape as uv
@@ -264,7 +273,7 @@ class Generator(nn.Module):
             c_cur = upsample_initial_channel // (2 ** (i + 1))
             if i + 1 < len(upsample_rates):
                 stride_f0 = math.prod(upsample_rates[i + 1:])
-                print(f"torch: {stride_f0=} {c_cur=}" )
+
                 self.noise_convs.append(nn.Conv1d(
                     gen_istft_n_fft + 2, c_cur, kernel_size=stride_f0 * 2, stride=stride_f0, padding=(stride_f0+1) // 2))
                 self.noise_res.append(AdaINResBlock1(c_cur, 7, [1,3,5], style_dim))
@@ -284,36 +293,21 @@ class Generator(nn.Module):
         
         self.stft = TorchSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
 
-    def forward(self, x, s, f0, dbg):
+    def forward(self, x, s, f0):
         with torch.no_grad():
-            dbg['gen_input'] = (x, s, f0)
+
             f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
-            dbg['f0_upsampled'] = f0
             har_source, noi_source, uv = self.m_source(f0)
-            dbg['har_source'] = har_source
-            dbg['noi_source'] = noi_source
-            dbg['uv'] = uv
             har_source = har_source.transpose(1, 2).squeeze(1)
-            print(f"torch ++++++{har_source.shape=}")
             har_spec, har_phase = self.stft.transform(har_source)
-            dbg['har_spec'] = har_spec[:,:,:]
-            dbg['har_phase'] = har_phase[:,:,:]
-            print(f"++++++{har_spec.shape=}")
             har = torch.cat([har_spec, har_phase], dim=1)
             
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, negative_slope=0.1) 
 
             x_source = self.noise_convs[i](har)
-            print(f"torch ++++++{i} {x_source.shape=} {har.shape=}")
-
-            dbg[f'noise_conv_{i}'] = x_source
-            
             x_source = self.noise_res[i](x_source, s)
-            dbg[f'noise_res_{i}'] = x_source
-            print(f"torch ++++++{i} after resblock {x_source.shape=}")
             x = self.ups[i](x)
-            dbg[f'upsample_{i}'] = x
             if i == self.num_upsamples - 1:
                 x = self.reflection_pad(x)
                 
@@ -325,20 +319,12 @@ class Generator(nn.Module):
                 else:
                     xs = xs + self.resblocks[i*self.num_kernels+j](x, s)
 
-                dbg[f'resblock_{i}_{i*self.num_kernels+j}'] = xs
-                dbg[f'resblock_in_x_{i}_{i*self.num_kernels+j}'] = x
-                dbg[f'resblock_in_s_{i}_{i*self.num_kernels+j}'] = s
             x = xs / self.num_kernels
         x = F.leaky_relu(x)
-        dbg['conv_relu'] = x
         x = self.conv_post(x)
-        dbg['conv_post'] = x
         spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :])
         phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
-        dbg['spec'] = spec
-        dbg['phase'] = phase
-        print(f"{self.stft=}")
-        return self.stft.inverse(spec, phase), dbg
+        return self.stft.inverse(spec, phase)
 
 
 class UpSample1d(nn.Module):
@@ -422,32 +408,23 @@ class Decoder(nn.Module):
                                    upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, disable_complex=disable_complex)
 
     def forward(self, asr, F0_curve, N, s):
-        dbg = {}
+
         F0 = self.F0_conv(F0_curve.unsqueeze(1))
         N = self.N_conv(N.unsqueeze(1))
-        dbg['F0'] = F0
-        dbg['N'] = N
 
         x = torch.cat([asr, F0, N], axis=1)
         x = self.encode(x, s)
-        dbg['x_0'] = x
         
         asr_res = self.asr_res(asr)
-        dbg['asr_res'] = asr_res
         res = True
         for i, block in enumerate(self.decode):
             if res:
                 # print(f"torch: Before cat: {x.shape=}, {asr_res.shape=}, {F0.shape=}, {N.shape=}")
                 x = torch.cat([x, asr_res, F0, N], axis=1)
             x = block(x, s)
-            dbg[f'x_{i+1}'] = x
             # print(f"torch: After block: {block=} {x.shape=} {s.shape=}")
             if block.upsample_type != "none":
                 res = False
 
-        x, dbg = self.generator(x, s, F0_curve, dbg)
-        dbg['x_final'] = x
-        import pickle as pkl
-        with open("debug_decoder_torch.pkl", "wb") as f:
-            pkl.dump(dbg, f)
+        x = self.generator(x, s, F0_curve)
         return x

@@ -92,34 +92,19 @@ class KModel(torch.nn.Module):
         speed: float = 1
     ) -> tuple[torch.FloatTensor, torch.LongTensor]:
  
-        dbg={}
-        dbg['input']=(input_ids, ref_s, speed)
-        dbg['input_ids']=input_ids
-        dbg['ref_s']=ref_s
-        dbg['speed']=speed
-
         bert_dur = self.bert(input_ids)
-        dbg['bert_dur']=bert_dur
-        bert_dur = bert_dur.last_hidden_state
 
         d_en = self.bert_encoder(bert_dur).transpose(-1, -2)
-        dbg['d_en']=d_en
 
         s = ref_s[:, 128:]
         d = self.predictor.text_encoder(d_en, s)
-        dbg['d']=d
-        dbg['s']=s
 
         x, _ = self.predictor.lstm(d)
-        dbg['x']=x
         
         duration = self.predictor.duration_proj(x)
-        dbg['duration']=duration
         duration = torch.sigmoid(duration).sum(axis=-1) / speed
         
-        dbg['duration_sigmoid']=duration
         pred_dur = torch.round(duration).clamp(min=1).squeeze()
-        dbg['pred_dur']=pred_dur
 
         # Alignment/upsampling of phoneme embeddings to match audio frame rate.
         # This replaces torch.repeat_interleave with an equivalent operation
@@ -127,33 +112,23 @@ class KModel(torch.nn.Module):
         
         # en = torch.repeat_interleave(d.transpose(-1,-2), pred_dur, dim=2)
         input_tensor = d.transpose(-1, -2)
-        dbg['input_tensor']=input_tensor
 
         boundaries = torch.cumsum(pred_dur, dim=0)
         values = torch.arange(boundaries[-1], device=pred_dur.device)
         expanded_indices = torch.sum(boundaries.unsqueeze(1) <= values.unsqueeze(0), dim=0)
         en = torch.index_select(input_tensor, 2, expanded_indices)
 
-        dbg['expanded_indices']=expanded_indices
-        dbg['en']=en
-        print(f"\t{boundaries.shape=} {values.shape=} en: {en.shape=} {expanded_indices.shape=}")
+        print(f"\n\n\n\t{boundaries.shape=} {values.shape=} en: {en.shape=} {expanded_indices.shape=}\n\n\n")
+        en, _ = self.predictor.shared(en.transpose(-1, -2))
         F0_pred, N_pred = self.predictor.F0Ntrain(en, s)
-        dbg['F0_pred']=F0_pred
-        dbg['N_pred']=N_pred
 
         t_en = self.text_encoder(input_ids)
-        dbg['t_en']=t_en
 
         # The original line was:
         # asr = torch.repeat_interleave(t_en, pred_dur, dim=2)
         asr = torch.index_select(t_en, 2, expanded_indices)
-        dbg['asr']=asr
 
         audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze()
-        dbg['audio']=audio
-        import pickle
-        with open('dbg.pkl', 'wb') as f:
-            pickle.dump(dbg, f)
         return audio
 
     def forward(
