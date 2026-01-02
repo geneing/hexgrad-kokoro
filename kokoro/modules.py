@@ -118,7 +118,7 @@ class ProsodyPredictor(nn.Module):
         return duration.squeeze(-1), en
 
     def F0Ntrain(self, x, s):
-        x, _ = self.shared(x.transpose(-1, -2))
+        # x, _ = self.shared(x.transpose(-1, -2)) #I moved this to model.py to make export easier
 
         F0 = x.transpose(-1, -2)
         for ii, block in enumerate(self.F0):
@@ -159,4 +159,4 @@ class DurationEncoder(nn.Module):
 class CustomAlbert(AlbertModel):
     def forward(self, *args, **kwargs):
         outputs = super().forward(*args, **kwargs)
-        return outputs #outputs.last_hidden_state
+        return outputs.last_hidden_state

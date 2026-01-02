@@ -33,7 +33,7 @@ dependencies = [
     "soundfile>=0.13.1",
     "tensorflow[and-cuda]>=2.20.0",
     "tf-keras>=2.20.1",
-    "torch",
+    "torch>=2.9.0",
     "transformers",
     "onnx==1.19.1",
     "ai-edge-litert>=2.1.0",

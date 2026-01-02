@@ -174,6 +174,8 @@ class KPipeline:
         if len(packs) == 1:
             return packs[0]
         self.voices[voice] = torch.mean(torch.stack(packs), dim=0)
+
+        print(f"Loaded and averaged {len(packs)} voices for '{voice}' self.voices[voice].shape={self.voices[voice].shape}")
         return self.voices[voice]
 
     @staticmethod
