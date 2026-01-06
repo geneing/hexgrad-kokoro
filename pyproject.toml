@@ -31,7 +31,6 @@ dependencies = [
     "pip>=25.3",
     "sounddevice>=0.5.3",
     "soundfile>=0.13.1",
-    "tensorflow[and-cuda]>=2.20.0",
     "tf-keras>=2.20.1",
     "torch>=2.9.0",
     "transformers",
@@ -40,6 +39,11 @@ dependencies = [
     "sng4onnx>=1.0.4",
     "olive-ai[gpu]>=0.10.1",
     "scipy>=1.15.3",
+    "ai-edge-torch>=0.7.1",
+    "matplotlib>=3.10.8",
+    "tensorflow>=2.20.0",
+    "spacy>=3.8.11",
+    "typer>=0.21.0",
 ]
 
 [project.scripts]

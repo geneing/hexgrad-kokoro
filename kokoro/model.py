@@ -89,6 +89,7 @@ class KModel(torch.nn.Module):
         self,
         input_ids: torch.LongTensor,
         ref_s: torch.FloatTensor,
+        mask: torch.FloatTensor,
         speed: float = 1
     ) -> tuple[torch.FloatTensor, torch.LongTensor]:
  
@@ -97,7 +98,7 @@ class KModel(torch.nn.Module):
         d_en = self.bert_encoder(bert_dur).transpose(-1, -2)
 
         s = ref_s[:, 128:]
-        d = self.predictor.text_encoder(d_en, s)
+        d = self.predictor.text_encoder(d_en, s, mask)
 
         x, _ = self.predictor.lstm(d)
         

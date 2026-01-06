@@ -1,6 +1,8 @@
 import argparse
 import os
+from pydoc import text
 from matplotlib import style
+from regex import F
 import torch
 import onnx
 import onnxruntime as ort
@@ -11,15 +13,16 @@ from kokoro import KModel, KPipeline
 from kokoro.model import KModelForONNX
 import matplotlib
 
+import ai_edge_torch
+
 ##########################################################################
 OPSET_VERSION = 19
-
-
+MAX_INPUT_LENGTH = 510
 
 def export_bert(model, input, output_dir):
     onnx_file = output_dir + "/" + "bert.onnx"
 
-    (input_ids, style, speed) = input
+    (input_ids, style, text_mask, speed) = input
 
     batch_size = Dim.STATIC #Dim("batch_size", min=1, max=32)
     input_len = Dim("seq_length", min=2, max=510)
@@ -30,15 +33,16 @@ def export_bert(model, input, output_dir):
             self.bert = model.bert
             self.bert_encoder = model.bert_encoder
 
-        def forward(self, input_ids):
-            bert_dur = self.bert(input_ids)
+        def forward(self, input_ids, text_mask=text_mask):
+            bert_dur = self.bert(input_ids, attention_mask=text_mask)
             d_en = self.bert_encoder(bert_dur).transpose(-1, -2)
+            # print(f'\nmodel_bert forward: {input_ids.shape=} {text_mask.shape=} bert_dur: {bert_dur.shape=} d_en: {d_en.shape=}\n')
             return d_en
 
     model_bert_instance = model_bert(model).eval()
 
-    d_en = model_bert_instance(input_ids)
-    print(f'bert output d_en: {d_en.shape}')
+    d_en = model_bert_instance(input_ids, text_mask)
+    print(f'\nmodel_bert_instance input: {input_ids.shape=} bert output d_en: {d_en.shape=}\n')
 
     torch.onnx.export(
         model_bert_instance, 
@@ -46,26 +50,33 @@ def export_bert(model, input, output_dir):
         f = onnx_file, 
         export_params = True, 
         verbose = False, 
-        input_names = [ 'input_ids' ], 
+        input_names = [ 'input_ids', 'text_mask' ], 
         output_names = [ 'd_en' ],
         opset_version = OPSET_VERSION, 
-        dynamic_shapes = { 'input_ids': {0: batch_size, 1: input_len} },
+        # dynamic_shapes = { 'input_ids': {0: batch_size, 1: input_len} },
         do_constant_folding = True, 
         dynamo = True,
         external_data=False,
         # report = True,
     )
 
+    # edge_model = ai_edge_torch.convert(model_bert_instance.eval(),
+    #     sample_args =  (input_ids,), 
+    #     strict_export = True, 
+    #     dynamic_shapes = { 'input_ids': {1: input_len} },
+    #     )
+
+
     print('export bert.onnx ok!')
     onnx_model = onnx.load(onnx_file)
     onnx.checker.check_model(onnx_model)
     print('onnx check ok!')
-    return d_en
+    return d_en, text_mask
 
 def export_duration_predictor(model, input, output_dir):
     onnx_file = output_dir + "/" + "duration_predictor.onnx"
 
-    (input_ids, d_en, style, speed) = input
+    (input_ids, d_en, style, text_mask, speed) = input
 
     batch_size = Dim.STATIC #Dim("batch_size", min=1, max=32)
     input_len = Dim("seq_length", min=2, max=510)
@@ -77,39 +88,40 @@ def export_duration_predictor(model, input, output_dir):
             self.predictor = model.predictor
             self.text_encoder = model.text_encoder
 
-        def forward(self, input_ids, d_en, style, speed):
-            d = self.predictor.text_encoder(d_en, style[:, 128:])
+        def forward(self, input_ids, d_en, style, text_mask, speed):
+            d = self.predictor.text_encoder(d_en, style[:, 128:], text_mask)
             x, _ = self.predictor.lstm(d)
             duration = self.predictor.duration_proj(x)
-            duration = torch.sigmoid(duration).sum(axis=-1) / speed
-            pred_dur = torch.round(duration).clamp(min=1).squeeze()
+            duration = text_mask * torch.sigmoid(duration).sum(axis=-1) / speed
+            pred_dur = torch.round(duration).squeeze()
 
             input_tensor = d.transpose(-1, -2)
 
             boundaries = torch.cumsum(pred_dur, dim=0)
             # print(f'\n\n\nboundaries: {boundaries=}\n\n\n')
-            print(f'\n\n\nboundaries: {boundaries.shape=} {boundaries[-1]=}\n\n\n')
+            print(f'\n\n\nboundaries: {boundaries.shape=} {boundaries=}\n\n\n')
             values = torch.arange(boundaries[-1], device=pred_dur.device)
             expanded_indices = torch.sum(boundaries.unsqueeze(1) <= values.unsqueeze(0), dim=0)
+            print(f"\n\n\nvalues: {expanded_indices.shape=} {expanded_indices=}\n\n\n")
             en = torch.index_select(input_tensor, 2, expanded_indices)
             en, _ = self.predictor.shared(en.transpose(-1, -2)) #moved lstm here from F0Ntrain to make dyanmo export of F0Ntrain possible
-            t_en = self.text_encoder(input_ids)
+            t_en = self.text_encoder(input_ids, text_mask)
 
             return pred_dur, input_tensor, expanded_indices, en, t_en
 
     with torch.no_grad():
         model_duration_instance = model_duration_predictor(model).eval()
 
-        pred_dur, input_tensor, expanded_indices, en, t_en = model_duration_instance(input_ids, d_en, style, speed)
-        print(f'\n\n\nduration predictor output pred_dur: {pred_dur.shape=} {en.shape=} {t_en.shape=} {expanded_indices=}\n\n\n')
+        pred_dur, input_tensor, expanded_indices, en, t_en = model_duration_instance(input_ids, d_en, style, text_mask, speed)
+        print(f'\nmodel_duration_instance: {input_ids.shape=} {d_en.shape=} {pred_dur.shape=} {input_tensor.shape=} {en.shape=} {t_en.shape=} {expanded_indices=}\n\n')
 
         torch.onnx.export(
             model_duration_instance, 
-            args =  (input_ids, d_en, style, speed), 
+            args =  (input_ids, d_en, style, text_mask, speed), 
             f = onnx_file, 
             export_params = True, 
             verbose = False, 
-            input_names = [ 'input_ids', 'd_en', 'style', 'speed' ], 
+            input_names = [ 'input_ids', 'd_en', 'style', 'text_mask', 'speed' ], 
             output_names = [ 'pred_dur', 'd', 'expanded_indices', 'en', 't_en' ],
             opset_version = OPSET_VERSION, 
             dynamic_axes = { 
@@ -123,6 +135,7 @@ def export_duration_predictor(model, input, output_dir):
             external_data=False,
             # report = True,
         )
+
 
     # torch.onnx.export(
     #     model_duration_instance, 
@@ -178,7 +191,7 @@ def export_text_encoder(model, input, output_dir):
         model_text_encoder_instance = model_text_encoder(model).eval()
 
         audio, asr, F0_pred, N_pred = model_text_encoder_instance(en, style, expanded_indices, t_en)
-
+        print(f'\nmodel_text_encoder_instance: {en.shape=} {style.shape=} {expanded_indices.shape=} {t_en.shape=} {audio.shape=} {asr.shape=} {F0_pred.shape=} {N_pred.shape=}\n\n')
         batch_size = Dim.STATIC 
         en_len = Dim("en", min=2) #, max=30000)
         input_len = Dim("seq_length", min=2, max=510)
@@ -221,16 +234,28 @@ def export_onnx(model, output_dir):
     # print(f'\n\nexport_onnx SIM: {input_ids.shape=} {style.shape=} {speed.shape=}'          )
 
     input_ids, style, speed = load_sample(model)
+
     print(f'\n\nexport_onnx    : {input_ids.shape=} {style.shape=} {speed.shape=}')
 
-    d_en = export_bert(model.kmodel, (input_ids, style, speed), output_dir=output_dir)
-    pred_dur, input_tensor, expanded_indices, en, t_en = export_duration_predictor(model.kmodel, (input_ids, d_en, style, speed), output_dir=output_dir)
+    #pad to 510 and create mask
+    text_mask = torch.zeros(1, MAX_INPUT_LENGTH, dtype=torch.float32).to(input_ids.device)
+    text_mask[0, :input_ids.shape[1]] = 1
+    input_ids = torch.nn.functional.pad(input_ids, (0, MAX_INPUT_LENGTH - input_ids.shape[1]))
+
+    d_en, text_mask = export_bert(model.kmodel, (input_ids, style, text_mask, speed), output_dir=output_dir)
+    pred_dur, input_tensor, expanded_indices, en, t_en = export_duration_predictor(model.kmodel, (input_ids, d_en, style, text_mask, speed), output_dir=output_dir)
     audio, asr, F0_pred, N_pred = export_text_encoder(model.kmodel, (en, style, expanded_indices, t_en), output_dir=output_dir)
 
     # Save audio to onnx_test.wav
     import scipy.io.wavfile as wavfile
     audio = audio.numpy() if isinstance(audio, torch.Tensor) else audio
     wavfile.write(os.path.join(output_dir, 'onnx_test.wav'), 24000, (audio * 32767).astype('int16'))
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(12, 4))
+    plt.plot(audio)
+    plt.savefig(os.path.join(output_dir, 'onnx_test.png'))
+    plt.close()
     print('export kokoro.onnx ok!')
 
     onnx_model = onnx.load(onnx_file)

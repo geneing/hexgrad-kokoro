@@ -50,17 +50,18 @@ class TextEncoder(nn.Module):
  
         self.lstm = nn.LSTM(channels, channels//2, 1, batch_first=True, bidirectional=True)
 
-    def forward(self, x):
+    def forward(self, x, mask):
         x = self.embedding(x)  # [B, T, emb]
-        x = x.transpose(1, 2)  # [B, emb, T]
+        x = mask * x.transpose(1, 2)  # [B, emb, T]
         for i,c in enumerate(self.cnn):
             for ii, l in enumerate(c):
-                x = l(x) 
+                x = mask*l(x) 
             # x = c(x)
 
         x = x.transpose(1, 2)  # [B, T, chn]
         x, _ = self.lstm(x)
         x = x.transpose(-1, -2)
+        x = x * mask.unsqueeze(1)
         return x
 
 
@@ -144,11 +145,12 @@ class DurationEncoder(nn.Module):
         self.d_model = d_model
         self.sty_dim = sty_dim
 
-    def forward(self, x, style):
+    def forward(self, x, style, text_mask):
         x = x.transpose(-1, -2) # [B, C, T] -> [B, T, C]
         s = style.expand(x.shape[0], x.shape[1], -1) # [B, C] -> [B, T, C]
 
         x = torch.cat([x, s], axis=-1) # [B, T, C+S]
+        x = text_mask.unsqueeze(-1) * x
         for i in range(self.nlayers):
             x, _ = self.lstms[2*i](x)
             x = self.lstms[2*i+1](x, style)
