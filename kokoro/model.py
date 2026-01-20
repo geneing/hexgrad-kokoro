@@ -33,7 +33,9 @@ class KModel(torch.nn.Module):
         repo_id: Optional[str] = None,
         config: Union[Dict, str, None] = None,
         model: Optional[str] = None,
-        disable_complex: bool = False
+        disable_complex: bool = False,
+        use_fixed_stats: bool = False,
+        stats_file: Optional[str] = None
     ):
         super().__init__()
         if repo_id is None:
@@ -62,7 +64,9 @@ class KModel(torch.nn.Module):
         )
         self.decoder = Decoder(
             dim_in=config['hidden_dim'], style_dim=config['style_dim'],
-            dim_out=config['n_mels'], disable_complex=disable_complex, **config['istftnet']
+            dim_out=config['n_mels'], disable_complex=disable_complex, 
+            use_fixed_stats=use_fixed_stats, stats_file=stats_file,
+            **config['istftnet']
         )
         if not model:
             model = hf_hub_download(repo_id=repo_id, filename=KModel.MODEL_NAMES[repo_id])
@@ -82,7 +86,7 @@ class KModel(torch.nn.Module):
     @dataclass
     class Output:
         audio: torch.FloatTensor
-        # pred_dur: Optional[torch.LongTensor] = None
+        pred_dur: Optional[torch.LongTensor] = None
 
     @torch.no_grad()
     def forward_with_tokens(
@@ -123,14 +127,15 @@ class KModel(torch.nn.Module):
         en, _ = self.predictor.shared(en.transpose(-1, -2))
         F0_pred, N_pred = self.predictor.F0Ntrain(en, s)
 
-        t_en = self.text_encoder(input_ids)
+        # Pass mask directly to text_encoder - it handles broadcasting internally
+        t_en = self.text_encoder(input_ids, mask)
 
         # The original line was:
         # asr = torch.repeat_interleave(t_en, pred_dur, dim=2)
         asr = torch.index_select(t_en, 2, expanded_indices)
 
         audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze()
-        return audio
+        return audio, pred_dur
 
     def forward(
         self,
@@ -144,10 +149,15 @@ class KModel(torch.nn.Module):
         assert len(input_ids)+2 <= self.context_length, (len(input_ids)+2, self.context_length)
         input_ids = torch.LongTensor([[0, *input_ids, 0]]).to(self.device)
         ref_s = ref_s.to(self.device)
-        audio = self.forward_with_tokens(input_ids, ref_s, speed)
+        
+        # Create text_mask tensor matching the actual sequence length
+        seq_len = input_ids.shape[1]
+        text_mask = torch.ones(1, seq_len, dtype=torch.float32).to(self.device)
+        
+        audio, pred_dur = self.forward_with_tokens(input_ids, ref_s, text_mask, speed)
         audio = audio.squeeze().cpu()
-        # logger.debug(f"pred_dur: {pred_dur}")
-        return self.Output(audio=audio) if return_output else audio
+        pred_dur = pred_dur.cpu()
+        return self.Output(audio=audio, pred_dur=pred_dur) if return_output else audio
 
 class KModelForONNX(torch.nn.Module):
     def __init__(self, kmodel: KModel):

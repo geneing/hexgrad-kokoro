@@ -5,6 +5,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import json
+import os
 
 
 # https://github.com/yl4579/StyleTTS2/blob/main/Modules/utils.py
@@ -17,11 +19,68 @@ def get_padding(kernel_size, dilation=1):
     return int((kernel_size*dilation - dilation)/2)
 
 
+class FixedInstanceNorm1d(nn.Module):
+    """InstanceNorm1d that uses pre-computed fixed statistics instead of computing from data."""
+    def __init__(self, num_features, layer_name, stats_file, affine=True, eps=1e-5):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.layer_name = layer_name
+        
+        # Load pre-computed statistics
+        with open(stats_file, 'r') as f:
+            all_stats = json.load(f)
+        
+        if layer_name not in all_stats:
+            raise ValueError(f"Layer {layer_name} not found in stats file {stats_file}")
+        
+        stats = all_stats[layer_name]
+        # Statistics are now per-channel arrays
+        mean_array = torch.tensor(stats['mean'], dtype=torch.float32)
+        var_array = torch.tensor(stats['var'], dtype=torch.float32)
+        
+        # Validate shapes
+        if mean_array.numel() != num_features or var_array.numel() != num_features:
+            raise ValueError(f"Statistics shape mismatch for layer '{layer_name}': "
+                           f"expected {num_features} channels, got {mean_array.numel()} and {var_array.numel()}")
+        
+        # Register as buffers (not trainable parameters)
+        self.register_buffer('running_mean', mean_array)
+        self.register_buffer('running_var', var_array)
+        
+        # Optional affine parameters (same as InstanceNorm1d)
+        if affine:
+            self.weight = nn.Parameter(torch.ones(num_features))
+            self.bias = nn.Parameter(torch.zeros(num_features))
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias', None)
+    
+    def forward(self, x):
+        # x shape: (batch, channels, time)
+        # Use the pre-computed per-channel mean and variance
+        # Reshape running_mean and running_var to (1, channels, 1) for broadcasting
+        mean = self.running_mean.view(1, -1, 1)
+        var = self.running_var.view(1, -1, 1)
+        
+        # Normalize using fixed statistics
+        x_normalized = (x - mean) / torch.sqrt(var + self.eps)
+        
+        # Apply affine transformation if present
+        if self.weight is not None:
+            x_normalized = x_normalized * self.weight.view(1, -1, 1) + self.bias.view(1, -1, 1)
+        
+        return x_normalized
+
+
 class AdaIN1d(nn.Module):
-    def __init__(self, style_dim, num_features):
+    def __init__(self, style_dim, num_features, layer_name=None, use_fixed_stats=False, stats_file=None):
         super().__init__()
         # affine should be False, however there's a bug in the old torch.onnx.export (not newer dynamo) that causes the channel dimension to be lost if affine=False. When affine is true, there's additional learnably parameters. This shouldn't really matter setting it to True, since we're in inference mode
-        self.norm = nn.InstanceNorm1d(num_features, affine=True)
+        if use_fixed_stats and layer_name is not None and stats_file is not None:
+            self.norm = FixedInstanceNorm1d(num_features, layer_name, stats_file, affine=True)
+        else:
+            self.norm = nn.InstanceNorm1d(num_features, affine=True)
         self.fc = nn.Linear(style_dim, num_features*2)
 
     def forward(self, x, s):
@@ -33,7 +92,7 @@ class AdaIN1d(nn.Module):
 
 
 class AdaINResBlock1(nn.Module):
-    def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5), style_dim=64):
+    def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5), style_dim=64, block_name=None, use_fixed_stats=False, stats_file=None):
         super(AdaINResBlock1, self).__init__()
         self.convs1 = nn.ModuleList([
             weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[0],
@@ -54,14 +113,14 @@ class AdaINResBlock1(nn.Module):
         ])
         self.convs2.apply(init_weights)
         self.adain1 = nn.ModuleList([
-            AdaIN1d(style_dim, channels),
-            AdaIN1d(style_dim, channels),
-            AdaIN1d(style_dim, channels),
+            AdaIN1d(style_dim, channels, f"{block_name}.adain1.0.norm" if block_name else None, use_fixed_stats, stats_file),
+            AdaIN1d(style_dim, channels, f"{block_name}.adain1.1.norm" if block_name else None, use_fixed_stats, stats_file),
+            AdaIN1d(style_dim, channels, f"{block_name}.adain1.2.norm" if block_name else None, use_fixed_stats, stats_file),
         ])
         self.adain2 = nn.ModuleList([
-            AdaIN1d(style_dim, channels),
-            AdaIN1d(style_dim, channels),
-            AdaIN1d(style_dim, channels),
+            AdaIN1d(style_dim, channels, f"{block_name}.adain2.0.norm" if block_name else None, use_fixed_stats, stats_file),
+            AdaIN1d(style_dim, channels, f"{block_name}.adain2.1.norm" if block_name else None, use_fixed_stats, stats_file),
+            AdaIN1d(style_dim, channels, f"{block_name}.adain2.2.norm" if block_name else None, use_fixed_stats, stats_file),
         ])
         self.alpha1 = nn.ParameterList([nn.Parameter(torch.ones(1, channels, 1)) for i in range(len(self.convs1))])
         self.alpha2 = nn.ParameterList([nn.Parameter(torch.ones(1, channels, 1)) for i in range(len(self.convs2))])
@@ -249,7 +308,7 @@ class SourceModuleHnNSF(nn.Module):
 
 
 class Generator(nn.Module):
-    def __init__(self, style_dim, resblock_kernel_sizes, upsample_rates, upsample_initial_channel, resblock_dilation_sizes, upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, disable_complex=False):
+    def __init__(self, style_dim, resblock_kernel_sizes, upsample_rates, upsample_initial_channel, resblock_dilation_sizes, upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, disable_complex=False, use_fixed_stats=False, stats_file=None):
         super(Generator, self).__init__()
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
@@ -269,17 +328,20 @@ class Generator(nn.Module):
         for i in range(len(self.ups)):
             ch = upsample_initial_channel//(2**(i+1))
             for j, (k, d) in enumerate(zip(resblock_kernel_sizes,resblock_dilation_sizes)):
-                self.resblocks.append(AdaINResBlock1(ch, k, d, style_dim))
+                block_name = f"generator.resblocks.{len(self.resblocks)}" if use_fixed_stats else None
+                self.resblocks.append(AdaINResBlock1(ch, k, d, style_dim, block_name, use_fixed_stats, stats_file))
             c_cur = upsample_initial_channel // (2 ** (i + 1))
             if i + 1 < len(upsample_rates):
                 stride_f0 = math.prod(upsample_rates[i + 1:])
 
                 self.noise_convs.append(nn.Conv1d(
                     gen_istft_n_fft + 2, c_cur, kernel_size=stride_f0 * 2, stride=stride_f0, padding=(stride_f0+1) // 2))
-                self.noise_res.append(AdaINResBlock1(c_cur, 7, [1,3,5], style_dim))
+                block_name = f"generator.noise_res.{len(self.noise_res)}" if use_fixed_stats else None
+                self.noise_res.append(AdaINResBlock1(c_cur, 7, [1,3,5], style_dim, block_name, use_fixed_stats, stats_file))
             else:
                 self.noise_convs.append(nn.Conv1d(gen_istft_n_fft + 2, c_cur, kernel_size=1))
-                self.noise_res.append(AdaINResBlock1(c_cur, 11, [1,3,5], style_dim))
+                block_name = f"generator.noise_res.{len(self.noise_res)}" if use_fixed_stats else None
+                self.noise_res.append(AdaINResBlock1(c_cur, 11, [1,3,5], style_dim, block_name, use_fixed_stats, stats_file))
         self.post_n_fft = gen_istft_n_fft
         self.conv_post = weight_norm(nn.Conv1d(ch, self.post_n_fft + 2, 7, 1, padding=3))
         self.ups.apply(init_weights)
@@ -392,7 +454,9 @@ class Decoder(nn.Module):
                  resblock_dilation_sizes,
                  upsample_kernel_sizes,
                  gen_istft_n_fft, gen_istft_hop_size,
-                 disable_complex=False):
+                 disable_complex=False,
+                 use_fixed_stats=False,
+                 stats_file=None):
         super().__init__()
         self.encode = AdainResBlk1d(dim_in + 2, 1024, style_dim)
         self.decode = nn.ModuleList()
@@ -405,7 +469,10 @@ class Decoder(nn.Module):
         self.asr_res = nn.Sequential(weight_norm(nn.Conv1d(512, 64, kernel_size=1)))
         self.generator = Generator(style_dim, resblock_kernel_sizes, upsample_rates, 
                                    upsample_initial_channel, resblock_dilation_sizes, 
-                                   upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, disable_complex=disable_complex)
+                                   upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, 
+                                   disable_complex=disable_complex, 
+                                   use_fixed_stats=use_fixed_stats, 
+                                   stats_file=stats_file)
 
     def forward(self, asr, F0_curve, N, s):
 
