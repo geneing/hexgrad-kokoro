@@ -27,6 +27,7 @@ dependencies = [
     "tensorflow>=2.18.1",
     "torch",
     "transformers",
+    "vocos",
 ]
 
 [project.scripts]
@@ -35,6 +36,9 @@ kokoro = "kokoro.__main__:main"
 [tool.hatch.build.targets.wheel]
 only-include = ["kokoro"]
 only-packages = true
+
+[tool.uv.sources]
+vocos = { path = "third_party/vocos", editable = true }
 
 [project.urls]
 Homepage = "https://github.com/hexgrad/kokoro"
