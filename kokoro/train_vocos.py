@@ -25,17 +25,10 @@ from vocos.loss import (
     DiscriminatorLoss as VocosDiscriminatorLoss,
     FeatureMatchingLoss,
     GeneratorLoss as VocosGeneratorLoss,
-    MelSpecReconstructionLoss,
 )
 from vocos.models import VocosBackbone
 
-from .styletts2_losses import (
-    StyleTTS2MultiResolutionSTFTLoss,
-    styletts2_discriminator_lsgan_loss,
-    styletts2_discriminator_tprls_loss,
-    styletts2_generator_lsgan_loss,
-    styletts2_generator_tprls_loss,
-)
+from .styletts2_losses import StyleTTS2MultiResolutionSTFTLoss
 
 
 @dataclass
@@ -334,16 +327,19 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--pretrain-mel-steps", type=int, default=3000)
 
-    parser.add_argument("--mel-loss-coeff", type=float, default=45.0)
+    parser.add_argument("--gan-loss-coeff", type=float, default=1.0)
+    parser.add_argument("--fm-loss-coeff", type=float, default=2.0)
+    parser.add_argument("--mrstft-loss-coeff", type=float, default=45.0)
+    parser.add_argument("--mrstft-final-ratio", type=float, default=0.25)
     parser.add_argument("--mrd-loss-coeff", type=float, default=1.0)
-    parser.add_argument("--style-stft-coeff", type=float, default=5.0)
-    parser.add_argument("--style-gan-coeff", type=float, default=0.1)
-    parser.add_argument("--style-tprls-coeff", type=float, default=0.05)
 
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=4444)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
 
+    parser.add_argument("--sample-voices", type=str, default="af_bella,af_nicole,af_heart")
+    parser.add_argument("--sample-count", type=int, default=5)
+    parser.add_argument("--sample-max-frames", type=int, default=640)
     parser.add_argument("--output-dir", type=Path, default=Path("runs/vocos_kokoro_paired"))
     parser.add_argument("--resume", type=Path, default=None)
     return parser.parse_args()
@@ -488,6 +484,130 @@ def align_audio(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.T
     return a[..., :n], b[..., :n]
 
 
+def voice_from_wav_path(wav_path: str) -> str:
+    return Path(wav_path).parent.name
+
+
+def select_preview_items(
+    items: Sequence[TrainItem],
+    voices: Sequence[str],
+    sample_count: int,
+    seed: int,
+) -> List[TrainItem]:
+    by_voice: Dict[str, List[TrainItem]] = {v: [] for v in voices}
+    for item in items:
+        voice = item.wav_path.parent.name
+        if voice in by_voice:
+            by_voice[voice].append(item)
+
+    rng = random.Random(seed)
+    selected: List[TrainItem] = []
+    voice_order = list(voices)
+    while len(selected) < sample_count and voice_order:
+        next_voice_order: List[str] = []
+        for voice in voice_order:
+            pool = by_voice.get(voice, [])
+            if not pool:
+                continue
+            idx = rng.randrange(len(pool))
+            selected.append(pool.pop(idx))
+            if pool:
+                next_voice_order.append(voice)
+            if len(selected) >= sample_count:
+                break
+        voice_order = next_voice_order
+
+    if len(selected) < sample_count:
+        fallback = [x for x in items if x not in selected]
+        rng.shuffle(fallback)
+        selected.extend(fallback[: max(0, sample_count - len(selected))])
+
+    return selected[:sample_count]
+
+
+def compute_dynamic_weights(
+    step: int,
+    max_steps: int,
+    pretrain_steps: int,
+    gan_base: float,
+    fm_base: float,
+    mrstft_base: float,
+    mrstft_final_ratio: float,
+) -> Dict[str, float]:
+    post_warmup = max(1, max_steps - pretrain_steps)
+    adv_ramp_window = max(1, int(0.1 * post_warmup))
+    if step < pretrain_steps:
+        adv_scale = 0.0
+    else:
+        adv_scale = min(1.0, (step - pretrain_steps) / float(adv_ramp_window))
+    progress = min(1.0, step / float(max(1, max_steps)))
+    final_ratio = max(0.0, min(1.0, mrstft_final_ratio))
+    mrstft_scale = 1.0 - (1.0 - final_ratio) * progress
+    return {
+        "gan": gan_base * adv_scale,
+        "fm": fm_base * adv_scale,
+        "mrstft": mrstft_base * mrstft_scale,
+    }
+
+
+def log_preview_samples(
+    generator: nn.Module,
+    dataset: PairedVocoderDataset,
+    preview_items: Sequence[TrainItem],
+    device: torch.device,
+    step: int,
+    writer: SummaryWriter,
+    sample_rate: int,
+    hop_length: int,
+    max_frames: int,
+) -> None:
+    if not preview_items:
+        return
+    index_by_wav = {str(it.wav_path): i for i, it in enumerate(dataset.items)}
+    generator.eval()
+    with torch.no_grad():
+        for i, item in enumerate(preview_items):
+            row_idx = index_by_wav.get(str(item.wav_path))
+            if row_idx is None:
+                continue
+            row = dataset[row_idx]
+            total_frames = int(row["f0"].shape[-1])
+            target_frames = min(total_frames, max_frames)
+            if target_frames <= 0:
+                continue
+
+            asr = row["asr"]
+            f0 = row["f0"]
+            noise = row["noise"]
+            style = row["style"]
+            wav = row["audio"]
+
+            if asr.shape[-1] != total_frames:
+                asr = torch.nn.functional.interpolate(
+                    asr.unsqueeze(0),
+                    size=total_frames,
+                    mode="linear",
+                    align_corners=False,
+                ).squeeze(0)
+
+            asr_s = asr[:, :target_frames]
+            f0_s = f0[:target_frames].unsqueeze(0)
+            noise_s = noise[:target_frames].unsqueeze(0)
+            style_s = style.unsqueeze(-1).expand(style.shape[0], target_frames)
+            feat = torch.cat([asr_s, f0_s, noise_s, style_s], dim=0).unsqueeze(0).to(device)
+
+            target_audio = target_frames * hop_length
+            real = wav[:target_audio].unsqueeze(0).to(device)
+            pred = generator(feat)
+            pred, real = align_audio(pred, real)
+
+            voice = voice_from_wav_path(str(item.wav_path))
+            tag = f"samples/{i+1:02d}_{voice}"
+            writer.add_audio(f"{tag}/target", real[0].detach().cpu(), step, sample_rate)
+            writer.add_audio(f"{tag}/pred", pred[0].detach().cpu(), step, sample_rate)
+    generator.train()
+
+
 def waveform_to_image(
     target_wav: torch.Tensor,
     pred_wav: torch.Tensor | None = None,
@@ -583,18 +703,18 @@ def run_validation(
     generator: nn.Module,
     val_loader: DataLoader,
     device: torch.device,
-    mel_loss: MelSpecReconstructionLoss,
-    style_stft_loss: StyleTTS2MultiResolutionSTFTLoss,
+    mrstft_loss: StyleTTS2MultiResolutionSTFTLoss,
     writer: SummaryWriter,
     log_waveform_images: bool,
     step: int,
     max_batches: int,
     sample_rate: int,
+    loss_weights: Dict[str, float],
 ) -> None:
     generator.eval()
-    mel_values: List[float] = []
-    stft_values: List[float] = []
+    mrstft_values: List[float] = []
     l1_values: List[float] = []
+    total_values: List[float] = []
 
     with torch.no_grad():
         for i, batch in enumerate(val_loader):
@@ -605,11 +725,10 @@ def run_validation(
             pred = generator(features)
             pred, real = align_audio(pred, real)
 
-            m = mel_loss(pred, real)
-            s = style_stft_loss(pred, real)
+            s = mrstft_loss(pred, real)
             l1 = torch.mean(torch.abs(pred - real))
-            mel_values.append(float(m.item()))
-            stft_values.append(float(s.item()))
+            total_values.append(float((loss_weights["mrstft"] * s).item()))
+            mrstft_values.append(float(s.item()))
             l1_values.append(float(l1.item()))
 
             if i == 0:
@@ -622,9 +741,10 @@ def run_validation(
                         step,
                     )
 
-    if mel_values:
-        writer.add_scalar("val/mel_loss", sum(mel_values) / len(mel_values), step)
-        writer.add_scalar("val/style_stft_loss", sum(stft_values) / len(stft_values), step)
+    if mrstft_values:
+        writer.add_scalar("val/generator_total_estimate", sum(total_values) / len(total_values), step)
+        writer.add_scalar("val/gen_mrstft_raw", sum(mrstft_values) / len(mrstft_values), step)
+        writer.add_scalar("val/gen_mrstft_weighted", sum(total_values) / len(total_values), step)
         writer.add_scalar("val/l1_wave_loss", sum(l1_values) / len(l1_values), step)
 
     generator.train()
@@ -665,6 +785,22 @@ def main() -> None:
         raise RuntimeError("No val items found")
 
     logger.info(f"Train items: {len(train_items)} | Val items: {len(val_items)}")
+    sample_voices = [x.strip() for x in args.sample_voices.split(",") if x.strip()]
+    preview_items = select_preview_items(
+        items=val_items,
+        voices=sample_voices,
+        sample_count=max(1, args.sample_count),
+        seed=args.seed,
+    )
+    preview_voices_found = sorted({item.wav_path.parent.name for item in preview_items})
+    logger.info(
+        f"Preview samples: {len(preview_items)} items from voices={sample_voices} "
+        f"(requested={args.sample_count})"
+    )
+    if len(preview_items) < args.sample_count or not all(v in preview_voices_found for v in sample_voices):
+        logger.warning(
+            f"Could not fully satisfy requested preview voice mix. Found voices in preview: {preview_voices_found}"
+        )
 
     state = AdaptiveBatchState(
         frame_cap=args.frame_cap,
@@ -725,13 +861,7 @@ def main() -> None:
     vocos_disc_loss = VocosDiscriminatorLoss()
     vocos_gen_loss = VocosGeneratorLoss()
     feat_match_loss = FeatureMatchingLoss()
-    mel_loss = MelSpecReconstructionLoss(
-        sample_rate=args.sample_rate,
-        n_fft=args.n_fft,
-        hop_length=args.hop_length,
-        n_mels=80,
-    ).to(device)
-    style_stft_loss = StyleTTS2MultiResolutionSTFTLoss(sample_rate=args.sample_rate).to(device)
+    mrstft_loss = StyleTTS2MultiResolutionSTFTLoss(sample_rate=args.sample_rate).to(device)
 
     gen_opt = torch.optim.AdamW(generator.parameters(), lr=args.gen_lr, betas=(0.8, 0.9), weight_decay=args.weight_decay)
     disc_params = list(mpd.parameters()) + list(mrd.parameters())
@@ -811,33 +941,30 @@ def main() -> None:
                         fake_detached = generator(features)
                         fake_detached, real_for_disc = align_audio(fake_detached, real)
 
+                    loss_weights = compute_dynamic_weights(
+                        step=step,
+                        max_steps=args.max_steps,
+                        pretrain_steps=args.pretrain_mel_steps,
+                        gan_base=args.gan_loss_coeff,
+                        fm_base=args.fm_loss_coeff,
+                        mrstft_base=args.mrstft_loss_coeff,
+                        mrstft_final_ratio=args.mrstft_final_ratio,
+                    )
                     train_discriminator = step >= args.pretrain_mel_steps
                     d_total = torch.zeros(1, device=device)
-                    d_vocos = torch.zeros(1, device=device)
-                    d_style_lsgan = torch.zeros(1, device=device)
-                    d_style_tprls = torch.zeros(1, device=device)
+                    d_mp = torch.zeros(1, device=device)
+                    d_mrd = torch.zeros(1, device=device)
 
                     if train_discriminator:
                         disc_opt.zero_grad(set_to_none=True)
                         r_mp, g_mp, _, _ = mpd(real_for_disc, fake_detached)
                         r_mrd, g_mrd, _, _ = mrd(real_for_disc, fake_detached)
 
-                        d_mp, d_mp_real, _ = vocos_disc_loss(r_mp, g_mp)
-                        d_mrd, d_mrd_real, _ = vocos_disc_loss(r_mrd, g_mrd)
-                        d_mp = d_mp / max(1, len(d_mp_real))
-                        d_mrd = d_mrd / max(1, len(d_mrd_real))
-                        d_vocos = d_mp + args.mrd_loss_coeff * d_mrd
-
-                        d_style_lsgan = (
-                            styletts2_discriminator_lsgan_loss(r_mp, g_mp)
-                            + args.mrd_loss_coeff * styletts2_discriminator_lsgan_loss(r_mrd, g_mrd)
-                        )
-                        d_style_tprls = (
-                            styletts2_discriminator_tprls_loss(r_mp, g_mp)
-                            + args.mrd_loss_coeff * styletts2_discriminator_tprls_loss(r_mrd, g_mrd)
-                        )
-
-                        d_total = d_vocos + args.style_gan_coeff * d_style_lsgan + args.style_tprls_coeff * d_style_tprls
+                        d_mp_raw, d_mp_real, _ = vocos_disc_loss(r_mp, g_mp)
+                        d_mrd_raw, d_mrd_real, _ = vocos_disc_loss(r_mrd, g_mrd)
+                        d_mp = d_mp_raw / max(1, len(d_mp_real))
+                        d_mrd = d_mrd_raw / max(1, len(d_mrd_real))
+                        d_total = d_mp + args.mrd_loss_coeff * d_mrd
                         d_total.backward()
                         disc_opt.step()
 
@@ -846,39 +973,28 @@ def main() -> None:
                     fake = generator(features)
                     fake, real = align_audio(fake, real)
 
-                    r_mp, g_mp_outs, fmap_r_mp, fmap_g_mp = mpd(real, fake)
-                    r_mrd, g_mrd_outs, fmap_r_mrd, fmap_g_mrd = mrd(real, fake)
+                    g_gan_raw = torch.zeros(1, device=device)
+                    g_fm_raw = torch.zeros(1, device=device)
+                    if train_discriminator and loss_weights["gan"] > 0.0:
+                        _, g_mp_outs, fmap_r_mp, fmap_g_mp = mpd(real, fake)
+                        _, g_mrd_outs, fmap_r_mrd, fmap_g_mrd = mrd(real, fake)
 
-                    g_mp_adv, g_mp_terms = vocos_gen_loss(g_mp_outs)
-                    g_mrd_adv, g_mrd_terms = vocos_gen_loss(g_mrd_outs)
-                    g_mp_adv = g_mp_adv / max(1, len(g_mp_terms))
-                    g_mrd_adv = g_mrd_adv / max(1, len(g_mrd_terms))
+                        g_mp_adv, g_mp_terms = vocos_gen_loss(g_mp_outs)
+                        g_mrd_adv, g_mrd_terms = vocos_gen_loss(g_mrd_outs)
+                        g_mp_adv = g_mp_adv / max(1, len(g_mp_terms))
+                        g_mrd_adv = g_mrd_adv / max(1, len(g_mrd_terms))
 
-                    fm_mp = feat_match_loss(fmap_r_mp, fmap_g_mp) / max(1, len(fmap_r_mp))
-                    fm_mrd = feat_match_loss(fmap_r_mrd, fmap_g_mrd) / max(1, len(fmap_r_mrd))
+                        fm_mp = feat_match_loss(fmap_r_mp, fmap_g_mp) / max(1, len(fmap_r_mp))
+                        fm_mrd = feat_match_loss(fmap_r_mrd, fmap_g_mrd) / max(1, len(fmap_r_mrd))
 
-                    m_loss = mel_loss(fake, real)
-                    stft_loss = style_stft_loss(fake, real)
+                        g_gan_raw = g_mp_adv + args.mrd_loss_coeff * g_mrd_adv
+                        g_fm_raw = fm_mp + args.mrd_loss_coeff * fm_mrd
+                    g_mrstft_raw = mrstft_loss(fake, real)
 
-                    g_style_lsgan = (
-                        styletts2_generator_lsgan_loss(g_mp_outs)
-                        + args.mrd_loss_coeff * styletts2_generator_lsgan_loss(g_mrd_outs)
-                    )
-                    g_style_tprls = (
-                        styletts2_generator_tprls_loss(r_mp, g_mp_outs)
-                        + args.mrd_loss_coeff * styletts2_generator_tprls_loss(r_mrd, g_mrd_outs)
-                    )
-
-                    g_total = (
-                        g_mp_adv
-                        + args.mrd_loss_coeff * g_mrd_adv
-                        + fm_mp
-                        + args.mrd_loss_coeff * fm_mrd
-                        + args.mel_loss_coeff * m_loss
-                        + args.style_stft_coeff * stft_loss
-                        + args.style_gan_coeff * g_style_lsgan
-                        + args.style_tprls_coeff * g_style_tprls
-                    )
+                    g_gan_weighted = loss_weights["gan"] * g_gan_raw
+                    g_fm_weighted = loss_weights["fm"] * g_fm_raw
+                    g_mrstft_weighted = loss_weights["mrstft"] * g_mrstft_raw
+                    g_total = g_gan_weighted + g_fm_weighted + g_mrstft_weighted
                     g_total.backward()
                     gen_opt.step()
 
@@ -889,16 +1005,18 @@ def main() -> None:
                     # Logging
                     step += 1
                     running["gen_total"] = float(g_total.item())
-                    running["gen_mel"] = float(m_loss.item())
-                    running["gen_style_stft"] = float(stft_loss.item())
-                    running["gen_vocos_adv"] = float((g_mp_adv + args.mrd_loss_coeff * g_mrd_adv).item())
-                    running["gen_feat_match"] = float((fm_mp + args.mrd_loss_coeff * fm_mrd).item())
-                    running["gen_style_lsgan"] = float(g_style_lsgan.item())
-                    running["gen_style_tprls"] = float(g_style_tprls.item())
+                    running["gen_gan_raw"] = float(g_gan_raw.item())
+                    running["gen_feat_match_raw"] = float(g_fm_raw.item())
+                    running["gen_mrstft_raw"] = float(g_mrstft_raw.item())
+                    running["gen_gan_weighted"] = float(g_gan_weighted.item())
+                    running["gen_feat_match_weighted"] = float(g_fm_weighted.item())
+                    running["gen_mrstft_weighted"] = float(g_mrstft_weighted.item())
+                    running["weight_gan"] = float(loss_weights["gan"])
+                    running["weight_feat_match"] = float(loss_weights["fm"])
+                    running["weight_mrstft"] = float(loss_weights["mrstft"])
                     running["disc_total"] = float(d_total.item())
-                    running["disc_vocos"] = float(d_vocos.item())
-                    running["disc_style_lsgan"] = float(d_style_lsgan.item())
-                    running["disc_style_tprls"] = float(d_style_tprls.item())
+                    running["disc_mp"] = float(d_mp.item())
+                    running["disc_mrd"] = float(d_mrd.item())
                     running["frame_cap"] = float(state.frame_cap)
                     running["target_frames"] = float(batch_local["target_frames"])
                     running["lr_gen"] = float(gen_opt.param_groups[0]["lr"])
@@ -924,6 +1042,17 @@ def main() -> None:
                                 waveform_to_image(real[0], fake[0]),
                                 step,
                             )
+                        log_preview_samples(
+                            generator=generator,
+                            dataset=val_dataset,
+                            preview_items=preview_items,
+                            device=device,
+                            step=step,
+                            writer=writer,
+                            sample_rate=args.sample_rate,
+                            hop_length=args.hop_length,
+                            max_frames=args.sample_max_frames,
+                        )
 
                     if time.time() - last_log > 10:
                         logger.info(
@@ -937,13 +1066,13 @@ def main() -> None:
                             generator=generator,
                             val_loader=val_loader,
                             device=device,
-                            mel_loss=mel_loss,
-                            style_stft_loss=style_stft_loss,
+                            mrstft_loss=mrstft_loss,
                             writer=writer,
                             log_waveform_images=log_waveform_images,
                             step=step,
                             max_batches=args.val_steps,
                             sample_rate=args.sample_rate,
+                            loss_weights=loss_weights,
                         )
 
                     if step % args.save_every == 0:
