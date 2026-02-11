@@ -52,3 +52,48 @@ Secondary objective:
 - Training runs with frozen non-decoder Kokoro components.
 - End-to-end training fits within 24GB VRAM.
 - Generated audio quality is comparable to or better than the iSTFT baseline on project validation samples.
+
+## Data Generation (Vocoder Distillation)
+- Use `kokoro-vocoder-data` to generate paired iSTFTNet vocoder inputs and waveform targets.
+- Default sentence count per voice is `5000`.
+- Input text source is LibriTTS normalized text files.
+
+### Prerequisites
+- Install project deps:
+  - `uv sync`
+- Ensure `pip` exists inside the environment (needed by some G2P backends):
+  - `uv pip install pip`
+- Install Japanese tokenizer dictionary (one-time):
+  - `uv run python -m unidic download`
+
+### Download Kokoro Weights + Voices
+- `uv run kokoro-vocoder-data --download-only --repo-id hexgrad/Kokoro-82M`
+
+### Smoke Test (all voices, 1 sentence each)
+- `uv run kokoro-vocoder-data --num-sentences 1 --libritts-root /export/eingerman/audio/LibriTTS/LibriTTS --output-root /export/eingerman/audio/vocoder --write-repo-config`
+
+### Full Dataset Generation (default 5000)
+- `uv run kokoro-vocoder-data --libritts-root /export/eingerman/audio/LibriTTS/LibriTTS --output-root /export/eingerman/audio/vocoder --write-repo-config`
+
+### Generated Artifacts
+- Wave targets: `/export/eingerman/audio/vocoder/audio/<voice>/*.wav`
+- Paired vocoder inputs: `/export/eingerman/audio/vocoder/pairs/<voice>/*.pt`
+  - `.pt` payload includes: `asr`, `f0`, `noise`, `style`, plus metadata
+- Per-voice manifests: `/export/eingerman/audio/vocoder/manifests/*.jsonl`
+- Vocos filelists: `/export/eingerman/audio/vocoder/filelists/vocos.train.txt` and `/export/eingerman/audio/vocoder/filelists/vocos.val.txt`
+- Generated Vocos config: `/export/eingerman/audio/vocoder/vocos-kokoro-24khz.yaml`
+
+## Vocos Training
+- Install Vocos training dependencies:
+  - `uv pip install -r third_party/vocos/requirements-train.txt`
+- Train with generated config:
+  - `uv run python third_party/vocos/train.py -c /export/eingerman/audio/vocoder/vocos-kokoro-24khz.yaml`
+- Repo copy of config is also available at:
+  - `configs/vocos-kokoro-24khz.yaml`
+
+## Config Alignment Requirements
+- Keep Vocos settings aligned to Kokoro/iSTFTNet output:
+  - `sample_rate: 24000`
+  - `hop_length: 300` (derived from Kokoro upsampling stack)
+  - `n_mels: 80`
+  - `n_fft: 1200`

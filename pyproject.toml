@@ -22,8 +22,10 @@ dependencies = [
     "ipykernel>=6.30.1",
     "ipywidgets>=8.1.7",
     "loguru",
-    "misaki[en]>=0.9.4",
+    "matplotlib>=3.10.8",
+    "misaki[en,ja,zh]>=0.9.4",
     "numpy",
+    "pillow",
     "tensorflow>=2.18.1",
     "torch",
     "transformers",
@@ -32,6 +34,8 @@ dependencies = [
 
 [project.scripts]
 kokoro = "kokoro.__main__:main"
+kokoro-vocoder-data = "kokoro.vocoder_data:main"
+kokoro-vocos-train = "kokoro.train_vocos:main"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["kokoro"]

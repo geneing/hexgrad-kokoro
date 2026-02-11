@@ -262,7 +262,7 @@ class KPipeline:
         Raises:
             ValueError: If no voice is provided or token sequence exceeds model limits
         """
-        model = model or self.model
+        model = self.model if model is None else model
         if model and voice is None:
             raise ValueError('Specify a voice: pipeline.generate_from_tokens(..., voice="af_heart")')
         
@@ -366,7 +366,7 @@ class KPipeline:
         split_pattern: Optional[str] = r'\n+',
         model: Optional[KModel] = None
     ) -> Generator['KPipeline.Result', None, None]:
-        model = model or self.model
+        model = self.model if model is None else model
         if model and voice is None:
             raise ValueError('Specify a voice: en_us_pipeline(text="Hello world!", voice="af_heart")')
         pack = self.load_voice(voice).to(model.device) if model else None

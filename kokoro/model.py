@@ -82,78 +82,67 @@ class KModel(torch.nn.Module):
     @dataclass
     class Output:
         audio: torch.FloatTensor
-        # pred_dur: Optional[torch.LongTensor] = None
+        vocoder_io: Optional['KModel.VocoderIO'] = None
+        pred_dur: Optional[torch.LongTensor] = None
+
+    @dataclass
+    class VocoderIO:
+        # Input tensors used by the iSTFTNet decoder path.
+        asr: torch.FloatTensor
+        f0: torch.FloatTensor
+        noise: torch.FloatTensor
+        style: torch.FloatTensor
 
     @torch.no_grad()
     def forward_with_tokens(
         self,
         input_ids: torch.LongTensor,
         ref_s: torch.FloatTensor,
-        speed: float = 1
-    ) -> tuple[torch.FloatTensor, torch.LongTensor]:
- 
-        dbg={}
-        dbg['input']=(input_ids, ref_s, speed)
-        dbg['input_ids']=input_ids
-        dbg['ref_s']=ref_s
-        dbg['speed']=speed
-
+        speed: float = 1,
+        return_vocoder_io: bool = False,
+    ) -> Union[torch.FloatTensor, tuple[torch.FloatTensor, 'KModel.VocoderIO']]:
         bert_dur = self.bert(input_ids)
-        dbg['bert_dur']=bert_dur
         bert_dur = bert_dur.last_hidden_state
 
         d_en = self.bert_encoder(bert_dur).transpose(-1, -2)
-        dbg['d_en']=d_en
 
         s = ref_s[:, 128:]
         d = self.predictor.text_encoder(d_en, s)
-        dbg['d']=d
-        dbg['s']=s
 
         x, _ = self.predictor.lstm(d)
-        dbg['x']=x
-        
         duration = self.predictor.duration_proj(x)
-        dbg['duration']=duration
         duration = torch.sigmoid(duration).sum(axis=-1) / speed
-        
-        dbg['duration_sigmoid']=duration
         pred_dur = torch.round(duration).clamp(min=1).squeeze()
-        dbg['pred_dur']=pred_dur
 
         # Alignment/upsampling of phoneme embeddings to match audio frame rate.
         # This replaces torch.repeat_interleave with an equivalent operation
         # using torch.index_select for broader compatibility.
-        
-        # en = torch.repeat_interleave(d.transpose(-1,-2), pred_dur, dim=2)
         input_tensor = d.transpose(-1, -2)
-        dbg['input_tensor']=input_tensor
 
         boundaries = torch.cumsum(pred_dur, dim=0)
         values = torch.arange(boundaries[-1], device=pred_dur.device)
         expanded_indices = torch.sum(boundaries.unsqueeze(1) <= values.unsqueeze(0), dim=0)
         en = torch.index_select(input_tensor, 2, expanded_indices)
 
-        dbg['expanded_indices']=expanded_indices
-        dbg['en']=en
-        print(f"\t{boundaries.shape=} {values.shape=} en: {en.shape=} {expanded_indices.shape=}")
         F0_pred, N_pred = self.predictor.F0Ntrain(en, s)
-        dbg['F0_pred']=F0_pred
-        dbg['N_pred']=N_pred
 
         t_en = self.text_encoder(input_ids)
-        dbg['t_en']=t_en
 
         # The original line was:
         # asr = torch.repeat_interleave(t_en, pred_dur, dim=2)
         asr = torch.index_select(t_en, 2, expanded_indices)
-        dbg['asr']=asr
 
+        vocoder_io = None
+        if return_vocoder_io:
+            vocoder_io = self.VocoderIO(
+                asr=asr.squeeze(0).detach().cpu(),
+                f0=F0_pred.squeeze(0).detach().cpu(),
+                noise=N_pred.squeeze(0).detach().cpu(),
+                style=ref_s[:, :128].squeeze(0).detach().cpu(),
+            )
         audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze()
-        dbg['audio']=audio
-        import pickle
-        with open('dbg.pkl', 'wb') as f:
-            pickle.dump(dbg, f)
+        if return_vocoder_io:
+            return audio, vocoder_io
         return audio
 
     def forward(
@@ -161,17 +150,32 @@ class KModel(torch.nn.Module):
         phonemes: str,
         ref_s: torch.FloatTensor,
         speed: float = 1,
-        return_output: bool = False
-    ) -> Union['KModel.Output', torch.FloatTensor]:
+        return_output: bool = False,
+        return_vocoder_io: bool = False,
+    ) -> Union['KModel.Output', torch.FloatTensor, tuple[torch.FloatTensor, 'KModel.VocoderIO']]:
         input_ids = list(filter(lambda i: i is not None, map(lambda p: self.vocab.get(p), phonemes)))
         logger.debug(f"phonemes: {phonemes} -> input_ids: {input_ids}")
         assert len(input_ids)+2 <= self.context_length, (len(input_ids)+2, self.context_length)
         input_ids = torch.LongTensor([[0, *input_ids, 0]]).to(self.device)
         ref_s = ref_s.to(self.device)
-        audio = self.forward_with_tokens(input_ids, ref_s, speed)
+        vocoder_io = None
+        output = self.forward_with_tokens(
+            input_ids,
+            ref_s,
+            speed,
+            return_vocoder_io=return_vocoder_io,
+        )
+        if return_vocoder_io:
+            audio, vocoder_io = output
+        else:
+            audio = output
         audio = audio.squeeze().cpu()
         # logger.debug(f"pred_dur: {pred_dur}")
-        return self.Output(audio=audio) if return_output else audio
+        if return_output:
+            return self.Output(audio=audio, vocoder_io=vocoder_io)
+        if return_vocoder_io:
+            return audio, vocoder_io
+        return audio
 
 class KModelForONNX(torch.nn.Module):
     def __init__(self, kmodel: KModel):
