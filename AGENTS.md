@@ -91,6 +91,46 @@ Secondary objective:
 - Repo copy of config is also available at:
   - `configs/vocos-kokoro-24khz.yaml`
 
+## Kokoro Decoder Distillation Training (`kokoro/train_vocos.py`)
+- Use this script for paired Kokoro vocoder-input -> waveform distillation training.
+- Current generator objective is:
+  - `L_total = L_GAN + L_FM + L_MR-STFT` (weighted sum)
+  - GAN term uses MPD + MRD adversarial outputs
+  - Feature-matching term uses MPD + MRD feature maps
+  - Spectral term uses multi-resolution STFT loss
+- Default objective weights (literature-style):
+  - `--gan-loss-coeff 1.0`
+  - `--fm-loss-coeff 2.0`
+  - `--mrstft-loss-coeff 45.0`
+  - `--mrd-loss-coeff 1.0` (scales MRD branch contribution inside GAN/FM terms)
+- Dynamic weighting behavior:
+  - `--pretrain-mel-steps` is used as adversarial warmup boundary (name kept for compatibility)
+  - GAN/FM are zero before warmup, then linearly ramp up
+  - MR-STFT coefficient decays over training to `mrstft_final_ratio * mrstft_loss_coeff`
+  - Control decay endpoint with `--mrstft-final-ratio` (default `0.25`)
+- TensorBoard logs include separate raw and weighted loss parts:
+  - `train/gen_gan_raw`, `train/gen_feat_match_raw`, `train/gen_mrstft_raw`
+  - `train/gen_gan_weighted`, `train/gen_feat_match_weighted`, `train/gen_mrstft_weighted`
+  - `train/weight_gan`, `train/weight_feat_match`, `train/weight_mrstft`
+  - `train/steps_per_sec`, `train/cuda_mem_gb`
+- Audio sample logging:
+  - Uses 5 cached preview samples by default from `af_bella,af_nicole,af_heart`
+  - Controlled by `--sample-voices`, `--sample-count`, `--sample-max-frames`
+
+### Performance/Throughput Parameters (single-GPU focus)
+- Precision/backend:
+  - `--precision {auto,fp32,fp16,bf16}`
+  - `--tf32` (enable TensorFloat-32 matmul/cuDNN on supported NVIDIA GPUs)
+- Data pipeline:
+  - `--num-workers`
+  - `--prefetch-factor`
+  - DataLoader uses persistent workers when worker count > 0
+- Logging overhead control:
+  - `--log-every` (scalar logging frequency)
+
+### Example (optimized 24GB GPU run)
+- `uv run python -m kokoro.train_vocos --data-root /export/eingerman/audio/vocoder --precision auto --tf32 --num-workers 8 --prefetch-factor 4 --log-every 20`
+
 ## Config Alignment Requirements
 - Keep Vocos settings aligned to Kokoro/iSTFTNet output:
   - `sample_rate: 24000`
