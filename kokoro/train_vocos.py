@@ -9,7 +9,7 @@ import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -17,6 +17,7 @@ import torch
 import torchaudio
 from loguru import logger
 from torch import nn
+from torch.nn import Conv2d
 from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.tensorboard import SummaryWriter
 
@@ -29,7 +30,7 @@ from vocos.loss import (
 )
 from vocos.models import VocosBackbone
 
-from .styletts2_losses import StyleTTS2MultiResolutionSTFTLoss
+from .styletts2_losses import StyleTTS2MultiResolutionGroupDelayLoss, StyleTTS2MultiResolutionSTFTLoss
 
 
 @dataclass
@@ -183,9 +184,15 @@ class SlicedPairCollator:
         self,
         state: AdaptiveBatchState,
         train: bool,
+        train_frame_policy: str = "max",
+        train_frame_min_ratio: float = 0.6,
+        fixed_shapes: bool = True,
     ):
         self.state = state
         self.train = train
+        self.train_frame_policy = train_frame_policy
+        self.train_frame_min_ratio = train_frame_min_ratio
+        self.fixed_shapes = fixed_shapes
 
     @staticmethod
     def _repeat_pad_1d(x: torch.Tensor, target_length: int) -> torch.Tensor:
@@ -197,18 +204,34 @@ class SlicedPairCollator:
         x_rep = x.repeat(repeat)
         return x_rep[:target_length]
 
+    @staticmethod
+    def _repeat_pad_2d(x: torch.Tensor, target_length: int) -> torch.Tensor:
+        if x.shape[-1] >= target_length:
+            return x[:, :target_length]
+        if x.shape[-1] == 0:
+            return torch.zeros(x.shape[0], target_length, dtype=x.dtype)
+        repeat = 1 + target_length // x.shape[-1]
+        x_rep = x.repeat(1, repeat)
+        return x_rep[:, :target_length]
+
     def __call__(self, rows: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         if not rows:
             raise ValueError("Empty batch")
 
         f0_lengths = [int(r["f0"].shape[-1]) for r in rows]
-        cap = min(self.state.frame_cap, min(f0_lengths))
-        min_cap = min(32, cap)
-
-        if self.train:
-            target_frames = random.randint(min_cap, cap)
+        if self.fixed_shapes:
+            target_frames = self.state.frame_cap
         else:
-            target_frames = cap
+            cap = min(self.state.frame_cap, min(f0_lengths))
+            if self.train:
+                if self.train_frame_policy == "max":
+                    target_frames = cap
+                else:
+                    min_cap = max(32, int(cap * max(0.0, min(1.0, self.train_frame_min_ratio))))
+                    min_cap = min(min_cap, cap)
+                    target_frames = random.randint(min_cap, cap)
+            else:
+                target_frames = cap
 
         hop = self.state.hop_length
         target_audio_samples = target_frames * hop
@@ -247,9 +270,13 @@ class SlicedPairCollator:
 
             end_frame = start_frame + target_local
             asr_s = asr[:, start_frame:end_frame]
-            f0_s = f0[start_frame:end_frame].unsqueeze(0)
-            noise_s = noise[start_frame:end_frame].unsqueeze(0)
-            style_s = style.unsqueeze(-1).expand(style.shape[0], target_local)
+            f0_s = f0[start_frame:end_frame]
+            noise_s = noise[start_frame:end_frame]
+
+            asr_s = self._repeat_pad_2d(asr_s, target_frames)
+            f0_s = self._repeat_pad_1d(f0_s, target_frames).unsqueeze(0)
+            noise_s = self._repeat_pad_1d(noise_s, target_frames).unsqueeze(0)
+            style_s = style.unsqueeze(-1).expand(style.shape[0], target_frames)
             feat = torch.cat([asr_s, f0_s, noise_s, style_s], dim=0)
 
             start_sample = start_frame * hop
@@ -302,6 +329,84 @@ class PairedVocosGenerator(nn.Module):
         return self.head(x)
 
 
+class ComplexSTFTDiscriminator(nn.Module):
+    def __init__(
+        self,
+        window_length: int,
+        channels: int = 32,
+        hop_factor: float = 0.25,
+        compile_forward: bool = False,
+    ):
+        super().__init__()
+        self.spec_fn = torchaudio.transforms.Spectrogram(
+            n_fft=window_length,
+            hop_length=int(window_length * hop_factor),
+            win_length=window_length,
+            power=None,
+        )
+        wn = nn.utils.weight_norm
+        self.convs = nn.ModuleList(
+            [
+                wn(Conv2d(2, channels, kernel_size=(3, 9), stride=(1, 1), padding=(1, 4))),
+                wn(Conv2d(channels, channels, kernel_size=(3, 9), stride=(1, 2), padding=(1, 4))),
+                wn(Conv2d(channels, channels, kernel_size=(3, 9), stride=(1, 2), padding=(1, 4))),
+                wn(Conv2d(channels, channels, kernel_size=(3, 9), stride=(1, 2), padding=(1, 4))),
+                wn(Conv2d(channels, channels, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))),
+            ]
+        )
+        self.conv_post = wn(Conv2d(channels, 1, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)))
+        self._forward_impl = self._forward
+        if compile_forward and hasattr(torch, "compile"):
+            self._forward_impl = torch.compile(self._forward_impl, mode="reduce-overhead")
+
+    def _spectrogram(self, x: torch.Tensor) -> torch.Tensor:
+        x = x - x.mean(dim=-1, keepdim=True)
+        x = 0.8 * x / (x.abs().amax(dim=-1, keepdim=True) + 1e-9)
+        x = self.spec_fn(x)
+        x = torch.view_as_real(x)  # [B, F, T, 2]
+        x = x.permute(0, 3, 2, 1)  # [B, 2, T, F]
+        return x
+
+    def _forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        x = self._spectrogram(x)
+        fmap: List[torch.Tensor] = []
+        for i, layer in enumerate(self.convs):
+            x = torch.nn.functional.leaky_relu(layer(x), 0.1)
+            if i > 0:
+                fmap.append(x)
+        x = self.conv_post(x)
+        fmap.append(x)
+        x = torch.flatten(x, 1, -1)
+        return x, fmap
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        return self._forward_impl(x)
+
+
+class MultiResolutionComplexSTFTDiscriminator(nn.Module):
+    def __init__(self, fft_sizes: Tuple[int, ...] = (2048, 1024, 512, 256), compile_forward: bool = False):
+        super().__init__()
+        self.discriminators = nn.ModuleList(
+            [ComplexSTFTDiscriminator(window_length=w, compile_forward=compile_forward) for w in fft_sizes]
+        )
+
+    def forward(
+        self, y: torch.Tensor, y_hat: torch.Tensor
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[List[torch.Tensor]], List[List[torch.Tensor]]]:
+        y_d_rs: List[torch.Tensor] = []
+        y_d_gs: List[torch.Tensor] = []
+        fmap_rs: List[List[torch.Tensor]] = []
+        fmap_gs: List[List[torch.Tensor]] = []
+        for d in self.discriminators:
+            y_d_r, fmap_r = d(y)
+            y_d_g, fmap_g = d(y_hat)
+            y_d_rs.append(y_d_r)
+            y_d_gs.append(y_d_g)
+            fmap_rs.append(fmap_r)
+            fmap_gs.append(fmap_g)
+        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Train Vocos on saved Kokoro vocoder pairs")
     parser.add_argument("--data-root", type=Path, default=Path("."))
@@ -327,31 +432,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disc-lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
 
+    # 24GB-oriented defaults for higher utilization; OOM path still backs off frame_cap.
     parser.add_argument("--frame-budget", type=int, default=10240)
-    parser.add_argument("--max-batch-size", type=int, default=8)
-    parser.add_argument("--frame-cap", type=int, default=640)
-    parser.add_argument("--min-frame-cap", type=int, default=96)
+    parser.add_argument("--max-batch-size", type=int, default=12)
+    parser.add_argument("--frame-cap", type=int, default=480)
+    parser.add_argument("--min-frame-cap", type=int, default=192)
     parser.add_argument("--oom-backoff", type=float, default=0.8)
 
-    parser.add_argument("--pretrain-mel-steps", type=int, default=3000)
+    parser.add_argument("--pretrain-mel-steps", type=int, default=5000)
+    parser.add_argument("--adv-ramp-ratio", type=float, default=0.02)
+    parser.add_argument("--disc-update-interval", type=int, default=5)
+    parser.add_argument("--adv-loss-interval", type=int, default=5)
 
     parser.add_argument("--gan-loss-coeff", type=float, default=1.0)
     parser.add_argument("--fm-loss-coeff", type=float, default=2.0)
     parser.add_argument("--mrstft-loss-coeff", type=float, default=45.0)
+    parser.add_argument("--group-delay-loss-coeff", type=float, default=2.0)
     parser.add_argument("--mrstft-final-ratio", type=float, default=0.25)
     parser.add_argument("--mrd-loss-coeff", type=float, default=1.0)
+    parser.add_argument("--cstft-disc-loss-coeff", type=float, default=1.0)
 
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=12)
+    parser.add_argument("--prefetch-factor", type=int, default=12)
     parser.add_argument("--seed", type=int, default=4444)
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--device", type=str, default="cuda", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--precision", type=str, default="auto", choices=["auto", "fp32", "fp16", "bf16"])
-    parser.add_argument("--tf32", action="store_true")
-    parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--tf32", dest="tf32", action="store_true")
+    parser.add_argument("--no-tf32", dest="tf32", action="store_false")
+    parser.set_defaults(tf32=True)
+    parser.add_argument("--torch-compile", dest="torch_compile", action="store_true")
+    parser.add_argument("--no-torch-compile", dest="torch_compile", action="store_false")
+    parser.set_defaults(torch_compile=True)
+    parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--train-frame-policy", type=str, default="max", choices=["max", "random"])
+    parser.add_argument("--train-frame-min-ratio", type=float, default=0.6)
+    parser.add_argument("--fixed-shapes", dest="fixed_shapes", action="store_true")
+    parser.add_argument("--no-fixed-shapes", dest="fixed_shapes", action="store_false")
+    parser.set_defaults(fixed_shapes=True)
 
     parser.add_argument("--sample-voices", type=str, default="af_bella,af_nicole,af_heart")
     parser.add_argument("--sample-count", type=int, default=5)
-    parser.add_argument("--sample-max-frames", type=int, default=640)
+    parser.add_argument("--sample-max-frames", type=int, default=480)
     parser.add_argument("--output-dir", type=Path, default=Path("runs/vocos_kokoro_paired"))
     parser.add_argument("--resume", type=Path, default=None)
     return parser.parse_args()
@@ -617,13 +738,15 @@ def compute_dynamic_weights(
     step: int,
     max_steps: int,
     pretrain_steps: int,
+    adv_ramp_ratio: float,
     gan_base: float,
     fm_base: float,
     mrstft_base: float,
+    group_delay_base: float,
     mrstft_final_ratio: float,
 ) -> Dict[str, float]:
     post_warmup = max(1, max_steps - pretrain_steps)
-    adv_ramp_window = max(1, int(0.1 * post_warmup))
+    adv_ramp_window = max(1, int(max(0.0, adv_ramp_ratio) * post_warmup))
     if step < pretrain_steps:
         adv_scale = 0.0
     else:
@@ -635,6 +758,7 @@ def compute_dynamic_weights(
         "gan": gan_base * adv_scale,
         "fm": fm_base * adv_scale,
         "mrstft": mrstft_base * mrstft_scale,
+        "group_delay": group_delay_base * mrstft_scale,
     }
 
 
@@ -713,6 +837,7 @@ def save_checkpoint(
     generator: nn.Module,
     mpd: nn.Module,
     mrd: nn.Module,
+    cstft_disc: nn.Module,
     gen_opt: torch.optim.Optimizer,
     disc_opt: torch.optim.Optimizer,
     gen_sched: torch.optim.lr_scheduler._LRScheduler,
@@ -727,6 +852,7 @@ def save_checkpoint(
             "generator": generator.state_dict(),
             "mpd": mpd.state_dict(),
             "mrd": mrd.state_dict(),
+            "cstft_disc": cstft_disc.state_dict(),
             "gen_opt": gen_opt.state_dict(),
             "disc_opt": disc_opt.state_dict(),
             "gen_sched": gen_sched.state_dict(),
@@ -764,6 +890,7 @@ def run_validation(
     val_loader: DataLoader,
     device: torch.device,
     mrstft_loss: StyleTTS2MultiResolutionSTFTLoss,
+    group_delay_loss: StyleTTS2MultiResolutionGroupDelayLoss,
     writer: SummaryWriter,
     log_waveform_images: bool,
     step: int,
@@ -774,6 +901,7 @@ def run_validation(
 ) -> None:
     generator.eval()
     mrstft_values: List[float] = []
+    gd_values: List[float] = []
     l1_values: List[float] = []
     total_values: List[float] = []
 
@@ -793,9 +921,11 @@ def run_validation(
             pred, real = align_audio(pred, real)
 
             s = mrstft_loss(pred, real)
+            gd = group_delay_loss(pred, real)
             l1 = torch.mean(torch.abs(pred - real))
-            total_values.append(float((loss_weights["mrstft"] * s).item()))
+            total_values.append(float((loss_weights["mrstft"] * s + loss_weights["group_delay"] * gd).item()))
             mrstft_values.append(float(s.item()))
+            gd_values.append(float(gd.item()))
             l1_values.append(float(l1.item()))
 
             if i == 0:
@@ -811,7 +941,17 @@ def run_validation(
     if mrstft_values:
         writer.add_scalar("val/generator_total_estimate", sum(total_values) / len(total_values), step)
         writer.add_scalar("val/gen_mrstft_raw", sum(mrstft_values) / len(mrstft_values), step)
-        writer.add_scalar("val/gen_mrstft_weighted", sum(total_values) / len(total_values), step)
+        writer.add_scalar(
+            "val/gen_mrstft_weighted",
+            loss_weights["mrstft"] * (sum(mrstft_values) / len(mrstft_values)),
+            step,
+        )
+        writer.add_scalar("val/gen_group_delay_raw", sum(gd_values) / len(gd_values), step)
+        writer.add_scalar(
+            "val/gen_group_delay_weighted",
+            loss_weights["group_delay"] * (sum(gd_values) / len(gd_values)),
+            step,
+        )
         writer.add_scalar("val/l1_wave_loss", sum(l1_values) / len(l1_values), step)
 
     generator.train()
@@ -921,7 +1061,13 @@ def main() -> None:
         batch_sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
-        collate_fn=SlicedPairCollator(state=state, train=True),
+        collate_fn=SlicedPairCollator(
+            state=state,
+            train=True,
+            train_frame_policy=args.train_frame_policy,
+            train_frame_min_ratio=args.train_frame_min_ratio,
+            fixed_shapes=args.fixed_shapes,
+        ),
         **train_loader_kwargs,
     )
     val_loader = DataLoader(
@@ -929,7 +1075,7 @@ def main() -> None:
         batch_sampler=val_sampler,
         num_workers=val_num_workers,
         pin_memory=(device.type == "cuda"),
-        collate_fn=SlicedPairCollator(state=state, train=False),
+        collate_fn=SlicedPairCollator(state=state, train=False, fixed_shapes=args.fixed_shapes),
         **val_loader_kwargs,
     )
 
@@ -947,14 +1093,26 @@ def main() -> None:
 
     mpd = MultiPeriodDiscriminator().to(device)
     mrd = MultiResolutionDiscriminator().to(device)
+    cstft_disc = MultiResolutionComplexSTFTDiscriminator(compile_forward=args.torch_compile).to(device)
+
+    if args.torch_compile:
+        try:
+            generator = torch.compile(generator, mode="reduce-overhead")
+            mpd = torch.compile(mpd, mode="reduce-overhead")
+            mrd = torch.compile(mrd, mode="reduce-overhead")
+            cstft_disc = torch.compile(cstft_disc, mode="reduce-overhead")
+            logger.info("Enabled torch.compile for generator, MPD, MRD, and complex-STFT discriminator")
+        except Exception as exc:
+            logger.warning(f"torch.compile failed, continuing without compile: {exc}")
 
     vocos_disc_loss = VocosDiscriminatorLoss()
     vocos_gen_loss = VocosGeneratorLoss()
     feat_match_loss = FeatureMatchingLoss()
     mrstft_loss = StyleTTS2MultiResolutionSTFTLoss(sample_rate=args.sample_rate).to(device)
+    group_delay_loss = StyleTTS2MultiResolutionGroupDelayLoss().to(device)
 
     gen_opt = torch.optim.AdamW(generator.parameters(), lr=args.gen_lr, betas=(0.8, 0.9), weight_decay=args.weight_decay)
-    disc_params = list(mpd.parameters()) + list(mrd.parameters())
+    disc_params = list(mpd.parameters()) + list(mrd.parameters()) + list(cstft_disc.parameters())
     disc_opt = torch.optim.AdamW(disc_params, lr=args.disc_lr, betas=(0.8, 0.9), weight_decay=args.weight_decay)
 
     gen_sched = torch.optim.lr_scheduler.CosineAnnealingLR(gen_opt, T_max=max(1, args.max_steps))
@@ -989,6 +1147,10 @@ def main() -> None:
         generator.load_state_dict(ckpt["generator"])
         mpd.load_state_dict(ckpt["mpd"])
         mrd.load_state_dict(ckpt["mrd"])
+        if "cstft_disc" in ckpt:
+            cstft_disc.load_state_dict(ckpt["cstft_disc"])
+        else:
+            logger.warning("Checkpoint missing cstft_disc state; starting complex-STFT discriminator from init.")
         gen_opt.load_state_dict(ckpt["gen_opt"])
         disc_opt.load_state_dict(ckpt["disc_opt"])
         gen_sched.load_state_dict(ckpt["gen_sched"])
@@ -1006,6 +1168,7 @@ def main() -> None:
     generator.train()
     mpd.train()
     mrd.train()
+    cstft_disc.train()
 
     last_log = time.time()
     throughput_last_time = time.time()
@@ -1017,6 +1180,7 @@ def main() -> None:
         for batch in train_loader:
             if step >= args.max_steps:
                 break
+            iter_start = time.perf_counter()
 
             # OOM-aware retry loop: shrink frame cap and recrop in-memory batch when needed.
             batch_local = {
@@ -1029,37 +1193,50 @@ def main() -> None:
             retried = 0
             while True:
                 try:
+                    timing: Dict[str, float] = {}
+
+                    t0 = time.perf_counter()
                     features = batch_local["features"].to(device, non_blocking=True)
                     real = batch_local["audio"].to(device, non_blocking=True)
+                    timing["time_h2d_ms"] = (time.perf_counter() - t0) * 1000.0
 
                     loss_weights = compute_dynamic_weights(
                         step=step,
                         max_steps=args.max_steps,
                         pretrain_steps=args.pretrain_mel_steps,
+                        adv_ramp_ratio=args.adv_ramp_ratio,
                         gan_base=args.gan_loss_coeff,
                         fm_base=args.fm_loss_coeff,
                         mrstft_base=args.mrstft_loss_coeff,
+                        group_delay_base=args.group_delay_loss_coeff,
                         mrstft_final_ratio=args.mrstft_final_ratio,
                     )
-                    train_discriminator = step >= args.pretrain_mel_steps
+                    adv_started = step >= args.pretrain_mel_steps
+                    run_disc_step = adv_started and (step % max(1, args.disc_update_interval) == 0)
+                    run_adv_loss = adv_started and (step % max(1, args.adv_loss_interval) == 0)
                     d_total = torch.zeros(1, device=device)
                     d_mp = torch.zeros(1, device=device)
                     d_mrd = torch.zeros(1, device=device)
+                    d_cstft = torch.zeros(1, device=device)
 
                     autocast_ctx = (
                         torch.autocast(device_type="cuda", dtype=amp_dtype)
                         if (device.type == "cuda" and amp_dtype is not None)
                         else contextlib.nullcontext()
                     )
+                    t0 = time.perf_counter()
                     with autocast_ctx:
                         fake = generator(features)
                         fake, real = align_audio(fake, real)
+                    timing["time_gen_forward_ms"] = (time.perf_counter() - t0) * 1000.0
                     fake_detached = fake.detach()
 
-                    if train_discriminator:
+                    if run_disc_step:
                         set_requires_grad(mpd, True)
                         set_requires_grad(mrd, True)
+                        set_requires_grad(cstft_disc, True)
                         disc_opt.zero_grad(set_to_none=True)
+                        t0 = time.perf_counter()
                         autocast_ctx = (
                             torch.autocast(device_type="cuda", dtype=amp_dtype)
                             if (device.type == "cuda" and amp_dtype is not None)
@@ -1068,24 +1245,34 @@ def main() -> None:
                         with autocast_ctx:
                             r_mp, g_mp, _, _ = mpd(real, fake_detached)
                             r_mrd, g_mrd, _, _ = mrd(real, fake_detached)
+                            r_cstft, g_cstft, _, _ = cstft_disc(real, fake_detached)
 
                             d_mp_raw, d_mp_real, _ = vocos_disc_loss(r_mp, g_mp)
                             d_mrd_raw, d_mrd_real, _ = vocos_disc_loss(r_mrd, g_mrd)
+                            d_cstft_raw, d_cstft_real, _ = vocos_disc_loss(r_cstft, g_cstft)
                             d_mp = d_mp_raw / max(1, len(d_mp_real))
                             d_mrd = d_mrd_raw / max(1, len(d_mrd_real))
-                            d_total = d_mp + args.mrd_loss_coeff * d_mrd
+                            d_cstft = d_cstft_raw / max(1, len(d_cstft_real))
+                            d_total = d_mp + args.mrd_loss_coeff * d_mrd + args.cstft_disc_loss_coeff * d_cstft
+                        timing["time_disc_loss_compute_ms"] = (time.perf_counter() - t0) * 1000.0
 
+                        t0 = time.perf_counter()
                         if use_grad_scaler:
                             scaler.scale(d_total).backward()
                             scaler.step(disc_opt)
                         else:
                             d_total.backward()
                             disc_opt.step()
+                        timing["time_disc_backward_step_ms"] = (time.perf_counter() - t0) * 1000.0
+                    else:
+                        timing["time_disc_loss_compute_ms"] = 0.0
+                        timing["time_disc_backward_step_ms"] = 0.0
 
                     # Generator
                     gen_opt.zero_grad(set_to_none=True)
                     set_requires_grad(mpd, False)
                     set_requires_grad(mrd, False)
+                    set_requires_grad(cstft_disc, False)
 
                     autocast_ctx = (
                         torch.autocast(device_type="cuda", dtype=amp_dtype)
@@ -1095,27 +1282,42 @@ def main() -> None:
                     with autocast_ctx:
                         g_gan_raw = torch.zeros(1, device=device)
                         g_fm_raw = torch.zeros(1, device=device)
-                        if train_discriminator and (loss_weights["gan"] > 0.0 or loss_weights["fm"] > 0.0):
+                        t_adv = time.perf_counter()
+                        if run_adv_loss and (loss_weights["gan"] > 0.0 or loss_weights["fm"] > 0.0):
                             _, g_mp_outs, fmap_r_mp, fmap_g_mp = mpd(real, fake)
                             _, g_mrd_outs, fmap_r_mrd, fmap_g_mrd = mrd(real, fake)
+                            _, g_cstft_outs, fmap_r_cstft, fmap_g_cstft = cstft_disc(real, fake)
 
                             g_mp_adv, g_mp_terms = vocos_gen_loss(g_mp_outs)
                             g_mrd_adv, g_mrd_terms = vocos_gen_loss(g_mrd_outs)
+                            g_cstft_adv, g_cstft_terms = vocos_gen_loss(g_cstft_outs)
                             g_mp_adv = g_mp_adv / max(1, len(g_mp_terms))
                             g_mrd_adv = g_mrd_adv / max(1, len(g_mrd_terms))
+                            g_cstft_adv = g_cstft_adv / max(1, len(g_cstft_terms))
 
                             fm_mp = feat_match_loss(fmap_r_mp, fmap_g_mp) / max(1, len(fmap_r_mp))
                             fm_mrd = feat_match_loss(fmap_r_mrd, fmap_g_mrd) / max(1, len(fmap_r_mrd))
+                            fm_cstft = feat_match_loss(fmap_r_cstft, fmap_g_cstft) / max(1, len(fmap_r_cstft))
 
-                            g_gan_raw = g_mp_adv + args.mrd_loss_coeff * g_mrd_adv
-                            g_fm_raw = fm_mp + args.mrd_loss_coeff * fm_mrd
+                            g_gan_raw = g_mp_adv + args.mrd_loss_coeff * g_mrd_adv + args.cstft_disc_loss_coeff * g_cstft_adv
+                            g_fm_raw = fm_mp + args.mrd_loss_coeff * fm_mrd + args.cstft_disc_loss_coeff * fm_cstft
+                        timing["time_gen_adv_fm_loss_ms"] = (time.perf_counter() - t_adv) * 1000.0
+
+                        t_mrstft = time.perf_counter()
                         g_mrstft_raw = mrstft_loss(fake, real)
+                        timing["time_gen_mrstft_loss_ms"] = (time.perf_counter() - t_mrstft) * 1000.0
+
+                        t_group_delay = time.perf_counter()
+                        g_group_delay_raw = group_delay_loss(fake, real)
+                        timing["time_gen_group_delay_loss_ms"] = (time.perf_counter() - t_group_delay) * 1000.0
 
                         g_gan_weighted = loss_weights["gan"] * g_gan_raw
                         g_fm_weighted = loss_weights["fm"] * g_fm_raw
                         g_mrstft_weighted = loss_weights["mrstft"] * g_mrstft_raw
-                        g_total = g_gan_weighted + g_fm_weighted + g_mrstft_weighted
+                        g_group_delay_weighted = loss_weights["group_delay"] * g_group_delay_raw
+                        g_total = g_gan_weighted + g_fm_weighted + g_mrstft_weighted + g_group_delay_weighted
 
+                    t0 = time.perf_counter()
                     if use_grad_scaler:
                         scaler.scale(g_total).backward()
                         scaler.step(gen_opt)
@@ -1123,13 +1325,17 @@ def main() -> None:
                     else:
                         g_total.backward()
                         gen_opt.step()
+                    timing["time_gen_backward_step_ms"] = (time.perf_counter() - t0) * 1000.0
 
                     set_requires_grad(mpd, True)
                     set_requires_grad(mrd, True)
+                    set_requires_grad(cstft_disc, True)
 
+                    t0 = time.perf_counter()
                     gen_sched.step()
-                    if train_discriminator:
+                    if run_disc_step:
                         disc_sched.step()
+                    timing["time_scheduler_step_ms"] = (time.perf_counter() - t0) * 1000.0
 
                     # Logging
                     step += 1
@@ -1140,16 +1346,24 @@ def main() -> None:
                     running["gen_gan_weighted"] = float(g_gan_weighted.item())
                     running["gen_feat_match_weighted"] = float(g_fm_weighted.item())
                     running["gen_mrstft_weighted"] = float(g_mrstft_weighted.item())
+                    running["gen_group_delay_raw"] = float(g_group_delay_raw.item())
+                    running["gen_group_delay_weighted"] = float(g_group_delay_weighted.item())
                     running["weight_gan"] = float(loss_weights["gan"])
                     running["weight_feat_match"] = float(loss_weights["fm"])
                     running["weight_mrstft"] = float(loss_weights["mrstft"])
+                    running["weight_group_delay"] = float(loss_weights["group_delay"])
                     running["disc_total"] = float(d_total.item())
                     running["disc_mp"] = float(d_mp.item())
                     running["disc_mrd"] = float(d_mrd.item())
+                    running["disc_cstft"] = float(d_cstft.item())
+                    running["ran_disc_step"] = float(1.0 if run_disc_step else 0.0)
+                    running["ran_adv_loss"] = float(1.0 if run_adv_loss else 0.0)
                     running["frame_cap"] = float(state.frame_cap)
                     running["target_frames"] = float(batch_local["target_frames"])
                     running["lr_gen"] = float(gen_opt.param_groups[0]["lr"])
                     running["lr_disc"] = float(disc_opt.param_groups[0]["lr"])
+                    running.update(timing)
+                    running["time_step_total_ms"] = (time.perf_counter() - iter_start) * 1000.0
 
                     if step % max(1, args.log_every) == 0:
                         now = time.time()
@@ -1188,9 +1402,11 @@ def main() -> None:
                         )
 
                     if time.time() - last_log > 10:
+                        sps = running.get("steps_per_sec", 0.0)
                         logger.info(
                             f"step={step} gen={running['gen_total']:.4f} disc={running['disc_total']:.4f} "
-                            f"frames={batch_local['target_frames']} cap={state.frame_cap}"
+                            f"frames={batch_local['target_frames']} cap={state.frame_cap} "
+                            f"sps={sps:.2f}"
                         )
                         last_log = time.time()
 
@@ -1200,6 +1416,7 @@ def main() -> None:
                             val_loader=val_loader,
                             device=device,
                             mrstft_loss=mrstft_loss,
+                            group_delay_loss=group_delay_loss,
                             writer=writer,
                             log_waveform_images=log_waveform_images,
                             step=step,
@@ -1218,6 +1435,7 @@ def main() -> None:
                             generator=generator,
                             mpd=mpd,
                             mrd=mrd,
+                            cstft_disc=cstft_disc,
                             gen_opt=gen_opt,
                             disc_opt=disc_opt,
                             gen_sched=gen_sched,
@@ -1231,6 +1449,7 @@ def main() -> None:
                             generator=generator,
                             mpd=mpd,
                             mrd=mrd,
+                            cstft_disc=cstft_disc,
                             gen_opt=gen_opt,
                             disc_opt=disc_opt,
                             gen_sched=gen_sched,
@@ -1269,6 +1488,7 @@ def main() -> None:
         generator=generator,
         mpd=mpd,
         mrd=mrd,
+        cstft_disc=cstft_disc,
         gen_opt=gen_opt,
         disc_opt=disc_opt,
         gen_sched=gen_sched,
@@ -1282,6 +1502,7 @@ def main() -> None:
         generator=generator,
         mpd=mpd,
         mrd=mrd,
+        cstft_disc=cstft_disc,
         gen_opt=gen_opt,
         disc_opt=disc_opt,
         gen_sched=gen_sched,

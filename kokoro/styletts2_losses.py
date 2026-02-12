@@ -31,6 +31,7 @@ class StyleTTS2STFTLoss(nn.Module):
         shift_size: int = 120,
         win_length: int = 600,
         sample_rate: int = 24000,
+        n_mels: int = 80,
     ) -> None:
         super().__init__()
         self.to_mel = torchaudio.transforms.MelSpectrogram(
@@ -38,6 +39,7 @@ class StyleTTS2STFTLoss(nn.Module):
             n_fft=fft_size,
             win_length=win_length,
             hop_length=shift_size,
+            n_mels=n_mels,
             window_fn=torch.hann_window,
         )
         self.spectral_convergence_loss = SpectralConvergenceLoss()
@@ -61,6 +63,7 @@ class StyleTTS2MultiResolutionSTFTLoss(nn.Module):
         hop_sizes: Iterable[int] = (120, 240, 50),
         win_lengths: Iterable[int] = (600, 1200, 240),
         sample_rate: int = 24000,
+        n_mels: int = 80,
     ) -> None:
         super().__init__()
         fft_sizes = list(fft_sizes)
@@ -75,6 +78,7 @@ class StyleTTS2MultiResolutionSTFTLoss(nn.Module):
                     shift_size=ss,
                     win_length=wl,
                     sample_rate=sample_rate,
+                    n_mels=n_mels,
                 )
                 for fs, ss, wl in zip(fft_sizes, hop_sizes, win_lengths)
             ]
@@ -85,6 +89,75 @@ class StyleTTS2MultiResolutionSTFTLoss(nn.Module):
         for loss in self.losses:
             sc_loss = sc_loss + loss(x, y)
         return sc_loss / len(self.losses)
+
+
+class StyleTTS2MultiResolutionGroupDelayLoss(nn.Module):
+    """Multi-resolution group-delay phase loss."""
+
+    def __init__(
+        self,
+        fft_sizes: Iterable[int] = (1024, 2048, 512),
+        hop_sizes: Iterable[int] = (120, 240, 50),
+        win_lengths: Iterable[int] = (600, 1200, 240),
+    ) -> None:
+        super().__init__()
+        fft_sizes = list(fft_sizes)
+        hop_sizes = list(hop_sizes)
+        win_lengths = list(win_lengths)
+        if not (len(fft_sizes) == len(hop_sizes) == len(win_lengths)):
+            raise ValueError("fft_sizes, hop_sizes and win_lengths must have equal length")
+        self.fft_sizes = fft_sizes
+        self.hop_sizes = hop_sizes
+        self.win_lengths = win_lengths
+        for i, wl in enumerate(win_lengths):
+            self.register_buffer(f"_window_{i}", torch.hann_window(wl), persistent=False)
+
+    @staticmethod
+    def _group_delay(spec: torch.Tensor) -> torch.Tensor:
+        # Phase derivative over frequency bins using adjacent-bin complex product.
+        cross = spec[:, 1:, :] * torch.conj(spec[:, :-1, :])
+        return torch.atan2(cross.imag, cross.real)
+
+    @staticmethod
+    def _wrapped_phase_l1(pred_gd: torch.Tensor, target_gd: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        # Wrap to [-pi, pi] to avoid artificial jumps at branch boundaries.
+        delta = pred_gd - target_gd
+        delta = torch.atan2(torch.sin(delta), torch.cos(delta))
+        denom = torch.sum(weight).clamp_min(1e-6)
+        return torch.sum(torch.abs(delta) * weight) / denom
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        # STFT phase ops are more stable in fp32.
+        x = x.float()
+        y = y.float()
+
+        total = x.new_tensor(0.0)
+        for i, (fs, hs, wl) in enumerate(zip(self.fft_sizes, self.hop_sizes, self.win_lengths)):
+            window = getattr(self, f"_window_{i}").to(device=x.device, dtype=x.dtype)
+            x_spec = torch.stft(
+                x,
+                n_fft=fs,
+                hop_length=hs,
+                win_length=wl,
+                window=window,
+                center=True,
+                return_complex=True,
+            )
+            y_spec = torch.stft(
+                y,
+                n_fft=fs,
+                hop_length=hs,
+                win_length=wl,
+                window=window,
+                center=True,
+                return_complex=True,
+            )
+            x_gd = self._group_delay(x_spec)
+            y_gd = self._group_delay(y_spec)
+
+            mag = 0.5 * (torch.abs(y_spec[:, 1:, :]) + torch.abs(y_spec[:, :-1, :]))
+            total = total + self._wrapped_phase_l1(x_gd, y_gd, mag)
+        return total / len(self.fft_sizes)
 
 
 def styletts2_generator_lsgan_loss(disc_outputs: List[torch.Tensor]) -> torch.Tensor:
