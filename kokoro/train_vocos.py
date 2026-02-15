@@ -441,8 +441,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--pretrain-mel-steps", type=int, default=5000)
     parser.add_argument("--adv-ramp-ratio", type=float, default=0.02)
-    parser.add_argument("--disc-update-interval", type=int, default=5)
-    parser.add_argument("--adv-loss-interval", type=int, default=5)
+    parser.add_argument("--disc-update-interval", type=int, default=1)
+    parser.add_argument("--adv-loss-interval", type=int, default=1)
 
     parser.add_argument("--gan-loss-coeff", type=float, default=1.0)
     parser.add_argument("--fm-loss-coeff", type=float, default=2.0)
@@ -463,6 +463,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-compile", dest="torch_compile", action="store_true")
     parser.add_argument("--no-torch-compile", dest="torch_compile", action="store_false")
     parser.set_defaults(torch_compile=True)
+    parser.add_argument("--compile-generator", dest="compile_generator", action="store_true")
+    parser.add_argument("--no-compile-generator", dest="compile_generator", action="store_false")
+    parser.set_defaults(compile_generator=False)
+    parser.add_argument("--compile-complex-paths", dest="compile_complex_paths", action="store_true")
+    parser.add_argument("--no-compile-complex-paths", dest="compile_complex_paths", action="store_false")
+    parser.set_defaults(compile_complex_paths=False)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--train-frame-policy", type=str, default="max", choices=["max", "random"])
     parser.add_argument("--train-frame-min-ratio", type=float, default=0.6)
@@ -1093,15 +1099,28 @@ def main() -> None:
 
     mpd = MultiPeriodDiscriminator().to(device)
     mrd = MultiResolutionDiscriminator().to(device)
-    cstft_disc = MultiResolutionComplexSTFTDiscriminator(compile_forward=args.torch_compile).to(device)
+    cstft_disc = MultiResolutionComplexSTFTDiscriminator(
+        compile_forward=(args.torch_compile and args.compile_complex_paths)
+    ).to(device)
 
     if args.torch_compile:
         try:
-            generator = torch.compile(generator, mode="reduce-overhead")
+            if args.compile_generator:
+                generator = torch.compile(generator, mode="reduce-overhead")
             mpd = torch.compile(mpd, mode="reduce-overhead")
             mrd = torch.compile(mrd, mode="reduce-overhead")
-            cstft_disc = torch.compile(cstft_disc, mode="reduce-overhead")
-            logger.info("Enabled torch.compile for generator, MPD, MRD, and complex-STFT discriminator")
+            if args.compile_complex_paths:
+                cstft_disc = torch.compile(cstft_disc, mode="reduce-overhead")
+                logger.info(
+                    "Enabled torch.compile for "
+                    f"{'generator, ' if args.compile_generator else ''}MPD, MRD, and complex-STFT discriminator"
+                )
+            else:
+                logger.info(
+                    "Enabled torch.compile for "
+                    f"{'generator, ' if args.compile_generator else ''}MPD and MRD "
+                    "(complex-STFT path left eager)"
+                )
         except Exception as exc:
             logger.warning(f"torch.compile failed, continuing without compile: {exc}")
 
