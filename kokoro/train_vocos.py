@@ -60,6 +60,10 @@ class AdaptiveBatchState:
         return 1 if changed else 0
 
 
+class NonFiniteLossError(RuntimeError):
+    pass
+
+
 class PairedVocoderDataset(Dataset):
     """Loads saved vocoder conditioning tensors + waveform targets."""
 
@@ -441,8 +445,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--pretrain-mel-steps", type=int, default=5000)
     parser.add_argument("--adv-ramp-ratio", type=float, default=0.02)
-    parser.add_argument("--disc-update-interval", type=int, default=1)
-    parser.add_argument("--adv-loss-interval", type=int, default=1)
+    parser.add_argument("--disc-update-interval", type=int, default=2)
+    parser.add_argument("--adv-loss-interval", type=int, default=2)
 
     parser.add_argument("--gan-loss-coeff", type=float, default=1.0)
     parser.add_argument("--fm-loss-coeff", type=float, default=2.0)
@@ -836,6 +840,11 @@ def maybe_oom(exc: RuntimeError) -> bool:
     return "out of memory" in msg or "cuda error: out of memory" in msg
 
 
+def assert_finite(tag: str, x: torch.Tensor) -> None:
+    if not torch.isfinite(x).all():
+        raise NonFiniteLossError(f"Non-finite detected at {tag}")
+
+
 def save_checkpoint(
     path: Path,
     step: int,
@@ -1218,6 +1227,8 @@ def main() -> None:
                     features = batch_local["features"].to(device, non_blocking=True)
                     real = batch_local["audio"].to(device, non_blocking=True)
                     timing["time_h2d_ms"] = (time.perf_counter() - t0) * 1000.0
+                    assert_finite("batch/features", features)
+                    assert_finite("batch/audio", real)
 
                     loss_weights = compute_dynamic_weights(
                         step=step,
@@ -1273,6 +1284,10 @@ def main() -> None:
                             d_mrd = d_mrd_raw / max(1, len(d_mrd_real))
                             d_cstft = d_cstft_raw / max(1, len(d_cstft_real))
                             d_total = d_mp + args.mrd_loss_coeff * d_mrd + args.cstft_disc_loss_coeff * d_cstft
+                            assert_finite("disc/d_mp", d_mp)
+                            assert_finite("disc/d_mrd", d_mrd)
+                            assert_finite("disc/d_cstft", d_cstft)
+                            assert_finite("disc/d_total", d_total)
                         timing["time_disc_loss_compute_ms"] = (time.perf_counter() - t0) * 1000.0
 
                         t0 = time.perf_counter()
@@ -1335,6 +1350,11 @@ def main() -> None:
                         g_mrstft_weighted = loss_weights["mrstft"] * g_mrstft_raw
                         g_group_delay_weighted = loss_weights["group_delay"] * g_group_delay_raw
                         g_total = g_gan_weighted + g_fm_weighted + g_mrstft_weighted + g_group_delay_weighted
+                        assert_finite("gen/g_gan_raw", g_gan_raw)
+                        assert_finite("gen/g_fm_raw", g_fm_raw)
+                        assert_finite("gen/g_mrstft_raw", g_mrstft_raw)
+                        assert_finite("gen/g_group_delay_raw", g_group_delay_raw)
+                        assert_finite("gen/g_total", g_total)
 
                     t0 = time.perf_counter()
                     if use_grad_scaler:
@@ -1479,6 +1499,17 @@ def main() -> None:
                     break
 
                 except RuntimeError as exc:
+                    if isinstance(exc, NonFiniteLossError):
+                        writer.add_scalar("train/non_finite_events", 1.0, step)
+                        writer.add_scalar("train/non_finite_target_frames", float(batch_local["target_frames"]), step)
+                        logger.error(
+                            f"Non-finite loss at step={step}, retry={retried}, "
+                            f"frames={batch_local['target_frames']}, cap={state.frame_cap}: {exc}. "
+                            "Skipping batch and continuing with next batch."
+                        )
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
+                        break
                     if device.type != "cuda" or not maybe_oom(exc):
                         raise
                     retried += 1
