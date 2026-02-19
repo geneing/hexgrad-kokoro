@@ -427,7 +427,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone-intermediate-dim", type=int, default=1152)
     parser.add_argument("--backbone-layers", type=int, default=8)
 
-    parser.add_argument("--max-steps", type=int, default=100000)
+    parser.add_argument("--max-steps", type=int, default=200000)
     parser.add_argument("--val-every", type=int, default=500)
     parser.add_argument("--val-steps", type=int, default=16)
     parser.add_argument("--save-every", type=int, default=1000)
@@ -439,7 +439,7 @@ def parse_args() -> argparse.Namespace:
     # 24GB-oriented defaults for higher utilization; OOM path still backs off frame_cap.
     parser.add_argument("--frame-budget", type=int, default=10240)
     parser.add_argument("--max-batch-size", type=int, default=12)
-    parser.add_argument("--frame-cap", type=int, default=480)
+    parser.add_argument("--frame-cap", type=int, default=520)
     parser.add_argument("--min-frame-cap", type=int, default=192)
     parser.add_argument("--oom-backoff", type=float, default=0.8)
 

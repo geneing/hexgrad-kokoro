@@ -18,7 +18,7 @@ from kokoro import KModel, KPipeline
 DEFAULT_LIBRITTS_ROOT = Path("/export/eingerman/audio/LibriTTS/LibriTTS")
 DEFAULT_OUTPUT_ROOT = Path("/export/eingerman/audio/vocoder")
 DEFAULT_REPO_ID = "hexgrad/Kokoro-82M"
-DEFAULT_SENTENCE_COUNT = 500
+DEFAULT_SENTENCE_COUNT = 1500
 DEFAULT_SAMPLE_RATE = 24000
 
 
