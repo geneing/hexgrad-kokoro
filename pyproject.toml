@@ -18,9 +18,11 @@ classifiers = [
 ]
 requires-python = ">=3.10, <3.14"
 dependencies = [
+    "ai-edge-quantizer-nightly>=0.5.0.dev20260219",
     "huggingface_hub",
     "ipykernel>=6.30.1",
     "ipywidgets>=8.1.7",
+    "litert-torch-nightly>=0.9.0.dev20260218",
     "loguru",
     "matplotlib>=3.10.8",
     "misaki[en,ja,zh]>=0.9.4",
@@ -28,8 +30,14 @@ dependencies = [
     "pillow",
     "tensorflow>=2.18.1",
     "torch",
+    "torchvision>=0.24.1",
     "transformers",
     "vocos",
+]
+
+[project.optional-dependencies]
+executorch-quant = [
+    "executorch",
 ]
 
 [project.scripts]

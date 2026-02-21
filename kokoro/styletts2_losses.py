@@ -99,6 +99,8 @@ class StyleTTS2MultiResolutionGroupDelayLoss(nn.Module):
         fft_sizes: Iterable[int] = (1024, 2048, 512),
         hop_sizes: Iterable[int] = (120, 240, 50),
         win_lengths: Iterable[int] = (600, 1200, 240),
+        phase_eps: float = 1e-6,
+        mag_floor: float = 1e-4,
     ) -> None:
         super().__init__()
         fft_sizes = list(fft_sizes)
@@ -109,14 +111,22 @@ class StyleTTS2MultiResolutionGroupDelayLoss(nn.Module):
         self.fft_sizes = fft_sizes
         self.hop_sizes = hop_sizes
         self.win_lengths = win_lengths
+        self.phase_eps = float(max(1e-12, phase_eps))
+        self.mag_floor = float(max(0.0, mag_floor))
         for i, wl in enumerate(win_lengths):
             self.register_buffer(f"_window_{i}", torch.hann_window(wl), persistent=False)
 
     @staticmethod
-    def _group_delay(spec: torch.Tensor) -> torch.Tensor:
+    def _group_delay(spec: torch.Tensor, eps: float) -> torch.Tensor:
         # Phase derivative over frequency bins using adjacent-bin complex product.
         cross = spec[:, 1:, :] * torch.conj(spec[:, :-1, :])
-        return torch.atan2(cross.imag, cross.real)
+        # atan2 gradients are undefined at (0,0); low-energy bins can hit that exactly.
+        # Replace near-zero bins with a constant phase anchor to avoid NaN/Inf gradients.
+        cross_power = cross.real.square() + cross.imag.square()
+        safe = cross_power > (eps * eps)
+        real = torch.where(safe, cross.real, torch.full_like(cross.real, eps))
+        imag = torch.where(safe, cross.imag, torch.zeros_like(cross.imag))
+        return torch.atan2(imag, real)
 
     @staticmethod
     def _wrapped_phase_l1(pred_gd: torch.Tensor, target_gd: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -152,10 +162,12 @@ class StyleTTS2MultiResolutionGroupDelayLoss(nn.Module):
                 center=True,
                 return_complex=True,
             )
-            x_gd = self._group_delay(x_spec)
-            y_gd = self._group_delay(y_spec)
+            x_gd = self._group_delay(x_spec, self.phase_eps)
+            y_gd = self._group_delay(y_spec, self.phase_eps)
 
             mag = 0.5 * (torch.abs(y_spec[:, 1:, :]) + torch.abs(y_spec[:, :-1, :]))
+            if self.mag_floor > 0.0:
+                mag = torch.where(mag >= self.mag_floor, mag, torch.zeros_like(mag))
             total = total + self._wrapped_phase_l1(x_gd, y_gd, mag)
         return total / len(self.fft_sizes)
 

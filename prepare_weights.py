@@ -1,23 +1,38 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import gc
+import logging
 import random
 import re
 import wave
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional
 
 import numpy as np
 import torch
+
+logging.getLogger("torchao").setLevel(logging.ERROR)
+
 from loguru import logger
 from torch import nn
-from torch.ao.quantization import allow_exported_model_train_eval
-from torch.ao.quantization.quantize_pt2e import convert_pt2e, prepare_qat_pt2e
-from torch.ao.quantization.quantizer.xnnpack_quantizer import (
-    XNNPACKQuantizer,
-    get_symmetric_quantization_config,
-)
+from torchao.quantization.pt2e import allow_exported_model_train_eval, disable_observer
+from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
+try:
+    from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import (
+        XNNPACKQuantizer,
+        get_symmetric_quantization_config,
+    )
+    USING_EXECUTORCH_XNNPACK = True
+except ImportError:
+    from torchao.testing.pt2e._xnnpack_quantizer import (
+        XNNPACKQuantizer,
+        get_symmetric_quantization_config,
+    )
+    USING_EXECUTORCH_XNNPACK = False
 from torch.utils.data import DataLoader
 from vocos.discriminators import MultiPeriodDiscriminator, MultiResolutionDiscriminator
 from vocos.loss import FeatureMatchingLoss, GeneratorLoss as VocosGeneratorLoss
@@ -154,6 +169,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-adversarial", action="store_true")
 
     parser.add_argument("--quant-backend", type=str, default="qnnpack")
+    parser.add_argument("--save-full-q8", action="store_true")
     return parser.parse_args()
 
 
@@ -404,6 +420,37 @@ def _next_batch(it: Iterable[Dict[str, torch.Tensor]], fallback_loader: DataLoad
         return next(iterator), iterator
 
 
+def sanitize_batch_tensors(
+    features: torch.Tensor,
+    real: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    clean_features = torch.nan_to_num(features, nan=0.0, posinf=1e4, neginf=-1e4)
+    clean_real = torch.nan_to_num(real, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+    changed = bool((not torch.equal(clean_features, features)) or (not torch.equal(clean_real, real)))
+    return clean_features, clean_real, changed
+
+
+def has_non_finite_gradients(module: nn.Module) -> bool:
+    for p in module.parameters():
+        if p.grad is None:
+            continue
+        if not torch.isfinite(p.grad).all():
+            return True
+    return False
+
+
+def stabilize_non_finite_parameters(module: nn.Module) -> int:
+    fixed = 0
+    with torch.no_grad():
+        for p in module.parameters():
+            if not torch.is_floating_point(p):
+                continue
+            if not torch.isfinite(p).all():
+                p.copy_(torch.nan_to_num(p, nan=0.0, posinf=1e3, neginf=-1e3))
+                fixed += 1
+    return fixed
+
+
 def compute_generator_loss(
     generator: nn.Module,
     features: torch.Tensor,
@@ -497,13 +544,21 @@ def run_qat(
         dynamic_shapes=dynamic_shapes,
         strict=False,
     ).module()
-    quantizer = XNNPACKQuantizer().set_global(
-        get_symmetric_quantization_config(
-            is_per_channel=True,
-            is_qat=True,
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*XNNPACKQuantizer.*deprecated.*",
+            category=Warning,
         )
-    )
-    qat_core = prepare_qat_pt2e(exported_core, quantizer)
+        quantizer = XNNPACKQuantizer().set_global(
+            get_symmetric_quantization_config(
+                is_per_channel=True,
+                is_qat=False,
+                act_qmin=-127,
+                act_qmax=127,
+            )
+        )
+    qat_core = prepare_pt2e(exported_core, quantizer)
     allow_exported_model_train_eval(qat_core)
     qat_core.train()
     pre_fp.train()
@@ -523,15 +578,39 @@ def run_qat(
         batch, batch_iter = _next_batch(batch_iter, train_loader)
         features = batch["features"].float()
         real = batch["audio"].float()
+        features, real, batch_sanitized = sanitize_batch_tensors(features, real)
+        if batch_sanitized:
+            logger.warning(f"QAT step={step}: sanitized non-finite batch values before forward")
 
         optimizer.zero_grad(set_to_none=True)
-        loss, stats = compute_generator_loss(qat_model, features, real, losses, args)
+        try:
+            loss, stats = compute_generator_loss(qat_model, features, real, losses, args)
+        except RuntimeError as exc:
+            if "torch.histc: range of [nan, nan] is not finite" in str(exc):
+                logger.warning(
+                    f"QAT step={step}: non-finite observer histogram input; skipping batch and continuing"
+                )
+                fixed = stabilize_non_finite_parameters(qat_model)
+                if fixed > 0:
+                    logger.warning(f"QAT step={step}: repaired {fixed} non-finite parameter tensors")
+                continue
+            raise
         if not torch.isfinite(loss):
             raise RuntimeError(f"Non-finite QAT loss at step={step}: {stats}")
         loss.backward()
+        if has_non_finite_gradients(qat_model):
+            logger.warning(f"QAT step={step}: non-finite gradients detected; skipping optimizer step")
+            optimizer.zero_grad(set_to_none=True)
+            fixed = stabilize_non_finite_parameters(qat_model)
+            if fixed > 0:
+                logger.warning(f"QAT step={step}: repaired {fixed} non-finite parameter tensors")
+            continue
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(qat_model.parameters(), max_norm=args.grad_clip_norm)
         optimizer.step()
+        fixed = stabilize_non_finite_parameters(qat_model)
+        if fixed > 0:
+            logger.warning(f"QAT step={step}: repaired {fixed} non-finite parameter tensors after optimizer step")
 
         if step % max(1, args.log_every) == 0 or step == 1 or step == args.qat_steps:
             logger.info(
@@ -547,7 +626,7 @@ def run_qat(
                 )
             )
 
-    qat_core.apply(torch.ao.quantization.disable_observer)
+    qat_core.apply(disable_observer)
     qat_core.eval()
     converted_core = convert_pt2e(qat_core)
     allow_exported_model_train_eval(converted_core)
@@ -578,6 +657,166 @@ def cast_floating_state_dict_to_fp16(state_dict: Mapping[str, torch.Tensor]) -> 
         else:
             out[key] = value
     return out
+
+
+def build_slim_q8_state_dict(
+    full_q8_state: Mapping[str, torch.Tensor],
+    int8_model: nn.Module,
+) -> tuple[Dict[str, torch.Tensor], set[str]]:
+    keep_keys: set[str] = set()
+    for key in full_q8_state.keys():
+        if not key.startswith("core."):
+            keep_keys.add(key)
+
+    core = getattr(int8_model, "core", None)
+    if core is None or not hasattr(core, "graph"):
+        # Fallback: keep full state if core graph is unavailable.
+        return dict(full_q8_state), set()
+
+    core_keep_local: set[str] = set()
+    for node in core.graph.nodes:
+        if node.op == "get_attr":
+            core_keep_local.add(str(node.target))
+
+    # Keep only graph-referenced core attrs.
+    for target in core_keep_local:
+        full_key = f"core.{target}"
+        if full_key in full_q8_state:
+            keep_keys.add(full_key)
+
+    slim_state: Dict[str, torch.Tensor] = {k: v for k, v in full_q8_state.items() if k in keep_keys}
+    removed = set(full_q8_state.keys()) - set(slim_state.keys())
+    return slim_state, removed
+
+
+def verify_slim_q8_state_dict(
+    int8_model: nn.Module,
+    full_q8_state: Mapping[str, torch.Tensor],
+    slim_state: Mapping[str, torch.Tensor],
+    removed_keys: set[str],
+    sample_features: torch.Tensor,
+) -> None:
+    ref_model = copy.deepcopy(int8_model).eval()
+    ref_load = ref_model.load_state_dict(full_q8_state, strict=False)
+    if ref_load.unexpected_keys:
+        raise RuntimeError(f"Full q8 state_dict has unexpected keys: {sorted(ref_load.unexpected_keys)[:8]}")
+
+    slim_model = copy.deepcopy(int8_model).eval()
+    load_result = slim_model.load_state_dict(slim_state, strict=False)
+    missing = set(load_result.missing_keys)
+    unexpected = set(load_result.unexpected_keys)
+
+    # Any missing key must be an intentionally removed key.
+    if unexpected:
+        raise RuntimeError(f"Slim q8 state_dict has unexpected keys: {sorted(unexpected)[:8]}")
+    if not missing.issubset(removed_keys):
+        extra_missing = sorted(missing - removed_keys)[:8]
+        raise RuntimeError(f"Slim q8 verification failed; unexpected missing keys: {extra_missing}")
+
+    with torch.inference_mode():
+        ref = ref_model(sample_features.unsqueeze(0).float()).squeeze(0).float()
+        got = slim_model(sample_features.unsqueeze(0).float()).squeeze(0).float()
+    max_abs_err = torch.max(torch.abs(ref - got)).item()
+    if max_abs_err > 1e-5:
+        raise RuntimeError(f"Slim q8 verification mismatch: max_abs_err={max_abs_err:.6g}")
+
+
+def count_weight_dtypes(state_dict: Mapping[str, torch.Tensor]) -> Dict[str, int]:
+    counts = {"fp32": 0, "fp16": 0, "int8": 0}
+    for value in state_dict.values():
+        if not torch.is_tensor(value):
+            continue
+        n = int(value.numel())
+        dtype = value.dtype
+        if value.is_quantized:
+            if dtype in (torch.qint8, torch.quint8):
+                counts["int8"] += n
+            elif dtype == torch.float16:
+                counts["fp16"] += n
+            elif dtype == torch.float32:
+                counts["fp32"] += n
+            continue
+
+        if dtype == torch.float32:
+            counts["fp32"] += n
+        elif dtype in (torch.float16, torch.bfloat16):
+            counts["fp16"] += n
+        elif dtype in (torch.int8, torch.uint8):
+            counts["int8"] += n
+    return counts
+
+
+def estimate_ops_for_50_frames(cfg: GeneratorConfig, frames: int = 50) -> Dict[str, Dict[str, int]]:
+    # MAC estimate using Conv1d/Linear style terms over learned layers.
+    t = int(frames)
+    c_in = cfg.in_channels
+    c_mid = cfg.model_input_channels
+    d = cfg.backbone_dim
+    d_int = cfg.backbone_intermediate_dim
+    layers = cfg.backbone_layers
+    head_out = cfg.n_fft + 2
+
+    conditioner_ops = t * (c_mid * c_in + c_mid * c_mid * 3 + c_mid * c_mid)
+    embed_ops = t * (d * c_mid * 7)
+    convnext_per_layer = t * (d * 7 + d_int * d + d * d_int)
+    convnext_ops = layers * convnext_per_layer
+    head_ops = t * (head_out * d)
+
+    total = conditioner_ops + embed_ops + convnext_ops + head_ops
+    pre_ops = conditioner_ops + embed_ops
+    post_ops = head_ops
+
+    # Quantized pipeline currently: pre(float) -> core(int8) -> post(float).
+    return {
+        "original": {"fp32": total, "fp16": 0, "int8": 0},
+        "fp16": {"fp32": 0, "fp16": total, "int8": 0},
+        "int8": {"fp32": 0, "fp16": pre_ops + post_ops, "int8": convnext_ops},
+    }
+
+
+def format_int(n: int) -> str:
+    return f"{int(n):,}"
+
+
+def print_quant_summary_table(
+    original_state: Mapping[str, torch.Tensor],
+    fp16_state: Mapping[str, torch.Tensor],
+    int8_state: Mapping[str, torch.Tensor],
+    cfg: GeneratorConfig,
+) -> None:
+    weight_rows = {
+        "original": count_weight_dtypes(original_state),
+        "fp16": count_weight_dtypes(fp16_state),
+        "int8": count_weight_dtypes(int8_state),
+    }
+    op_rows = estimate_ops_for_50_frames(cfg=cfg, frames=50)
+
+    headers = [
+        "model",
+        "weights_fp32",
+        "weights_fp16",
+        "weights_int8",
+        "ops_fp32@50f",
+        "ops_fp16@50f",
+        "ops_int8@50f",
+    ]
+    print()
+    print("| " + " | ".join(headers) + " |")
+    print("|" + "|".join(["---"] * len(headers)) + "|")
+    for model_name in ("original", "fp16", "int8"):
+        w = weight_rows[model_name]
+        o = op_rows[model_name]
+        row = [
+            model_name,
+            format_int(w["fp32"]),
+            format_int(w["fp16"]),
+            format_int(w["int8"]),
+            format_int(o["fp32"]),
+            format_int(o["fp16"]),
+            format_int(o["int8"]),
+        ]
+        print("| " + " | ".join(row) + " |")
+    print()
 
 
 def run_fp16_inference(
@@ -638,6 +877,11 @@ def save_inference_samples(
 def main() -> None:
     logger.enable("prepare_weights")
     args = parse_args()
+    if not USING_EXECUTORCH_XNNPACK:
+        logger.warning(
+            "ExecuTorch XNNPACK quantizer not found; using torchao fallback. "
+            "Install optional deps: `uv sync --extra executorch-quant`"
+        )
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
@@ -671,10 +915,36 @@ def main() -> None:
     losses = build_losses(args, ckpt)
     int8_model = run_qat(generator, train_loader, losses, args)
 
-    q8_path = out_dir / "vocos_q8.pt"
     q8_state = cast_floating_state_dict_to_fp16(int8_model.state_dict())
-    torch.save(q8_state, q8_path)
-    logger.info(f"Saved quantized int8 inference state_dict: {q8_path}")
+
+    sample_features_for_verify: torch.Tensor
+    if inference_samples:
+        sample_features_for_verify = inference_samples[0].features
+    else:
+        verify_batch = next(iter(train_loader))
+        sample_features_for_verify = verify_batch["features"][0]
+
+    q8_slim_state, removed_q8_keys = build_slim_q8_state_dict(q8_state, int8_model)
+    verify_slim_q8_state_dict(
+        int8_model=int8_model,
+        full_q8_state=q8_state,
+        slim_state=q8_slim_state,
+        removed_keys=removed_q8_keys,
+        sample_features=sample_features_for_verify,
+    )
+    q8_path = out_dir / "vocos_q8.pt"
+    torch.save(q8_slim_state, q8_path)
+    logger.info(
+        "Saved quantized int8 inference state_dict (slim default): "
+        f"{q8_path} (removed {len(removed_q8_keys)} keys)"
+    )
+    if args.save_full_q8:
+        q8_full_path = out_dir / "vocos_q8_full.pt"
+        torch.save(q8_state, q8_full_path)
+        logger.info(f"Saved full quantized int8 inference state_dict: {q8_full_path}")
+    # Release redundant full-q8 tensors before sample generation.
+    del q8_state
+    gc.collect()
 
     samples_dir = args.samples_dir.resolve() if args.samples_dir else (out_dir / "sample_audio")
     save_inference_samples(
@@ -687,6 +957,12 @@ def main() -> None:
         sample_rate=args.sample_rate,
     )
     logger.info(f"Saved inference comparison audio files to: {samples_dir}")
+    print_quant_summary_table(
+        original_state=generator.state_dict(),
+        fp16_state=fp16_state,
+        int8_state=q8_slim_state,
+        cfg=config,
+    )
 
 
 if __name__ == "__main__":
