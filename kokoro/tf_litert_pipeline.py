@@ -36,13 +36,23 @@ Examples:
      --skip-export --skip-qat \
      --output-dir output/tf_litert
 
+5) Force weight-only int8 export (quality-first)
+   uv run python -m kokoro.tf_litert_pipeline \
+     --pytorch-checkpoint output/checkpoints/last.pt \
+     --data-root inputs \
+     --train-filelist inputs/filelists/vocos.train.txt \
+     --val-filelist inputs/filelists/vocos.val.txt \
+     --int8-recipe weight_only \
+     --output-dir output/tf_litert_weight_only
+
 Notes:
 - Fixed-frame export is enforced at 520 frames (input shape [1, 642, 520]).
 - Quantization split mirrors PyTorch flow:
   - Float pre blocks: conditioner + embed + input norm
   - Quantized core: ConvNeXt stack
   - Float post blocks: final layer norm + export-safe ISTFT head
-- int8 export uses representative-dataset calibration with native TFLite conversion.
+- int8 export mode is configurable: `auto`, `static`, or `weight_only`.
+- `auto` exports both and chooses the better-quality int8 candidate by fp32 probe match.
 """
 
 from __future__ import annotations
@@ -52,6 +62,7 @@ import csv
 import json
 import math
 import random
+import shutil
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,6 +71,8 @@ from typing import Dict, Iterable, List, Mapping, Sequence
 import numpy as np
 import tensorflow as tf
 import torch
+from ai_edge_quantizer import quantizer as aeq_quantizer
+from ai_edge_quantizer import recipe as aeq_recipe
 from ai_edge_quantizer.utils import tfl_interpreter_utils
 from loguru import logger
 
@@ -125,6 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--int8-calib-samples", type=int, default=64)
     parser.add_argument("--num-val-samples", type=int, default=20)
+    parser.add_argument("--int8-recipe", choices=("auto", "static", "weight_only"), default="auto")
 
     parser.add_argument("--skip-qat", action="store_true")
     parser.add_argument("--skip-export", action="store_true")
@@ -440,7 +454,37 @@ def _export_int8_tflite(
     int8_model = converter.convert()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(int8_model)
-    return out_path, "tflite_representative_int8_hybrid"
+    return out_path, "tflite_representative_int8_hybrid_static"
+
+
+def _export_int8_weight_only_from_fp32(fp32_tflite_path: Path, out_path: Path) -> tuple[Path, str]:
+    fp32_model = fp32_tflite_path.read_bytes()
+    qt = aeq_quantizer.Quantizer(fp32_model)
+    qt.load_quantization_recipe(aeq_recipe.weight_only_wi8_afp32())
+    quant_result = qt.quantize()
+    if quant_result.quantized_model is None:
+        raise RuntimeError("AI Edge Quantizer did not produce weight-only int8 model")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(bytes(quant_result.quantized_model))
+    return out_path, "ai_edge_weight_only_wi8_afp32"
+
+
+def _probe_int8_quality(
+    fp32_path: Path,
+    int8_path: Path,
+    probe_feature: np.ndarray,
+) -> dict[str, float]:
+    y_fp32 = _run_tflite(fp32_path, probe_feature).astype(np.float32)
+    y_int8 = _run_tflite(int8_path, probe_feature).astype(np.float32)
+    n = min(len(y_fp32), len(y_int8))
+    if n <= 0:
+        return {"mae": math.inf, "rmse": math.inf, "corr": -1.0}
+    y_fp32 = y_fp32[:n]
+    y_int8 = y_int8[:n]
+    mae = float(np.mean(np.abs(y_fp32 - y_int8)))
+    rmse = float(np.sqrt(np.mean((y_fp32 - y_int8) ** 2)))
+    corr = float(np.corrcoef(y_fp32, y_int8)[0, 1]) if (np.std(y_fp32) > 1e-8 and np.std(y_int8) > 1e-8) else -1.0
+    return {"mae": mae, "rmse": rmse, "corr": corr}
 
 
 def _dtype_is_integer(dtype_obj: object) -> bool:
@@ -713,22 +757,63 @@ def main() -> None:
     fp32_path = tflite_dir / "vocos_fp32.tflite"
     fp16_path = tflite_dir / "vocos_fp16.tflite"
     int8_path = tflite_dir / "vocos_int8.tflite"
+    int8_static_path = tflite_dir / "vocos_int8_static.tflite"
+    int8_weight_only_path = tflite_dir / "vocos_int8_weight_only.tflite"
     int8_mode = "none"
+    int8_probe: dict[str, object] = {}
     if not args.skip_export:
         _export_fp32_tflite(inference_model, in_channels=cfg.in_channels, fixed_frames=args.fixed_frames, out_path=fp32_path)
         _export_fp16_tflite(inference_model, in_channels=cfg.in_channels, fixed_frames=args.fixed_frames, out_path=fp16_path)
 
-        rep_feats: list[np.ndarray] = []
-        for _ in range(max(1, args.int8_calib_samples)):
-            f, _ = train_loader.next_batch()
-            rep_feats.append(f[0])
-        _, int8_mode = _export_int8_tflite(
-            inference_model,
-            in_channels=cfg.in_channels,
+        probe_item = _build_val_items(val_filelist, 1)[0]
+        probe_feat, _ = _load_fixed_feature_and_target_audio(
+            pair_path=probe_item.pair_path,
+            wav_path=probe_item.wav_path,
             fixed_frames=args.fixed_frames,
-            out_path=int8_path,
-            rep_feats=rep_feats,
+            hop_length=args.hop_length,
+            sample_rate=args.sample_rate,
+            start_frame=0,
         )
+
+        int8_candidates: dict[str, Path] = {}
+        if args.int8_recipe in {"auto", "static"}:
+            rep_feats: list[np.ndarray] = []
+            for _ in range(max(1, args.int8_calib_samples)):
+                f, _ = train_loader.next_batch()
+                rep_feats.append(f[0])
+            _export_int8_tflite(
+                inference_model,
+                in_channels=cfg.in_channels,
+                fixed_frames=args.fixed_frames,
+                out_path=int8_static_path,
+                rep_feats=rep_feats,
+            )
+            int8_candidates["static"] = int8_static_path
+
+        if args.int8_recipe in {"auto", "weight_only"}:
+            _export_int8_weight_only_from_fp32(fp32_path, int8_weight_only_path)
+            int8_candidates["weight_only"] = int8_weight_only_path
+
+        if not int8_candidates:
+            raise RuntimeError(f"No int8 export candidate for recipe={args.int8_recipe}")
+
+        if args.int8_recipe == "auto" and len(int8_candidates) > 1:
+            for name, path in int8_candidates.items():
+                int8_probe[name] = _probe_int8_quality(fp32_path, path, probe_feat)
+            # Prefer highest correlation, then lowest mae.
+            ranked = sorted(int8_probe.items(), key=lambda kv: (-kv[1]["corr"], kv[1]["mae"]))
+            selected = ranked[0][0]
+            int8_path_selected = int8_candidates[selected]
+            int8_mode = f"auto:{selected}"
+            logger.info(f"int8 auto probe: {int8_probe} -> selected={selected}")
+        else:
+            selected = next(iter(int8_candidates.keys()))
+            int8_path_selected = int8_candidates[selected]
+            int8_mode = selected
+
+        if int8_path_selected != int8_path:
+            shutil.copy2(int8_path_selected, int8_path)
+        int8_probe["selected"] = {"mode": int8_mode}
         logger.info(f"Exported LiteRT models to {tflite_dir} (int8_mode={int8_mode})")
 
     op_rows: dict[str, ArithmeticOpStats] = {}
@@ -748,10 +833,13 @@ def main() -> None:
             "fp32": str(fp32_path),
             "fp16": str(fp16_path),
             "int8": str(int8_path),
+            "int8_static": str(int8_static_path),
+            "int8_weight_only": str(int8_weight_only_path),
             "int8_mode": int8_mode,
         },
         "ops": {k: {"float_ops": v.float_ops, "int_ops": v.int_ops, "total": v.total} for k, v in op_rows.items()},
         "qat": qat_stats,
+        "int8_probe": int8_probe,
         "load_report": {
             "loaded_keys": load_report["num_loaded_keys"],
             "ignored_keys": load_report["ignored_keys"],
