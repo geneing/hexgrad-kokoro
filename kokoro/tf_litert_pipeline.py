@@ -1,5 +1,15 @@
 """TensorFlow Vocos LiteRT export + QAT tuning + validation pipeline.
 
+Progress log (2026-02-22):
+- [done] Add mixed export path: int8 core ops + float-sensitive path from fp16 base model.
+- [done] Keep auto-selection quality-first while preferring higher int8 arithmetic coverage.
+- [done] Extend validation reports with fp16/int8 vs fp32 closeness metrics.
+- [done] Add optional intermediate tensor drift report across fp32/fp16/int8 TFLite models.
+- [done] Make auto mode robust to candidate-export failures (skip failed candidate, keep pipeline running).
+- [done] Add scoped int8 candidates to reduce remaining float ops (pre conv + optional post FC).
+- [done] Add narrow post-FC scoped candidate to test extra int8 coverage with lower quality risk.
+- [done] In auto mode, prefer higher int8 coverage among quality-equivalent candidates.
+
 Examples:
 1) End-to-end run (QAT + fp32/fp16/int8 export + 20-sample validation)
    uv run python -m kokoro.tf_litert_pipeline \
@@ -54,16 +64,29 @@ Examples:
      --int8-recipe static \
      --output-dir output/tf_litert_static
 
+7) Force mixed-core int8 export (preferred for quality/perf balance)
+   uv run python -m kokoro.tf_litert_pipeline \
+     --pytorch-checkpoint output/checkpoints/last.pt \
+     --data-root inputs \
+     --train-filelist inputs/filelists/vocos.train.txt \
+     --val-filelist inputs/filelists/vocos.val.txt \
+     --int8-recipe mixed \
+     --output-dir output/tf_litert_mixed
+
 Notes:
 - Fixed-frame export is enforced at 520 frames (input shape [1, 642, 520]).
 - Quantization split mirrors PyTorch flow:
   - Float pre blocks: conditioner + embed + input norm
   - Quantized core: ConvNeXt stack
   - Float post blocks: final layer norm + export-safe ISTFT head
-- int8 export mode is configurable: `auto`, `static`, `static_full`, or `weight_only`.
+- int8 export mode is configurable: `auto`, `mixed`, `static`, `static_plus_postfc`, `static_plus_pre`, `static_plus_pre_postfc`, `static_full`, or `weight_only`.
+- `mixed` quantizes core ConvNeXt-heavy ops from an fp16 base model (sensitive blocks stay float path).
 - `static` quantizes ConvNeXt core ops only (keeps sensitive blocks float).
+- `static_plus_postfc` quantizes core plus post-head FC projections (higher coverage, moderate risk).
+- `static_plus_pre` quantizes core plus pre-block convs (extra int8 coverage, quality-sensitive).
+- `static_plus_pre_postfc` quantizes core + pre convs + post FC projections (higher int8 coverage).
 - `static_full` fully static-quantizes int8 activations (diagnostic mode).
-- `auto` exports candidates and chooses the better-quality int8 by fp32 probe match.
+- `auto` exports candidates and chooses by fp32 probe match with int8 arithmetic coverage preference.
 """
 
 from __future__ import annotations
@@ -149,7 +172,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--int8-calib-samples", type=int, default=64)
     parser.add_argument("--num-val-samples", type=int, default=20)
-    parser.add_argument("--int8-recipe", choices=("auto", "static", "static_full", "weight_only"), default="auto")
+    parser.add_argument(
+        "--int8-recipe",
+        choices=(
+            "auto",
+            "mixed",
+            "static",
+            "static_plus_postfc",
+            "static_plus_pre",
+            "static_plus_pre_postfc",
+            "static_full",
+            "weight_only",
+        ),
+        default="auto",
+    )
+    parser.add_argument("--dump-intermediates", action="store_true")
+    parser.add_argument("--intermediate-max-tensors", type=int, default=192)
 
     parser.add_argument("--skip-qat", action="store_true")
     parser.add_argument("--skip-export", action="store_true")
@@ -468,18 +506,18 @@ def _export_int8_static_full_tflite(
     return out_path, "tflite_representative_int8_hybrid_static_full"
 
 
-def _export_int8_static_core_from_fp32(
-    fp32_tflite_path: Path,
+def _export_int8_scoped_from_tflite(
+    source_tflite_path: Path,
     out_path: Path,
     rep_feats: Sequence[np.ndarray],
+    source_tag: str,
+    static_configs: Sequence[tuple[str, str]],
+    recipe_tag: str,
 ) -> tuple[Path, str]:
-    fp32_model = fp32_tflite_path.read_bytes()
-    qt = aeq_quantizer.Quantizer(fp32_model)
-
-    # Keep sensitive pre/post synthesis path in float; quantize core heavy ops for NPU.
-    core_regex = r".*quantizable_vocos_core_tf_1.*"
-    qt.add_static_config(core_regex, "DEPTHWISE_CONV_2D", 8, 8)
-    qt.add_static_config(core_regex, "FULLY_CONNECTED", 8, 8)
+    source_model = source_tflite_path.read_bytes()
+    qt = aeq_quantizer.Quantizer(source_model)
+    for op_regex, op_type in static_configs:
+        qt.add_static_config(op_regex, op_type, 8, 8)
 
     rep = list(rep_feats)
     if not rep:
@@ -524,7 +562,7 @@ def _export_int8_static_core_from_fp32(
         raise RuntimeError("AI Edge Quantizer did not produce static-core int8 model")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(bytes(quant_result.quantized_model))
-    return out_path, "ai_edge_static_core_wi8_ai8"
+    return out_path, f"ai_edge_{recipe_tag}_wi8_ai8_from_{source_tag}"
 
 
 def _export_int8_weight_only_from_fp32(fp32_tflite_path: Path, out_path: Path) -> tuple[Path, str]:
@@ -555,6 +593,94 @@ def _probe_int8_quality(
     rmse = float(np.sqrt(np.mean((y_fp32 - y_int8) ** 2)))
     corr = float(np.corrcoef(y_fp32, y_int8)[0, 1]) if (np.std(y_fp32) > 1e-8 and np.std(y_int8) > 1e-8) else -1.0
     return {"mae": mae, "rmse": rmse, "corr": corr}
+
+
+def _score_int8_candidates(
+    fp32_path: Path,
+    candidates: Mapping[str, Path],
+    probe_feature: np.ndarray,
+    fixed_frames: int,
+) -> dict[str, dict[str, float]]:
+    scored: dict[str, dict[str, float]] = {}
+    for name, path in candidates.items():
+        q = _probe_int8_quality(fp32_path, path, probe_feature)
+        ops = estimate_tflite_arithmetic_ops(path, fixed_frames=fixed_frames)
+        total = max(1, ops.total)
+        int_ratio = float(ops.int_ops) / float(total)
+        scored[name] = {
+            "mae": float(q["mae"]),
+            "rmse": float(q["rmse"]),
+            "corr": float(q["corr"]),
+            "float_ops": float(ops.float_ops),
+            "int_ops": float(ops.int_ops),
+            "total_ops": float(ops.total),
+            "int_ops_ratio": float(int_ratio),
+        }
+    return scored
+
+
+def _select_int8_candidate(scored: Mapping[str, Mapping[str, float]]) -> tuple[str, dict[str, object]]:
+    if not scored:
+        raise RuntimeError("No scored int8 candidates to select from")
+    best_corr = max(float(v["corr"]) for v in scored.values())
+    corr_floor = best_corr - 0.005
+    shortlist = {k: v for k, v in scored.items() if float(v["corr"]) >= corr_floor}
+    if not shortlist:
+        shortlist = dict(scored)
+    # Candidates in shortlist are already quality-bounded by corr_floor.
+    # Within that set, prefer higher int8 coverage.
+    ranked = sorted(
+        shortlist.items(),
+        key=lambda kv: (
+            -float(kv[1]["int_ops_ratio"]),
+            -float(kv[1]["corr"]),
+            float(kv[1]["mae"]),
+            float(kv[1]["rmse"]),
+        ),
+    )
+    selected = ranked[0][0]
+    decision = {
+        "best_corr": float(best_corr),
+        "corr_floor": float(corr_floor),
+        "shortlist": list(shortlist.keys()),
+        "ranking": [
+            {
+                "name": k,
+                "corr": float(v["corr"]),
+                "int_ops_ratio": float(v["int_ops_ratio"]),
+                "mae": float(v["mae"]),
+                "rmse": float(v["rmse"]),
+            }
+            for k, v in ranked
+        ],
+    }
+    return selected, decision
+
+
+def _static_scope_configs(scope: str) -> list[tuple[str, str]]:
+    core_regex = r".*quantizable_vocos_core_tf.*"
+    pre_regex = r".*float_pre_blocks_tf.*"
+    post_head_regex = r".*float_post_blocks_tf.*export_safe_istft_head_tf.*"
+
+    cfg: list[tuple[str, str]] = [
+        (core_regex, "CONV_2D"),
+        (core_regex, "DEPTHWISE_CONV_2D"),
+        (core_regex, "FULLY_CONNECTED"),
+    ]
+    if scope in {"plus_pre", "plus_pre_postfc"}:
+        cfg.extend(
+            [
+                (pre_regex, "CONV_2D"),
+                (pre_regex, "FULLY_CONNECTED"),
+            ]
+        )
+    if scope in {"plus_postfc", "plus_pre_postfc"}:
+        cfg.extend(
+            [
+                (post_head_regex, "FULLY_CONNECTED"),
+            ]
+        )
+    return cfg
 
 
 def _dtype_is_integer(dtype_obj: object) -> bool:
@@ -692,8 +818,7 @@ def print_ops_table(rows: Mapping[str, ArithmeticOpStats]) -> None:
     print()
 
 
-def _run_tflite(model_path: Path, features_bct: np.ndarray) -> np.ndarray:
-    model = tfl_interpreter_utils.create_tfl_interpreter(str(model_path), allocate_tensors=True, use_xnnpack=False)
+def _run_tflite_interpreter(model: object, features_bct: np.ndarray) -> np.ndarray:
     sigs = list(model.get_signature_list().keys())
     x = np.asarray(features_bct[None, ...], dtype=np.float32)
     if sigs:
@@ -701,14 +826,14 @@ def _run_tflite(model_path: Path, features_bct: np.ndarray) -> np.ndarray:
         runner = model.get_signature_runner(sig)
         in_details = runner.get_input_details()
         if len(in_details) != 1:
-            raise RuntimeError(f"Expected single input in {model_path}")
+            raise RuntimeError("Expected single input in signature runner")
         in_name = next(iter(in_details.keys()))
         in_meta = in_details[in_name]
         in_dtype = np.dtype(in_meta["dtype"])
         if _dtype_is_integer(in_dtype):
             scale, zp = in_meta.get("quantization", (0.0, 0))
             if float(scale) <= 0.0:
-                raise RuntimeError(f"Invalid input quantization scale in {model_path}")
+                raise RuntimeError("Invalid input quantization scale")
             q = np.round(x / float(scale) + int(zp))
             q = np.clip(q, np.iinfo(in_dtype).min, np.iinfo(in_dtype).max).astype(in_dtype)
             x = q
@@ -720,13 +845,13 @@ def _run_tflite(model_path: Path, features_bct: np.ndarray) -> np.ndarray:
     else:
         in_details = model.get_input_details()
         if len(in_details) != 1:
-            raise RuntimeError(f"Expected single input in {model_path}")
+            raise RuntimeError("Expected single input in model input details")
         in_meta = in_details[0]
         in_dtype = np.dtype(in_meta["dtype"])
         if _dtype_is_integer(in_dtype):
             scale, zp = in_meta.get("quantization", (0.0, 0))
             if float(scale) <= 0.0:
-                raise RuntimeError(f"Invalid input quantization scale in {model_path}")
+                raise RuntimeError("Invalid input quantization scale")
             q = np.round(x / float(scale) + int(zp))
             x = np.clip(q, np.iinfo(in_dtype).min, np.iinfo(in_dtype).max).astype(in_dtype)
         else:
@@ -741,6 +866,106 @@ def _run_tflite(model_path: Path, features_bct: np.ndarray) -> np.ndarray:
             if float(scale) > 0.0:
                 y = (y - float(zp)) * float(scale)
     return y[0]
+
+
+def _run_tflite(model_path: Path, features_bct: np.ndarray) -> np.ndarray:
+    model = tfl_interpreter_utils.create_tfl_interpreter(str(model_path), allocate_tensors=True, use_xnnpack=False)
+    return _run_tflite_interpreter(model, features_bct)
+
+
+def _collect_tflite_intermediates(
+    model_path: Path,
+    features_bct: np.ndarray,
+    max_tensors: int,
+) -> dict[tuple[str, tuple[int, ...]], dict[str, object]]:
+    interpreter = tfl_interpreter_utils.create_tfl_interpreter(
+        str(model_path),
+        allocate_tensors=True,
+        use_xnnpack=False,
+        preserve_all_tensors=True,
+    )
+    _ = _run_tflite_interpreter(interpreter, features_bct)
+
+    op_output_indexes: set[int] = set()
+    for op in interpreter._get_ops_details():
+        for out_idx in list(op.get("outputs", [])):
+            if int(out_idx) >= 0:
+                op_output_indexes.add(int(out_idx))
+
+    entries: list[dict[str, object]] = []
+    for detail in interpreter.get_tensor_details():
+        idx = int(detail.get("index", -1))
+        if idx < 0 or idx not in op_output_indexes:
+            continue
+        name = str(detail.get("name", ""))
+        shape = tuple(int(d) for d in detail.get("shape", []))
+        if _shape_numel(shape) <= 0:
+            continue
+        try:
+            arr = np.asarray(interpreter.get_tensor(idx))
+        except Exception:
+            continue
+        if arr.size <= 0 or not np.issubdtype(arr.dtype, np.number):
+            continue
+        arrf = arr.astype(np.float32, copy=False).reshape(-1)
+        entries.append(
+            {
+                "key": (name, shape),
+                "name": name,
+                "shape": shape,
+                "dtype": str(arr.dtype),
+                "numel": int(arr.size),
+                "values": arrf,
+            }
+        )
+
+    entries.sort(key=lambda e: int(e["numel"]), reverse=True)
+    capped = entries[: max(1, int(max_tensors))]
+    out: dict[tuple[str, tuple[int, ...]], dict[str, object]] = {}
+    for e in capped:
+        out[e["key"]] = e
+    return out
+
+
+def _compare_tflite_intermediates(
+    ref_map: Mapping[tuple[str, tuple[int, ...]], Mapping[str, object]],
+    cand_map: Mapping[tuple[str, tuple[int, ...]], Mapping[str, object]],
+    candidate_name: str,
+    top_k: int = 40,
+) -> dict[str, object]:
+    keys = sorted(set(ref_map.keys()) & set(cand_map.keys()))
+    per_tensor: list[dict[str, object]] = []
+    for key in keys:
+        r = np.asarray(ref_map[key]["values"], dtype=np.float32)
+        c = np.asarray(cand_map[key]["values"], dtype=np.float32)
+        n = min(len(r), len(c))
+        if n <= 0:
+            continue
+        r = r[:n]
+        c = c[:n]
+        diff = c - r
+        mae = float(np.mean(np.abs(diff)))
+        rmse = float(np.sqrt(np.mean(diff * diff)))
+        corr = float(np.corrcoef(r, c)[0, 1]) if (np.std(r) > 1e-8 and np.std(c) > 1e-8) else math.nan
+        per_tensor.append(
+            {
+                "tensor_name": str(ref_map[key]["name"]),
+                "shape": [int(d) for d in ref_map[key]["shape"]],
+                "numel": int(n),
+                "reference_dtype": str(ref_map[key]["dtype"]),
+                "candidate_dtype": str(cand_map[key]["dtype"]),
+                "mae": mae,
+                "rmse": rmse,
+                "corr": corr,
+            }
+        )
+    per_tensor.sort(key=lambda r: float(r["rmse"]), reverse=True)
+    return {
+        "candidate": candidate_name,
+        "common_tensors": int(len(keys)),
+        "compared_tensors": int(len(per_tensor)),
+        "top_drift_tensors": per_tensor[: max(1, int(top_k))],
+    }
 
 
 def _metrics(pred: np.ndarray, target: np.ndarray) -> dict[str, float]:
@@ -827,7 +1052,11 @@ def main() -> None:
     fp32_path = tflite_dir / "vocos_fp32.tflite"
     fp16_path = tflite_dir / "vocos_fp16.tflite"
     int8_path = tflite_dir / "vocos_int8.tflite"
+    int8_mixed_path = tflite_dir / "vocos_int8_mixed.tflite"
     int8_static_path = tflite_dir / "vocos_int8_static.tflite"
+    int8_static_plus_postfc_path = tflite_dir / "vocos_int8_static_plus_postfc.tflite"
+    int8_static_plus_pre_path = tflite_dir / "vocos_int8_static_plus_pre.tflite"
+    int8_static_plus_pre_postfc_path = tflite_dir / "vocos_int8_static_plus_pre_postfc.tflite"
     int8_static_full_path = tflite_dir / "vocos_int8_static_full.tflite"
     int8_weight_only_path = tflite_dir / "vocos_int8_weight_only.tflite"
     int8_mode = "none"
@@ -847,54 +1076,157 @@ def main() -> None:
         )
 
         int8_candidates: dict[str, Path] = {}
+        int8_errors: dict[str, str] = {}
         rep_feats: list[np.ndarray] = []
-        if args.int8_recipe in {"auto", "static", "static_full"}:
+        if args.int8_recipe in {
+            "auto",
+            "mixed",
+            "static",
+            "static_plus_postfc",
+            "static_plus_pre",
+            "static_plus_pre_postfc",
+            "static_full",
+        }:
             for _ in range(max(1, args.int8_calib_samples)):
                 f, _ = train_loader.next_batch()
                 rep_feats.append(f[0])
 
-        if args.int8_recipe in {"auto", "static"}:
-            _export_int8_static_core_from_fp32(
-                fp32_tflite_path=fp32_path,
-                out_path=int8_static_path,
-                rep_feats=rep_feats,
+        def _record_candidate(name: str, export_fn, out_path: Path) -> None:
+            try:
+                export_fn()
+                int8_candidates[name] = out_path
+            except Exception as exc:  # noqa: BLE001
+                msg = f"{type(exc).__name__}: {exc}"
+                int8_errors[name] = msg
+                if args.int8_recipe == name:
+                    raise RuntimeError(f"int8 export failed for recipe={name}: {msg}") from exc
+                logger.warning(f"int8 candidate '{name}' failed, skipping: {msg}")
+
+        if args.int8_recipe in {"auto", "mixed"}:
+            _record_candidate(
+                "mixed",
+                lambda: _export_int8_scoped_from_tflite(
+                    source_tflite_path=fp16_path,
+                    out_path=int8_mixed_path,
+                    rep_feats=rep_feats,
+                    source_tag="fp16",
+                    static_configs=_static_scope_configs("core_only"),
+                    recipe_tag="mixed_core",
+                ),
+                int8_mixed_path,
             )
-            int8_candidates["static"] = int8_static_path
+
+        if args.int8_recipe in {"auto", "static"}:
+            _record_candidate(
+                "static",
+                lambda: _export_int8_scoped_from_tflite(
+                    source_tflite_path=fp32_path,
+                    out_path=int8_static_path,
+                    rep_feats=rep_feats,
+                    source_tag="fp32",
+                    static_configs=_static_scope_configs("core_only"),
+                    recipe_tag="static_core",
+                ),
+                int8_static_path,
+            )
+
+        if args.int8_recipe in {"auto", "static_plus_postfc"}:
+            _record_candidate(
+                "static_plus_postfc",
+                lambda: _export_int8_scoped_from_tflite(
+                    source_tflite_path=fp32_path,
+                    out_path=int8_static_plus_postfc_path,
+                    rep_feats=rep_feats,
+                    source_tag="fp32",
+                    static_configs=_static_scope_configs("plus_postfc"),
+                    recipe_tag="static_plus_postfc",
+                ),
+                int8_static_plus_postfc_path,
+            )
+
+        if args.int8_recipe in {"auto", "static_plus_pre"}:
+            _record_candidate(
+                "static_plus_pre",
+                lambda: _export_int8_scoped_from_tflite(
+                    source_tflite_path=fp32_path,
+                    out_path=int8_static_plus_pre_path,
+                    rep_feats=rep_feats,
+                    source_tag="fp32",
+                    static_configs=_static_scope_configs("plus_pre"),
+                    recipe_tag="static_plus_pre",
+                ),
+                int8_static_plus_pre_path,
+            )
+
+        if args.int8_recipe in {"auto", "static_plus_pre_postfc"}:
+            _record_candidate(
+                "static_plus_pre_postfc",
+                lambda: _export_int8_scoped_from_tflite(
+                    source_tflite_path=fp32_path,
+                    out_path=int8_static_plus_pre_postfc_path,
+                    rep_feats=rep_feats,
+                    source_tag="fp32",
+                    static_configs=_static_scope_configs("plus_pre_postfc"),
+                    recipe_tag="static_plus_pre_postfc",
+                ),
+                int8_static_plus_pre_postfc_path,
+            )
 
         if args.int8_recipe in {"auto", "static_full"}:
-            _export_int8_static_full_tflite(
-                inference_model,
-                in_channels=cfg.in_channels,
-                fixed_frames=args.fixed_frames,
-                out_path=int8_static_full_path,
-                rep_feats=rep_feats,
+            _record_candidate(
+                "static_full",
+                lambda: _export_int8_static_full_tflite(
+                    inference_model,
+                    in_channels=cfg.in_channels,
+                    fixed_frames=args.fixed_frames,
+                    out_path=int8_static_full_path,
+                    rep_feats=rep_feats,
+                ),
+                int8_static_full_path,
             )
-            int8_candidates["static_full"] = int8_static_full_path
 
         if args.int8_recipe in {"auto", "weight_only"}:
-            _export_int8_weight_only_from_fp32(fp32_path, int8_weight_only_path)
-            int8_candidates["weight_only"] = int8_weight_only_path
+            _record_candidate(
+                "weight_only",
+                lambda: _export_int8_weight_only_from_fp32(fp32_path, int8_weight_only_path),
+                int8_weight_only_path,
+            )
 
         if not int8_candidates:
-            raise RuntimeError(f"No int8 export candidate for recipe={args.int8_recipe}")
+            raise RuntimeError(f"No int8 export candidate for recipe={args.int8_recipe}. errors={int8_errors}")
 
         if args.int8_recipe == "auto" and len(int8_candidates) > 1:
-            for name, path in int8_candidates.items():
-                int8_probe[name] = _probe_int8_quality(fp32_path, path, probe_feat)
-            # Prefer highest correlation, then lowest mae.
-            ranked = sorted(int8_probe.items(), key=lambda kv: (-kv[1]["corr"], kv[1]["mae"]))
-            selected = ranked[0][0]
+            scored = _score_int8_candidates(
+                fp32_path=fp32_path,
+                candidates=int8_candidates,
+                probe_feature=probe_feat,
+                fixed_frames=args.fixed_frames,
+            )
+            selected, decision = _select_int8_candidate(scored)
+            int8_probe["candidates"] = scored
+            int8_probe["selection"] = decision
             int8_path_selected = int8_candidates[selected]
             int8_mode = f"auto:{selected}"
-            logger.info(f"int8 auto probe: {int8_probe} -> selected={selected}")
+            logger.info(f"int8 auto selection: {decision} selected={selected}")
         else:
             selected = next(iter(int8_candidates.keys()))
             int8_path_selected = int8_candidates[selected]
             int8_mode = selected
+            int8_probe["selected_only"] = {
+                "name": selected,
+                "metrics": _score_int8_candidates(
+                    fp32_path=fp32_path,
+                    candidates={selected: int8_path_selected},
+                    probe_feature=probe_feat,
+                    fixed_frames=args.fixed_frames,
+                )[selected],
+            }
 
         if int8_path_selected != int8_path:
             shutil.copy2(int8_path_selected, int8_path)
         int8_probe["selected"] = {"mode": int8_mode}
+        if int8_errors:
+            int8_probe["errors"] = int8_errors
         logger.info(f"Exported LiteRT models to {tflite_dir} (int8_mode={int8_mode})")
 
     op_rows: dict[str, ArithmeticOpStats] = {}
@@ -914,7 +1246,11 @@ def main() -> None:
             "fp32": str(fp32_path),
             "fp16": str(fp16_path),
             "int8": str(int8_path),
+            "int8_mixed": str(int8_mixed_path),
             "int8_static": str(int8_static_path),
+            "int8_static_plus_postfc": str(int8_static_plus_postfc_path),
+            "int8_static_plus_pre": str(int8_static_plus_pre_path),
+            "int8_static_plus_pre_postfc": str(int8_static_plus_pre_postfc_path),
             "int8_static_full": str(int8_static_full_path),
             "int8_weight_only": str(int8_weight_only_path),
             "int8_mode": int8_mode,
@@ -944,12 +1280,18 @@ def main() -> None:
             sample_rate=args.sample_rate,
             start_frame=0,
         )
+        preds: dict[str, np.ndarray] = {}
         for variant, model_path in (("fp32", fp32_path), ("fp16", fp16_path), ("int8", int8_path)):
             pred = _run_tflite(model_path, feat).astype(np.float32)
             pred = pred[: args.fixed_frames * args.hop_length]
-            m = _metrics(pred, target)
             out_wav = val_out_dir / variant / f"{item.index:02d}_{item.wav_path.stem}_{variant}.wav"
             save_wav_16bit(out_wav, pred, sample_rate=args.sample_rate)
+            preds[variant] = pred
+            m = _metrics(pred, target)
+            if variant == "fp32":
+                m_vs_fp32 = {"mae": 0.0, "rmse": 0.0, "corr": 1.0}
+            else:
+                m_vs_fp32 = _metrics(pred, preds["fp32"])
             rows.append(
                 {
                     "variant": variant,
@@ -962,12 +1304,29 @@ def main() -> None:
                     "mae": float(m["mae"]),
                     "rmse": float(m["rmse"]),
                     "corr": float(m["corr"]),
+                    "mae_vs_fp32": float(m_vs_fp32["mae"]),
+                    "rmse_vs_fp32": float(m_vs_fp32["rmse"]),
+                    "corr_vs_fp32": float(m_vs_fp32["corr"]),
                 }
             )
         logger.info(f"Validated sample {item.index}/{len(val_items)}: {item.wav_path.name}")
 
     csv_path = val_out_dir / "metrics_per_sample.csv"
-    fields = ["variant", "index", "wav_path", "pair_path", "generated_wav", "samples", "seconds", "mae", "rmse", "corr"]
+    fields = [
+        "variant",
+        "index",
+        "wav_path",
+        "pair_path",
+        "generated_wav",
+        "samples",
+        "seconds",
+        "mae",
+        "rmse",
+        "corr",
+        "mae_vs_fp32",
+        "rmse_vs_fp32",
+        "corr_vs_fp32",
+    ]
     with csv_path.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
@@ -982,6 +1341,9 @@ def main() -> None:
             "mae_mean": float(np.mean([r["mae"] for r in subset])) if subset else math.nan,
             "rmse_mean": float(np.mean([r["rmse"] for r in subset])) if subset else math.nan,
             "corr_mean": float(np.mean([r["corr"] for r in subset])) if subset else math.nan,
+            "mae_vs_fp32_mean": float(np.mean([r["mae_vs_fp32"] for r in subset])) if subset else math.nan,
+            "rmse_vs_fp32_mean": float(np.mean([r["rmse_vs_fp32"] for r in subset])) if subset else math.nan,
+            "corr_vs_fp32_mean": float(np.mean([r["corr_vs_fp32"] for r in subset])) if subset else math.nan,
         }
     summary_json = {
         "num_samples": len(val_items),
@@ -990,6 +1352,33 @@ def main() -> None:
         "summary": summary,
     }
     (val_out_dir / "summary.json").write_text(json.dumps(summary_json, indent=2), encoding="utf-8")
+
+    if args.dump_intermediates and val_items:
+        probe_feat, _ = _load_fixed_feature_and_target_audio(
+            pair_path=val_items[0].pair_path,
+            wav_path=val_items[0].wav_path,
+            fixed_frames=args.fixed_frames,
+            hop_length=args.hop_length,
+            sample_rate=args.sample_rate,
+            start_frame=0,
+        )
+        fp32_map = _collect_tflite_intermediates(fp32_path, probe_feat, max_tensors=args.intermediate_max_tensors)
+        fp16_map = _collect_tflite_intermediates(fp16_path, probe_feat, max_tensors=args.intermediate_max_tensors)
+        int8_map = _collect_tflite_intermediates(int8_path, probe_feat, max_tensors=args.intermediate_max_tensors)
+        intermediate_report = {
+            "sample_index": int(val_items[0].index),
+            "sample_wav": str(val_items[0].wav_path),
+            "max_tensors": int(args.intermediate_max_tensors),
+            "fp32_tensor_count": int(len(fp32_map)),
+            "fp16_tensor_count": int(len(fp16_map)),
+            "int8_tensor_count": int(len(int8_map)),
+            "comparisons": {
+                "fp16_vs_fp32": _compare_tflite_intermediates(fp32_map, fp16_map, candidate_name="fp16"),
+                "int8_vs_fp32": _compare_tflite_intermediates(fp32_map, int8_map, candidate_name="int8"),
+            },
+        }
+        (val_out_dir / "intermediate_drift.json").write_text(json.dumps(intermediate_report, indent=2), encoding="utf-8")
+
     logger.info(f"Wrote validation outputs to {val_out_dir}")
 
 
