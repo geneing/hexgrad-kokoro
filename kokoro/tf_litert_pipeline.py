@@ -45,14 +45,25 @@ Examples:
      --int8-recipe weight_only \
      --output-dir output/tf_litert_weight_only
 
+6) Force static-core int8 export (NPU-friendly)
+   uv run python -m kokoro.tf_litert_pipeline \
+     --pytorch-checkpoint output/checkpoints/last.pt \
+     --data-root inputs \
+     --train-filelist inputs/filelists/vocos.train.txt \
+     --val-filelist inputs/filelists/vocos.val.txt \
+     --int8-recipe static \
+     --output-dir output/tf_litert_static
+
 Notes:
 - Fixed-frame export is enforced at 520 frames (input shape [1, 642, 520]).
 - Quantization split mirrors PyTorch flow:
   - Float pre blocks: conditioner + embed + input norm
   - Quantized core: ConvNeXt stack
   - Float post blocks: final layer norm + export-safe ISTFT head
-- int8 export mode is configurable: `auto`, `static`, or `weight_only`.
-- `auto` exports both and chooses the better-quality int8 candidate by fp32 probe match.
+- int8 export mode is configurable: `auto`, `static`, `static_full`, or `weight_only`.
+- `static` quantizes ConvNeXt core ops only (keeps sensitive blocks float).
+- `static_full` fully static-quantizes int8 activations (diagnostic mode).
+- `auto` exports candidates and chooses the better-quality int8 by fp32 probe match.
 """
 
 from __future__ import annotations
@@ -138,7 +149,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--int8-calib-samples", type=int, default=64)
     parser.add_argument("--num-val-samples", type=int, default=20)
-    parser.add_argument("--int8-recipe", choices=("auto", "static", "weight_only"), default="auto")
+    parser.add_argument("--int8-recipe", choices=("auto", "static", "static_full", "weight_only"), default="auto")
 
     parser.add_argument("--skip-qat", action="store_true")
     parser.add_argument("--skip-export", action="store_true")
@@ -427,7 +438,7 @@ def _export_fp16_tflite(model: tf.keras.Model, in_channels: int, fixed_frames: i
     return out_path
 
 
-def _export_int8_tflite(
+def _export_int8_static_full_tflite(
     model: tf.keras.Model,
     in_channels: int,
     fixed_frames: int,
@@ -454,7 +465,66 @@ def _export_int8_tflite(
     int8_model = converter.convert()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(int8_model)
-    return out_path, "tflite_representative_int8_hybrid_static"
+    return out_path, "tflite_representative_int8_hybrid_static_full"
+
+
+def _export_int8_static_core_from_fp32(
+    fp32_tflite_path: Path,
+    out_path: Path,
+    rep_feats: Sequence[np.ndarray],
+) -> tuple[Path, str]:
+    fp32_model = fp32_tflite_path.read_bytes()
+    qt = aeq_quantizer.Quantizer(fp32_model)
+
+    # Keep sensitive pre/post synthesis path in float; quantize core heavy ops for NPU.
+    core_regex = r".*quantizable_vocos_core_tf_1.*"
+    qt.add_static_config(core_regex, "DEPTHWISE_CONV_2D", 8, 8)
+    qt.add_static_config(core_regex, "FULLY_CONNECTED", 8, 8)
+
+    rep = list(rep_feats)
+    if not rep:
+        raise RuntimeError("Representative dataset is empty for static-core int8 export")
+
+    # AI Edge calibrator requires signatures; these exports currently have none.
+    # Patch the signature helpers to use subgraph-0 input/output for single-input models.
+    orig_get_sig = tfl_interpreter_utils.get_signature_main_subgraph_index
+    orig_invoke_sig = tfl_interpreter_utils.invoke_interpreter_signature
+
+    def _patched_get_signature_main_subgraph_index(interpreter, signature_key=None):
+        signatures = interpreter.get_signature_list()
+        if not signatures:
+            return 0
+        return orig_get_sig(interpreter, signature_key)
+
+    def _patched_invoke_interpreter_signature(interpreter, signature_input_data, signature_key=None, quantize_input=True):
+        signatures = interpreter.get_signature_list()
+        if signatures:
+            return orig_invoke_sig(interpreter, signature_input_data, signature_key, quantize_input)
+        in_meta = interpreter.get_input_details()[0]
+        key = next(iter(signature_input_data.keys()))
+        x = np.asarray(signature_input_data[key], dtype=np.float32)
+        if in_meta["dtype"] != np.float32:
+            x = x.astype(in_meta["dtype"], copy=False)
+        interpreter.set_tensor(in_meta["index"], x)
+        interpreter.invoke()
+        out_meta = interpreter.get_output_details()[0]
+        return {out_meta["name"]: interpreter.get_tensor(out_meta["index"])}
+
+    tfl_interpreter_utils.get_signature_main_subgraph_index = _patched_get_signature_main_subgraph_index
+    tfl_interpreter_utils.invoke_interpreter_signature = _patched_invoke_interpreter_signature
+    try:
+        calibration_rows = [{"features_bct": feat[None, ...].astype(np.float32)} for feat in rep]
+        calibration_result = qt.calibrate({"default": calibration_rows})
+        quant_result = qt.quantize(calibration_result)
+    finally:
+        tfl_interpreter_utils.get_signature_main_subgraph_index = orig_get_sig
+        tfl_interpreter_utils.invoke_interpreter_signature = orig_invoke_sig
+
+    if quant_result.quantized_model is None:
+        raise RuntimeError("AI Edge Quantizer did not produce static-core int8 model")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(bytes(quant_result.quantized_model))
+    return out_path, "ai_edge_static_core_wi8_ai8"
 
 
 def _export_int8_weight_only_from_fp32(fp32_tflite_path: Path, out_path: Path) -> tuple[Path, str]:
@@ -758,6 +828,7 @@ def main() -> None:
     fp16_path = tflite_dir / "vocos_fp16.tflite"
     int8_path = tflite_dir / "vocos_int8.tflite"
     int8_static_path = tflite_dir / "vocos_int8_static.tflite"
+    int8_static_full_path = tflite_dir / "vocos_int8_static_full.tflite"
     int8_weight_only_path = tflite_dir / "vocos_int8_weight_only.tflite"
     int8_mode = "none"
     int8_probe: dict[str, object] = {}
@@ -776,19 +847,29 @@ def main() -> None:
         )
 
         int8_candidates: dict[str, Path] = {}
-        if args.int8_recipe in {"auto", "static"}:
-            rep_feats: list[np.ndarray] = []
+        rep_feats: list[np.ndarray] = []
+        if args.int8_recipe in {"auto", "static", "static_full"}:
             for _ in range(max(1, args.int8_calib_samples)):
                 f, _ = train_loader.next_batch()
                 rep_feats.append(f[0])
-            _export_int8_tflite(
-                inference_model,
-                in_channels=cfg.in_channels,
-                fixed_frames=args.fixed_frames,
+
+        if args.int8_recipe in {"auto", "static"}:
+            _export_int8_static_core_from_fp32(
+                fp32_tflite_path=fp32_path,
                 out_path=int8_static_path,
                 rep_feats=rep_feats,
             )
             int8_candidates["static"] = int8_static_path
+
+        if args.int8_recipe in {"auto", "static_full"}:
+            _export_int8_static_full_tflite(
+                inference_model,
+                in_channels=cfg.in_channels,
+                fixed_frames=args.fixed_frames,
+                out_path=int8_static_full_path,
+                rep_feats=rep_feats,
+            )
+            int8_candidates["static_full"] = int8_static_full_path
 
         if args.int8_recipe in {"auto", "weight_only"}:
             _export_int8_weight_only_from_fp32(fp32_path, int8_weight_only_path)
@@ -834,6 +915,7 @@ def main() -> None:
             "fp16": str(fp16_path),
             "int8": str(int8_path),
             "int8_static": str(int8_static_path),
+            "int8_static_full": str(int8_static_full_path),
             "int8_weight_only": str(int8_weight_only_path),
             "int8_mode": int8_mode,
         },
