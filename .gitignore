@@ -172,3 +172,4 @@ cython_debug/
 runs/
 inputs/
 outputs/
+inputs

@@ -44,11 +44,11 @@ executorch-quant = [
 kokoro = "kokoro.__main__:main"
 kokoro-vocoder-data = "kokoro.vocoder_data:main"
 kokoro-vocos-train = "kokoro.train_vocos:main"
-kokoro-vocos-train-tf = "kokoro.train_vocos_tf:main"
-kokoro-vocos-convert-pt-to-tf = "kokoro.convert_vocos_checkpoint_tf:main"
-kokoro-vocos-test-pt-ckpt-tf = "kokoro.test_tf_vocos_from_pytorch_ckpt:main"
-kokoro-vocos-validate-tf-quant = "kokoro.validate_tf_quantizations:main"
-kokoro-vocos-litert-pipeline = "kokoro.tf_litert_pipeline:main"
+kokoro-vocos-train-tf = "kokoro.tf.training:main"
+kokoro-vocos-convert-pt-to-tf = "kokoro.tf.convert:main"
+kokoro-vocos-test-pt-ckpt-tf = "kokoro.tf.smoke_test_from_pt_ckpt:main"
+kokoro-vocos-validate-tf-quant = "kokoro.tf.validate_quant:main"
+kokoro-vocos-litert-pipeline = "kokoro.tf.export:main"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["kokoro"]
