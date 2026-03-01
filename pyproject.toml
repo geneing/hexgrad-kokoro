@@ -29,12 +29,12 @@ dependencies = [
     "misaki[en,ja,zh]>=0.9.4",
     "numpy",
     "pillow",
-    "pytorch-lightning",
     "tensorflow>=2.18.1",
     "torch",
     "torchcrepe>=0.0.24",
     "torchvision>=0.24.1",
     "transformers",
+    "utmosv2",
     "vocos",
 ]
 
@@ -60,6 +60,7 @@ only-packages = true
 
 [tool.uv.sources]
 vocos = { path = "third_party/vocos", editable = true }
+utmosv2 = { git = "https://github.com/sarulab-speech/UTMOSv2.git" }
 
 [project.urls]
 Homepage = "https://github.com/hexgrad/kokoro"

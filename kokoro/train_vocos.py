@@ -81,7 +81,7 @@ class NonFiniteLossError(RuntimeError):
 
 
 class UTMOSScorer:
-    """Lazy wrapper around third_party/vocos UTMOS implementation."""
+    """Lazy wrapper around UTMOSv2."""
 
     def __init__(self, device: torch.device, src_sample_rate: int, target_sample_rate: int = 16000):
         self.device = device
@@ -100,13 +100,14 @@ class UTMOSScorer:
         if self._failed_msg is not None:
             return False
         try:
-            from third_party.vocos.metrics.UTMOS import UTMOSScore  # pylint: disable=import-outside-toplevel
+            import utmosv2  # pylint: disable=import-outside-toplevel
 
-            self._impl = UTMOSScore(device=self.device)
+            # Keep model on selected device; UTMOSv2 handles feature extraction internally.
+            self._impl = utmosv2.create_model(pretrained=True, device=self.device)
             return True
         except Exception as exc:  # noqa: BLE001
             self._failed_msg = str(exc)
-            logger.warning(f"UTMOS disabled: failed to initialize ({exc})")
+            logger.warning(f"UTMOSv2 disabled: failed to initialize ({exc})")
             return False
 
     @torch.no_grad()
@@ -120,12 +121,25 @@ class UTMOSScorer:
             x = torchaudio.functional.resample(x, self.src_sample_rate, self.target_sample_rate)
         x = torch.clamp(x, -1.0, 1.0).to(self.device, non_blocking=True)
         try:
-            scores = self._impl.score(x)
-            return float(scores.mean().item())
+            # UTMOSv2 returns float / ndarray / tensor depending on batch size.
+            scores = self._impl.predict(
+                data=x,
+                sr=self.target_sample_rate,
+                device=self.device,
+                verbose=False,
+            )
+            if torch.is_tensor(scores):
+                return float(scores.float().mean().item())
+            if isinstance(scores, np.ndarray):
+                return float(np.asarray(scores, dtype=np.float32).mean())
+            if isinstance(scores, (list, tuple)):
+                arr = np.asarray(scores, dtype=np.float32)
+                return float(arr.mean()) if arr.size > 0 else None
+            return float(scores)
         except Exception as exc:  # noqa: BLE001
             if self._failed_msg is None:
                 self._failed_msg = str(exc)
-                logger.warning(f"UTMOS disabled after runtime failure: {exc}")
+                logger.warning(f"UTMOSv2 disabled after runtime failure: {exc}")
             return None
 
 
@@ -1236,7 +1250,9 @@ def run_validation(
         )
         writer.add_scalar("val/l1_wave_loss", sum(l1_values) / len(l1_values), step)
     if utmos_values:
-        writer.add_scalar("val/utmos_mean", sum(utmos_values) / len(utmos_values), step)
+        utmos_mean = sum(utmos_values) / len(utmos_values)
+        writer.add_scalar("val/utmosv2_mean", utmos_mean, step)
+
 
     generator.train()
 
