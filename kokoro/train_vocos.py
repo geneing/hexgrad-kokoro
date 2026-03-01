@@ -1,15 +1,31 @@
+"""Train Kokoro paired vocoder distillation with Streaming Vocos by default.
+
+This script trains a waveform generator from saved Kokoro vocoder-conditioning
+pairs (`asr`, `f0`, `noise`, `style`) and target waveforms.
+
+Default decoder backend:
+- `--vocos-impl streaming` (from `warisqr007/vocos`)
+
+Example (streaming training):
+`uv run python -m kokoro.train_vocos --data-root /export/eingerman/audio/vocoder --vocos-impl streaming --streaming-vocos-repo third_party/vocos_streaming`
+"""
+
 from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib
+import importlib.util
 import json
 import math
 import random
+import sys
 import time
+import types
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Type
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -22,13 +38,13 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.tensorboard import SummaryWriter
 
 from vocos.discriminators import MultiPeriodDiscriminator, MultiResolutionDiscriminator
-from vocos.heads import ISTFTHead
+from vocos.heads import ISTFTHead as LegacyISTFTHead
 from vocos.loss import (
     DiscriminatorLoss as VocosDiscriminatorLoss,
     FeatureMatchingLoss,
     GeneratorLoss as VocosGeneratorLoss,
 )
-from vocos.models import VocosBackbone
+from vocos.models import VocosBackbone as LegacyVocosBackbone
 
 from .styletts2_losses import StyleTTS2MultiResolutionGroupDelayLoss, StyleTTS2MultiResolutionSTFTLoss
 
@@ -62,6 +78,194 @@ class AdaptiveBatchState:
 
 class NonFiniteLossError(RuntimeError):
     pass
+
+
+class UTMOSScorer:
+    """Lazy wrapper around third_party/vocos UTMOS implementation."""
+
+    def __init__(self, device: torch.device, src_sample_rate: int, target_sample_rate: int = 16000):
+        self.device = device
+        self.src_sample_rate = int(src_sample_rate)
+        self.target_sample_rate = int(target_sample_rate)
+        self._impl = None
+        self._failed_msg: Optional[str] = None
+
+    @property
+    def available(self) -> bool:
+        return self._failed_msg is None
+
+    def _ensure_impl(self) -> bool:
+        if self._impl is not None:
+            return True
+        if self._failed_msg is not None:
+            return False
+        try:
+            from third_party.vocos.metrics.UTMOS import UTMOSScore  # pylint: disable=import-outside-toplevel
+
+            self._impl = UTMOSScore(device=self.device)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self._failed_msg = str(exc)
+            logger.warning(f"UTMOS disabled: failed to initialize ({exc})")
+            return False
+
+    @torch.no_grad()
+    def score_mean(self, wavs: torch.Tensor) -> Optional[float]:
+        if wavs.ndim != 2 or wavs.numel() == 0:
+            return None
+        if not self._ensure_impl():
+            return None
+        x = wavs.detach().float()
+        if self.src_sample_rate != self.target_sample_rate:
+            x = torchaudio.functional.resample(x, self.src_sample_rate, self.target_sample_rate)
+        x = torch.clamp(x, -1.0, 1.0).to(self.device, non_blocking=True)
+        try:
+            scores = self._impl.score(x)
+            return float(scores.mean().item())
+        except Exception as exc:  # noqa: BLE001
+            if self._failed_msg is None:
+                self._failed_msg = str(exc)
+                logger.warning(f"UTMOS disabled after runtime failure: {exc}")
+            return None
+
+
+class StreamingPeriodicityScorer:
+    """Lazy wrapper for third_party/vocos_streaming periodicity metrics."""
+
+    def __init__(self, src_sample_rate: int, metrics_path: Path):
+        self.src_sample_rate = int(src_sample_rate)
+        self.metrics_path = Path(metrics_path)
+        self._mod = None
+        self._failed_msg: Optional[str] = None
+
+    @property
+    def available(self) -> bool:
+        return self._failed_msg is None
+
+    def _ensure_mod(self) -> bool:
+        if self._mod is not None:
+            return True
+        if self._failed_msg is not None:
+            return False
+        try:
+            if not self.metrics_path.exists():
+                raise FileNotFoundError(f"metrics module not found: {self.metrics_path}")
+            mod_name = "streaming_vocos_periodicity_metric"
+            mod = sys.modules.get(mod_name)
+            if mod is None:
+                spec = importlib.util.spec_from_file_location(mod_name, self.metrics_path)
+                if spec is None or spec.loader is None:
+                    raise RuntimeError(f"could not load spec from {self.metrics_path}")
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules[mod_name] = mod
+                spec.loader.exec_module(mod)
+            self._mod = mod
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self._failed_msg = str(exc)
+            logger.warning(f"Streaming periodicity metric disabled: {exc}")
+            return False
+
+    @torch.no_grad()
+    def score(self, y: torch.Tensor, y_hat: torch.Tensor) -> Optional[Dict[str, float]]:
+        if y.ndim != 2 or y_hat.ndim != 2 or y.numel() == 0 or y_hat.numel() == 0:
+            return None
+        if not self._ensure_mod():
+            return None
+        mod = self._mod
+        target_sr = int(mod.torchcrepe.SAMPLE_RATE)
+        y_in = y.detach().float()
+        y_hat_in = y_hat.detach().float()
+        if self.src_sample_rate != target_sr:
+            y_in = torchaudio.functional.resample(y_in, self.src_sample_rate, target_sr)
+            y_hat_in = torchaudio.functional.resample(y_hat_in, self.src_sample_rate, target_sr)
+        try:
+            p_loss, pitch_loss, f1 = mod.calculate_periodicity_metrics(y_in, y_hat_in)
+            return {
+                "periodicity_loss": float(p_loss),
+                "periodicity_pitch_loss": float(pitch_loss),
+                "periodicity_f1": float(f1),
+            }
+        except Exception as exc:  # noqa: BLE001
+            if self._failed_msg is None:
+                self._failed_msg = str(exc)
+                logger.warning(f"Streaming periodicity metric disabled after runtime failure: {exc}")
+            return None
+
+
+_STREAMING_VOCOS_CLASSES: Optional[tuple[Type[nn.Module], Type[nn.Module]]] = None
+
+
+def resolve_streaming_vocos_classes(repo_root: Optional[Path]) -> tuple[Type[nn.Module], Type[nn.Module]]:
+    """Resolve Streaming Vocos backbone/head classes from warisqr007/vocos layout."""
+    global _STREAMING_VOCOS_CLASSES
+    if _STREAMING_VOCOS_CLASSES is not None:
+        return _STREAMING_VOCOS_CLASSES
+
+    tried: List[str] = []
+    try:
+        mod = importlib.import_module("src.components")
+        _STREAMING_VOCOS_CLASSES = (mod.VocosBackbone, mod.ISTFTHead)
+        return _STREAMING_VOCOS_CLASSES
+    except Exception as exc:  # noqa: BLE001
+        tried.append(f"import src.components failed: {exc}")
+
+    if repo_root is not None:
+        repo_root = repo_root.resolve()
+        src_root = repo_root / "src"
+        if src_root.exists():
+            package_name = "streaming_vocos_src"
+            try:
+                pkg = sys.modules.get(package_name)
+                if pkg is None:
+                    spec = importlib.util.spec_from_file_location(
+                        package_name,
+                        src_root / "__init__.py",
+                        submodule_search_locations=[str(src_root)],
+                    )
+                    if spec is None or spec.loader is None:
+                        raise RuntimeError(f"Could not build module spec for {src_root}")
+                    pkg = importlib.util.module_from_spec(spec)
+                    sys.modules[package_name] = pkg
+                    spec.loader.exec_module(pkg)
+                # The upstream repository uses absolute imports like `from src.utils ...`.
+                sys.modules["src"] = pkg
+                utils_root = src_root / "utils"
+                if utils_root.exists():
+                    # Bypass src/utils/__init__.py (which pulls Lightning) and expose only compile.py.
+                    for pkg_name in (f"{package_name}.utils", "src.utils"):
+                        if pkg_name not in sys.modules:
+                            m = types.ModuleType(pkg_name)
+                            m.__path__ = [str(utils_root)]  # type: ignore[attr-defined]
+                            sys.modules[pkg_name] = m
+                    for mod_name in (f"{package_name}.utils.compile", "src.utils.compile"):
+                        if mod_name not in sys.modules:
+                            c_spec = importlib.util.spec_from_file_location(mod_name, utils_root / "compile.py")
+                            if c_spec is None or c_spec.loader is None:
+                                raise RuntimeError(f"Could not load {utils_root / 'compile.py'}")
+                            c_mod = importlib.util.module_from_spec(c_spec)
+                            sys.modules[mod_name] = c_mod
+                            c_spec.loader.exec_module(c_mod)
+                mod = importlib.import_module(f"{package_name}.components")
+                _STREAMING_VOCOS_CLASSES = (mod.VocosBackbone, mod.ISTFTHead)
+                return _STREAMING_VOCOS_CLASSES
+            except Exception as exc:  # noqa: BLE001
+                tried.append(f"import via package loader repo_root={repo_root} failed: {exc}")
+            repo_path = str(repo_root)
+            if repo_path not in sys.path:
+                sys.path.insert(0, repo_path)
+            try:
+                mod = importlib.import_module("src.components")
+                _STREAMING_VOCOS_CLASSES = (mod.VocosBackbone, mod.ISTFTHead)
+                return _STREAMING_VOCOS_CLASSES
+            except Exception as exc:  # noqa: BLE001
+                tried.append(f"import via repo_root={repo_root} failed: {exc}")
+
+    raise RuntimeError(
+        "Could not import streaming Vocos classes from warisqr007/vocos. "
+        "Set --streaming-vocos-repo to a local clone path containing src/components "
+        f"(attempts: {' | '.join(tried)})"
+    )
 
 
 class PairedVocoderDataset(Dataset):
@@ -310,6 +514,11 @@ class PairedVocosGenerator(nn.Module):
         n_fft: int,
         hop_length: int,
         padding: str = "same",
+        vocos_impl: str = "streaming",
+        streaming_vocos_repo: Optional[Path] = None,
+        backbone_causal: bool = True,
+        backbone_pad_mode: str = "constant",
+        backbone_norm: str = "weight_norm",
     ):
         super().__init__()
         self.conditioner = nn.Sequential(
@@ -319,18 +528,42 @@ class PairedVocosGenerator(nn.Module):
             nn.GELU(),
             nn.Conv1d(model_input_channels, model_input_channels, kernel_size=1),
         )
-        self.backbone = VocosBackbone(
-            input_channels=model_input_channels,
-            dim=backbone_dim,
-            intermediate_dim=backbone_intermediate_dim,
-            num_layers=backbone_layers,
-        )
-        self.head = ISTFTHead(dim=backbone_dim, n_fft=n_fft, hop_length=hop_length, padding=padding)
+        impl = str(vocos_impl).lower()
+        self._head_has_channel_axis = False
+        if impl == "streaming":
+            streaming_backbone_cls, streaming_head_cls = resolve_streaming_vocos_classes(streaming_vocos_repo)
+            inferred_mlp_ratio = float(backbone_intermediate_dim) / float(max(1, backbone_dim))
+            self.backbone = streaming_backbone_cls(
+                input_channels=model_input_channels,
+                dim=backbone_dim,
+                mlp_ratio=inferred_mlp_ratio,
+                kernel_size=7,
+                dilation=1,
+                norm=backbone_norm,
+                causal=bool(backbone_causal),
+                pad_mode=backbone_pad_mode,
+                num_layers=backbone_layers,
+            )
+            self.head = streaming_head_cls(dim=backbone_dim, n_fft=n_fft, hop_length=hop_length)
+            self._head_has_channel_axis = True
+        elif impl == "legacy":
+            self.backbone = LegacyVocosBackbone(
+                input_channels=model_input_channels,
+                dim=backbone_dim,
+                intermediate_dim=backbone_intermediate_dim,
+                num_layers=backbone_layers,
+            )
+            self.head = LegacyISTFTHead(dim=backbone_dim, n_fft=n_fft, hop_length=hop_length, padding=padding)
+        else:
+            raise ValueError(f"Unsupported --vocos-impl={vocos_impl}. Expected one of: streaming, legacy")
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         x = self.conditioner(features)
         x = self.backbone(x)
-        return self.head(x)
+        y = self.head(x)
+        if self._head_has_channel_axis and y.ndim == 3 and y.shape[1] == 1:
+            return y[:, 0, :]
+        return y
 
 
 class ComplexSTFTDiscriminator(nn.Module):
@@ -426,6 +659,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone-dim", type=int, default=384)
     parser.add_argument("--backbone-intermediate-dim", type=int, default=1152)
     parser.add_argument("--backbone-layers", type=int, default=8)
+    parser.add_argument("--vocos-impl", type=str, default="streaming", choices=["streaming", "legacy"])
+    parser.add_argument(
+        "--streaming-vocos-repo",
+        type=Path,
+        default=Path("third_party/vocos_streaming"),
+        help="Path to a local clone of https://github.com/warisqr007/vocos",
+    )
+    parser.add_argument("--backbone-causal", dest="backbone_causal", action="store_true")
+    parser.add_argument("--no-backbone-causal", dest="backbone_causal", action="store_false")
+    parser.set_defaults(backbone_causal=True)
+    parser.add_argument("--backbone-pad-mode", type=str, default="constant")
+    parser.add_argument("--backbone-norm", type=str, default="weight_norm")
 
     parser.add_argument("--max-steps", type=int, default=200000)
     parser.add_argument("--val-every", type=int, default=500)
@@ -474,6 +719,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-compile-complex-paths", dest="compile_complex_paths", action="store_false")
     parser.set_defaults(compile_complex_paths=False)
     parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--periodicity-enable", dest="periodicity_enable", action="store_true")
+    parser.add_argument("--no-periodicity-enable", dest="periodicity_enable", action="store_false")
+    parser.set_defaults(periodicity_enable=True)
+    parser.add_argument("--periodicity-metric-every", type=int, default=100)
+    parser.add_argument("--periodicity-metric-max-samples", type=int, default=2)
+    parser.add_argument(
+        "--periodicity-metrics-path",
+        type=Path,
+        default=Path("third_party/vocos_streaming/src/metrics/periodicity.py"),
+    )
     parser.add_argument("--train-frame-policy", type=str, default="max", choices=["max", "random"])
     parser.add_argument("--train-frame-min-ratio", type=float, default=0.6)
     parser.add_argument("--fixed-shapes", dest="fixed_shapes", action="store_true")
@@ -483,6 +738,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-voices", type=str, default="af_bella,af_nicole,af_heart")
     parser.add_argument("--sample-count", type=int, default=5)
     parser.add_argument("--sample-max-frames", type=int, default=480)
+    parser.add_argument("--utmos-enable", dest="utmos_enable", action="store_true")
+    parser.add_argument("--no-utmos-enable", dest="utmos_enable", action="store_false")
+    parser.set_defaults(utmos_enable=True)
+    parser.add_argument("--utmos-max-samples", type=int, default=4)
     parser.add_argument("--output-dir", type=Path, default=Path("runs/vocos_kokoro_paired"))
     parser.add_argument("--resume", type=Path, default=None)
     return parser.parse_args()
@@ -913,12 +1172,15 @@ def run_validation(
     sample_rate: int,
     loss_weights: Dict[str, float],
     amp_dtype: torch.dtype | None,
+    utmos_scorer: Optional[UTMOSScorer] = None,
+    utmos_max_samples: int = 4,
 ) -> None:
     generator.eval()
     mrstft_values: List[float] = []
     gd_values: List[float] = []
     l1_values: List[float] = []
     total_values: List[float] = []
+    utmos_values: List[float] = []
 
     with torch.inference_mode():
         for i, batch in enumerate(val_loader):
@@ -952,6 +1214,11 @@ def run_validation(
                         waveform_to_image(real[0], pred[0]),
                         step,
                     )
+            if utmos_scorer is not None and utmos_scorer.available:
+                n = max(1, min(int(utmos_max_samples), pred.shape[0]))
+                score = utmos_scorer.score_mean(pred[:n])
+                if score is not None and math.isfinite(score):
+                    utmos_values.append(float(score))
 
     if mrstft_values:
         writer.add_scalar("val/generator_total_estimate", sum(total_values) / len(total_values), step)
@@ -968,6 +1235,8 @@ def run_validation(
             step,
         )
         writer.add_scalar("val/l1_wave_loss", sum(l1_values) / len(l1_values), step)
+    if utmos_values:
+        writer.add_scalar("val/utmos_mean", sum(utmos_values) / len(utmos_values), step)
 
     generator.train()
 
@@ -1104,6 +1373,11 @@ def main() -> None:
         n_fft=args.n_fft,
         hop_length=args.hop_length,
         padding="same",
+        vocos_impl=args.vocos_impl,
+        streaming_vocos_repo=args.streaming_vocos_repo.resolve(),
+        backbone_causal=args.backbone_causal,
+        backbone_pad_mode=args.backbone_pad_mode,
+        backbone_norm=args.backbone_norm,
     ).to(device)
 
     mpd = MultiPeriodDiscriminator().to(device)
@@ -1163,30 +1437,52 @@ def main() -> None:
     except ImportError:
         log_waveform_images = False
         logger.warning("Pillow is not installed; waveform image logging is disabled. Install `pillow` to enable it.")
+    utmos_scorer: Optional[UTMOSScorer] = None
+    if args.utmos_enable:
+        utmos_scorer = UTMOSScorer(device=device, src_sample_rate=args.sample_rate)
+    periodicity_scorer: Optional[StreamingPeriodicityScorer] = None
+    if args.periodicity_enable:
+        periodicity_scorer = StreamingPeriodicityScorer(
+            src_sample_rate=args.sample_rate,
+            metrics_path=args.periodicity_metrics_path,
+        )
 
     resume_path = args.resume
+    auto_resume = False
     if resume_path is None:
         resume_path = discover_resume_checkpoint(ckpt_dir)
         if resume_path is not None:
+            auto_resume = True
             logger.info(f"Auto-detected checkpoint in output dir: {resume_path}")
 
     if resume_path:
-        ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
-        generator.load_state_dict(ckpt["generator"])
-        mpd.load_state_dict(ckpt["mpd"])
-        mrd.load_state_dict(ckpt["mrd"])
-        if "cstft_disc" in ckpt:
-            cstft_disc.load_state_dict(ckpt["cstft_disc"])
-        else:
-            logger.warning("Checkpoint missing cstft_disc state; starting complex-STFT discriminator from init.")
-        gen_opt.load_state_dict(ckpt["gen_opt"])
-        disc_opt.load_state_dict(ckpt["disc_opt"])
-        gen_sched.load_state_dict(ckpt["gen_sched"])
-        disc_sched.load_state_dict(ckpt["disc_sched"])
-        step = int(ckpt.get("step", 0))
-        epoch = int(ckpt.get("epoch", 0))
-        state.frame_cap = int(ckpt.get("frame_cap", state.frame_cap))
-        logger.info(f"Resumed from {resume_path} at step={step}, epoch={epoch}, frame_cap={state.frame_cap}")
+        try:
+            ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
+            generator.load_state_dict(ckpt["generator"])
+            mpd.load_state_dict(ckpt["mpd"])
+            mrd.load_state_dict(ckpt["mrd"])
+            if "cstft_disc" in ckpt:
+                cstft_disc.load_state_dict(ckpt["cstft_disc"])
+            else:
+                logger.warning("Checkpoint missing cstft_disc state; starting complex-STFT discriminator from init.")
+            gen_opt.load_state_dict(ckpt["gen_opt"])
+            disc_opt.load_state_dict(ckpt["disc_opt"])
+            gen_sched.load_state_dict(ckpt["gen_sched"])
+            disc_sched.load_state_dict(ckpt["disc_sched"])
+            step = int(ckpt.get("step", 0))
+            epoch = int(ckpt.get("epoch", 0))
+            state.frame_cap = int(ckpt.get("frame_cap", state.frame_cap))
+            logger.info(f"Resumed from {resume_path} at step={step}, epoch={epoch}, frame_cap={state.frame_cap}")
+        except Exception as exc:  # noqa: BLE001
+            if auto_resume:
+                logger.warning(
+                    "Auto-resume checkpoint is incompatible with current model/training settings; "
+                    f"starting fresh. checkpoint={resume_path} error={exc}"
+                )
+                step = 0
+                epoch = 0
+            else:
+                raise
 
     logger.info(
         f"Training on device={device} | precision={args.precision} resolved_amp={amp_dtype} "
@@ -1403,6 +1699,18 @@ def main() -> None:
                     running["lr_disc"] = float(disc_opt.param_groups[0]["lr"])
                     running.update(timing)
                     running["time_step_total_ms"] = (time.perf_counter() - iter_start) * 1000.0
+                    if (
+                        periodicity_scorer is not None
+                        and periodicity_scorer.available
+                        and step % max(1, int(args.periodicity_metric_every)) == 0
+                    ):
+                        n = max(1, min(int(args.periodicity_metric_max_samples), fake.shape[0]))
+                        with torch.inference_mode():
+                            p_scores = periodicity_scorer.score(real[:n], fake[:n])
+                        if p_scores is not None:
+                            running["periodicity_loss"] = p_scores["periodicity_loss"]
+                            running["periodicity_pitch_loss"] = p_scores["periodicity_pitch_loss"]
+                            running["periodicity_f1"] = p_scores["periodicity_f1"]
 
                     if step % max(1, args.log_every) == 0:
                         now = time.time()
@@ -1463,6 +1771,8 @@ def main() -> None:
                             sample_rate=args.sample_rate,
                             loss_weights=loss_weights,
                             amp_dtype=amp_dtype,
+                            utmos_scorer=utmos_scorer,
+                            utmos_max_samples=args.utmos_max_samples,
                         )
 
                     if step % args.save_every == 0:

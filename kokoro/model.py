@@ -24,13 +24,29 @@ Config examples:
      "decoder_type": "istft"
    }
 
+4) PT Vocos streaming decoder:
+   {
+     "decoder_type": "pt_vocos",
+     "vocos": {
+       "checkpoint_path": "/path/to/vocos_last.pt",
+       "streaming": true,
+       "chunk_size_ms": 300,
+       "padding_ms": 40
+     }
+   }
+
 Quick smoke test:
 `uv run python -c "from kokoro import KModel; m=KModel(config='/path/config.json', model='/path/kokoro.pth'); print(type(m.decoder).__name__)"`
 """
 
 from .istftnet import Decoder
 from .modules import CustomAlbert, ProsodyPredictor, TextEncoder
-from .vocos_decoder import PTVocosDecoder, TFVocosDecoder
+from .vocos_decoder import (
+    PTVocosDecoder,
+    StreamingPTVocosDecoder,
+    StreamingTFVocosDecoder,
+    TFVocosDecoder,
+)
 from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
 from loguru import logger
@@ -99,7 +115,9 @@ class KModel(torch.nn.Module):
                 dim_out=config['n_mels'], disable_complex=disable_complex, **config['istftnet']
             )
         elif self.decoder_type == 'pt_vocos':
-            self.decoder = PTVocosDecoder(
+            use_streaming = bool(vocos_cfg.get('streaming', False))
+            decoder_cls = StreamingPTVocosDecoder if use_streaming else PTVocosDecoder
+            decoder_kwargs = dict(
                 dim_in=config['hidden_dim'],
                 style_dim=config['style_dim'],
                 model_input_channels=int(vocos_cfg.get('model_input_channels', 192)),
@@ -111,8 +129,17 @@ class KModel(torch.nn.Module):
                 padding=str(vocos_cfg.get('padding', 'same')),
                 checkpoint_path=vocos_cfg.get('checkpoint_path'),
             )
+            if use_streaming:
+                decoder_kwargs.update(
+                    sample_rate=int(vocos_cfg.get('sample_rate', 24000)),
+                    chunk_size_ms=int(vocos_cfg.get('chunk_size_ms', 300)),
+                    padding_ms=int(vocos_cfg.get('padding_ms', 40)),
+                )
+            self.decoder = decoder_cls(**decoder_kwargs)
         elif self.decoder_type == 'tf_vocos':
-            self.decoder = TFVocosDecoder(
+            use_streaming = bool(vocos_cfg.get('streaming', False))
+            decoder_cls = StreamingTFVocosDecoder if use_streaming else TFVocosDecoder
+            decoder_kwargs = dict(
                 dim_in=config['hidden_dim'],
                 style_dim=config['style_dim'],
                 model_input_channels=int(vocos_cfg.get('model_input_channels', 192)),
@@ -124,6 +151,13 @@ class KModel(torch.nn.Module):
                 padding=str(vocos_cfg.get('padding', 'same')),
                 checkpoint_path=vocos_cfg.get('checkpoint_path'),
             )
+            if use_streaming:
+                decoder_kwargs.update(
+                    sample_rate=int(vocos_cfg.get('sample_rate', 24000)),
+                    chunk_size_ms=int(vocos_cfg.get('chunk_size_ms', 300)),
+                    padding_ms=int(vocos_cfg.get('padding_ms', 40)),
+                )
+            self.decoder = decoder_cls(**decoder_kwargs)
         else:
             raise ValueError(f"Unknown decoder_type='{self.decoder_type}'. Supported: istft, pt_vocos, tf_vocos.")
         if not model:
@@ -276,6 +310,29 @@ class KModel(torch.nn.Module):
         if return_vocoder_io:
             return audio, vocoder_io
         return audio
+
+    @torch.no_grad()
+    def stream_decode_vocoder_io(
+        self,
+        asr: torch.Tensor,
+        f0: torch.Tensor,
+        noise: torch.Tensor,
+        style: torch.Tensor,
+        is_last: bool = False,
+    ):
+        """Stream waveform chunks from vocoder inputs when decoder supports it."""
+        if not hasattr(self.decoder, "streaming_decode"):
+            raise RuntimeError("Configured decoder does not support streaming_decode")
+        asr = asr.to(self.device)
+        f0 = f0.to(self.device)
+        noise = noise.to(self.device)
+        style = style.to(self.device)
+        yield from self.decoder.streaming_decode(asr, f0, noise, style, is_last=is_last)
+
+    @torch.no_grad()
+    def reset_decoder_stream(self) -> None:
+        if hasattr(self.decoder, "reset"):
+            self.decoder.reset()
 
 class KModelForONNX(torch.nn.Module):
     def __init__(self, kmodel: KModel):
