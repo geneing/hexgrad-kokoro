@@ -1,5 +1,36 @@
+"""Core Kokoro model with configurable decoder backends.
+
+This module defines `KModel`, which performs text/phoneme conditioning and
+dispatches vocoder synthesis to one of:
+- `decoder_type="pt_vocos"` (default)
+- `decoder_type="tf_vocos"`
+- `decoder_type="istft"`
+
+Config examples:
+1) Default PT Vocos:
+   {
+     "decoder_type": "pt_vocos",
+     "vocos": {"checkpoint_path": "/path/to/vocos_last.pt"}
+   }
+
+2) TensorFlow Vocos:
+   {
+     "decoder_type": "tf_vocos",
+     "vocos": {"checkpoint_path": "/path/to/vocos_last.pt"}
+   }
+
+3) Legacy iSTFT:
+   {
+     "decoder_type": "istft"
+   }
+
+Quick smoke test:
+`uv run python -c "from kokoro import KModel; m=KModel(config='/path/config.json', model='/path/kokoro.pth'); print(type(m.decoder).__name__)"`
+"""
+
 from .istftnet import Decoder
 from .modules import CustomAlbert, ProsodyPredictor, TextEncoder
+from .vocos_decoder import PTVocosDecoder, TFVocosDecoder
 from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
 from loguru import logger
@@ -60,20 +91,48 @@ class KModel(torch.nn.Module):
             channels=config['hidden_dim'], kernel_size=config['text_encoder_kernel_size'],
             depth=config['n_layer'], n_symbols=config['n_token']
         )
-        self.decoder = Decoder(
-            dim_in=config['hidden_dim'], style_dim=config['style_dim'],
-            dim_out=config['n_mels'], disable_complex=disable_complex, **config['istftnet']
-        )
+        self.decoder_type = str(config.get('decoder_type', config.get('decoder', 'pt_vocos'))).lower()
+        vocos_cfg = config.get('vocos', config.get('vocos_decoder', {}))
+        if self.decoder_type == 'istft':
+            self.decoder = Decoder(
+                dim_in=config['hidden_dim'], style_dim=config['style_dim'],
+                dim_out=config['n_mels'], disable_complex=disable_complex, **config['istftnet']
+            )
+        elif self.decoder_type == 'pt_vocos':
+            self.decoder = PTVocosDecoder(
+                dim_in=config['hidden_dim'],
+                style_dim=config['style_dim'],
+                model_input_channels=int(vocos_cfg.get('model_input_channels', 192)),
+                backbone_dim=int(vocos_cfg.get('backbone_dim', 384)),
+                backbone_intermediate_dim=int(vocos_cfg.get('backbone_intermediate_dim', 1152)),
+                backbone_layers=int(vocos_cfg.get('backbone_layers', 8)),
+                n_fft=int(vocos_cfg.get('n_fft', 1200)),
+                hop_length=int(vocos_cfg.get('hop_length', 300)),
+                padding=str(vocos_cfg.get('padding', 'same')),
+                checkpoint_path=vocos_cfg.get('checkpoint_path'),
+            )
+        elif self.decoder_type == 'tf_vocos':
+            self.decoder = TFVocosDecoder(
+                dim_in=config['hidden_dim'],
+                style_dim=config['style_dim'],
+                model_input_channels=int(vocos_cfg.get('model_input_channels', 192)),
+                backbone_dim=int(vocos_cfg.get('backbone_dim', 384)),
+                backbone_intermediate_dim=int(vocos_cfg.get('backbone_intermediate_dim', 1152)),
+                backbone_layers=int(vocos_cfg.get('backbone_layers', 8)),
+                n_fft=int(vocos_cfg.get('n_fft', 1200)),
+                hop_length=int(vocos_cfg.get('hop_length', 300)),
+                padding=str(vocos_cfg.get('padding', 'same')),
+                checkpoint_path=vocos_cfg.get('checkpoint_path'),
+            )
+        else:
+            raise ValueError(f"Unknown decoder_type='{self.decoder_type}'. Supported: istft, pt_vocos, tf_vocos.")
         if not model:
             model = hf_hub_download(repo_id=repo_id, filename=KModel.MODEL_NAMES[repo_id])
         for key, state_dict in torch.load(model, map_location='cpu', weights_only=True).items():
-            assert hasattr(self, key), key
-            try:
-                getattr(self, key).load_state_dict(state_dict)
-            except:
-                logger.debug(f"Did not load {key} from state_dict")
-                state_dict = {k[7:]: v for k, v in state_dict.items()}
-                getattr(self, key).load_state_dict(state_dict, strict=False)
+            if not hasattr(self, key):
+                logger.debug(f"Skipping unknown checkpoint key: {key}")
+                continue
+            self._load_module_state_dict(getattr(self, key), state_dict, module_name=key)
 
     @property
     def device(self):
@@ -87,11 +146,52 @@ class KModel(torch.nn.Module):
 
     @dataclass
     class VocoderIO:
-        # Input tensors used by the iSTFTNet decoder path.
+        # Input tensors consumed by all decoder variants.
         asr: torch.FloatTensor
         f0: torch.FloatTensor
         noise: torch.FloatTensor
         style: torch.FloatTensor
+
+    @staticmethod
+    def _strip_parallel_prefixes(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        fixed: Dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            new_key = key
+            changed = True
+            while changed:
+                changed = False
+                for prefix in ("module.", "_orig_mod."):
+                    if new_key.startswith(prefix):
+                        new_key = new_key[len(prefix):]
+                        changed = True
+            fixed[new_key] = value
+        return fixed
+
+    def _load_module_state_dict(self, module: torch.nn.Module, state_dict: Dict[str, torch.Tensor], module_name: str) -> None:
+        state_dict = self._strip_parallel_prefixes(state_dict)
+        try:
+            module.load_state_dict(state_dict, strict=True)
+            return
+        except RuntimeError:
+            pass
+
+        module_state = module.state_dict()
+        filtered: Dict[str, torch.Tensor] = {}
+        skipped: list[str] = []
+        for key, value in state_dict.items():
+            expected = module_state.get(key)
+            if expected is not None and tuple(expected.shape) == tuple(value.shape):
+                filtered[key] = value
+            else:
+                skipped.append(key)
+
+        result = module.load_state_dict(filtered, strict=False)
+        skipped_count = len(skipped)
+        if skipped_count > 0 or result.missing_keys or result.unexpected_keys:
+            logger.debug(
+                f"Partial load for {module_name}: loaded={len(filtered)} "
+                f"missing={len(result.missing_keys)} unexpected={len(result.unexpected_keys)} skipped={skipped_count}"
+            )
 
     @torch.no_grad()
     def forward_with_tokens(

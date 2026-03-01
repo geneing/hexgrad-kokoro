@@ -49,6 +49,7 @@ kokoro-vocos-convert-pt-to-tf = "kokoro.tf.convert:main"
 kokoro-vocos-test-pt-ckpt-tf = "kokoro.tf.smoke_test_from_pt_ckpt:main"
 kokoro-vocos-validate-tf-quant = "kokoro.tf.validate_quant:main"
 kokoro-vocos-litert-pipeline = "kokoro.tf.export:main"
+kokoro-test-kmodel-decoders = "kokoro.test_kmodel_decoder_compare:main"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["kokoro"]
