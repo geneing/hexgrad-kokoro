@@ -5,14 +5,14 @@ data:
   class_path: vocos.dataset.VocosDataModule
   init_args:
     train_params:
-      filelist_path: /export/eingerman/audio/vocoder/filelists/vocos.train.txt
+      filelist_path: inputs//filelists/vocos.train.txt
       sampling_rate: 24000
       num_samples: 19200
       batch_size: 8
       num_workers: 8
 
     val_params:
-      filelist_path: /export/eingerman/audio/vocoder/filelists/vocos.val.txt
+      filelist_path: inputs//filelists/vocos.val.txt
       sampling_rate: 24000
       num_samples: 38400
       batch_size: 8

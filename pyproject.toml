@@ -31,6 +31,7 @@ dependencies = [
     "pillow",
     "tensorflow>=2.18.1",
     "torch",
+    "torchcodec>=0.10.0",
     "torchcrepe>=0.0.24",
     "torchvision>=0.24.1",
     "transformers",
@@ -53,6 +54,7 @@ kokoro-vocos-test-pt-ckpt-tf = "kokoro.tf.smoke_test_from_pt_ckpt:main"
 kokoro-vocos-validate-tf-quant = "kokoro.tf.validate_quant:main"
 kokoro-vocos-litert-pipeline = "kokoro.tf.export:main"
 kokoro-test-kmodel-decoders = "kokoro.test_kmodel_decoder_compare:main"
+kokoro-vocos-quant-compare = "kokoro.investigate_chunked_streaming_vocos:main"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["kokoro"]

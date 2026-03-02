@@ -1,4 +1,4 @@
-"""Compatibility shim for moved PyTorch->TensorFlow conversion entrypoint.
+"""Compatibility shim for moved streaming-Vocos PyTorch->TensorFlow conversion entrypoint.
 
 New location: `kokoro.tf.convert`.
 """

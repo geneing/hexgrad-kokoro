@@ -37,6 +37,7 @@ class TFVocosGeneratorConfig:
     n_fft: int
     hop_length: int
     padding: str = "same"
+    backbone_kernel_size: int = 7
 
 
 def _strip_parallel_prefixes(state_dict: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -76,17 +77,27 @@ def load_pytorch_generator_state(checkpoint_path: Path) -> tuple[dict[str, torch
 def infer_tf_generator_config(
     state_dict: Mapping[str, torch.Tensor], hop_length: int, padding: str = "same"
 ) -> TFVocosGeneratorConfig:
+    is_streaming = "backbone.embed.conv.conv.weight_v" in state_dict or "backbone.embed.conv.conv.weight" in state_dict
     try:
         model_input_channels = int(state_dict["conditioner.0.weight"].shape[0])
         in_channels = int(state_dict["conditioner.0.weight"].shape[1])
-        backbone_dim = int(state_dict["backbone.embed.weight"].shape[0])
+        if is_streaming:
+            if "backbone.embed.conv.conv.weight_v" in state_dict:
+                embed_w = state_dict["backbone.embed.conv.conv.weight_v"]
+            else:
+                embed_w = state_dict["backbone.embed.conv.conv.weight"]
+            backbone_dim = int(embed_w.shape[0])
+            backbone_kernel_size = int(embed_w.shape[2])
+        else:
+            backbone_dim = int(state_dict["backbone.embed.weight"].shape[0])
+            backbone_kernel_size = int(state_dict["backbone.embed.weight"].shape[2])
         backbone_intermediate_dim = int(state_dict["backbone.convnext.0.pwconv1.weight"].shape[0])
         n_fft = int(state_dict["head.out.weight"].shape[0]) - 2
     except KeyError as exc:
         raise KeyError(f"Could not infer generator config, missing key: {exc}") from exc
 
     layer_ids = set()
-    pattern = re.compile(r"^backbone\.convnext\.(\d+)\.dwconv\.weight$")
+    pattern = re.compile(r"^backbone\.convnext\.(\d+)\.dwconv(\.conv\.conv)?\.weight(_v)?$")
     for key in state_dict.keys():
         match = pattern.match(key)
         if match:
@@ -104,6 +115,7 @@ def infer_tf_generator_config(
         n_fft=n_fft,
         hop_length=int(hop_length),
         padding=padding,
+        backbone_kernel_size=backbone_kernel_size,
     )
 
 
@@ -117,6 +129,7 @@ def build_tf_generator(config: TFVocosGeneratorConfig) -> PairedVocosGeneratorTF
         n_fft=config.n_fft,
         hop_length=config.hop_length,
         padding=config.padding,
+        backbone_kernel_size=config.backbone_kernel_size,
     )
     # Build model variables.
     dummy = tf.zeros([1, config.in_channels, 16], dtype=tf.float32)
@@ -138,6 +151,7 @@ def build_tf_export_generator(
         hop_length=config.hop_length,
         fixed_frames=fixed_frames,
         padding=config.padding,
+        backbone_kernel_size=config.backbone_kernel_size,
     )
     dummy = tf.zeros([1, config.in_channels, int(fixed_frames)], dtype=tf.float32)
     _ = model(dummy, training=False)
@@ -158,12 +172,24 @@ def _assign_conv1d(layer: tf.keras.layers.Conv1D, w: torch.Tensor, b: torch.Tens
     layer.bias.assign(bias.astype(tf.as_dtype(layer.bias.dtype).as_numpy_dtype))
 
 
-def _assign_depthwise_conv1d(layer: tf.keras.layers.DepthwiseConv1D, w: torch.Tensor, b: torch.Tensor) -> None:
-    # PyTorch depthwise conv [C, 1, K] -> Keras [K, C, 1]
-    kernel = np.transpose(_np_from_torch(w), (2, 0, 1))
-    bias = _np_from_torch(b)
-    layer.kernel.assign(kernel.astype(tf.as_dtype(layer.kernel.dtype).as_numpy_dtype))
-    layer.bias.assign(bias.astype(tf.as_dtype(layer.bias.dtype).as_numpy_dtype))
+def _resolve_pt_conv_weight_bias(
+    state_dict: Mapping[str, torch.Tensor], base_key: str
+) -> tuple[torch.Tensor, torch.Tensor, set[str]]:
+    direct_w = f"{base_key}.weight"
+    direct_b = f"{base_key}.bias"
+    wv = f"{base_key}.weight_v"
+    wg = f"{base_key}.weight_g"
+    if direct_w in state_dict and direct_b in state_dict:
+        return state_dict[direct_w], state_dict[direct_b], {direct_w, direct_b}
+    if wv in state_dict and wg in state_dict and direct_b in state_dict:
+        v = state_dict[wv]
+        g = state_dict[wg]
+        # torch.nn.utils.weight_norm uses dim=0 by default for Conv1d.
+        reduce_dims = tuple(range(1, v.ndim))
+        v_norm = torch.linalg.vector_norm(v, ord=2, dim=reduce_dims, keepdim=True).clamp_min(1e-12)
+        w = v * (g / v_norm)
+        return w, state_dict[direct_b], {wv, wg, direct_b}
+    raise KeyError(f"Could not resolve conv weights for {base_key}")
 
 
 def _assign_dense(layer: tf.keras.layers.Dense, w: torch.Tensor, b: torch.Tensor) -> None:
@@ -193,27 +219,34 @@ def load_pytorch_state_into_tf_generator(
     _assign_conv1d(conditioner[4], state_dict["conditioner.4.weight"], state_dict["conditioner.4.bias"])
     used.update({"conditioner.4.weight", "conditioner.4.bias"})
 
-    _assign_conv1d(model.backbone.embed, state_dict["backbone.embed.weight"], state_dict["backbone.embed.bias"])
-    used.update({"backbone.embed.weight", "backbone.embed.bias"})
+    try:
+        embed_w, embed_b, embed_keys = _resolve_pt_conv_weight_bias(state_dict, "backbone.embed.conv.conv")
+    except KeyError:
+        embed_w = state_dict["backbone.embed.weight"]
+        embed_b = state_dict["backbone.embed.bias"]
+        embed_keys = {"backbone.embed.weight", "backbone.embed.bias"}
+    _assign_conv1d(model.backbone.embed.conv, embed_w, embed_b)
+    used.update(embed_keys)
     _assign_layer_norm(model.backbone.norm, state_dict["backbone.norm.weight"], state_dict["backbone.norm.bias"])
     used.update({"backbone.norm.weight", "backbone.norm.bias"})
 
     for i, block in enumerate(model.backbone.blocks):
         prefix = f"backbone.convnext.{i}"
-        _assign_depthwise_conv1d(
-            block.dwconv,
-            state_dict[f"{prefix}.dwconv.weight"],
-            state_dict[f"{prefix}.dwconv.bias"],
-        )
+        try:
+            dw_w, dw_b, dw_keys = _resolve_pt_conv_weight_bias(state_dict, f"{prefix}.dwconv.conv.conv")
+        except KeyError:
+            dw_w = state_dict[f"{prefix}.dwconv.weight"]
+            dw_b = state_dict[f"{prefix}.dwconv.bias"]
+            dw_keys = {f"{prefix}.dwconv.weight", f"{prefix}.dwconv.bias"}
+        _assign_conv1d(block.dwconv.conv, dw_w, dw_b)
         _assign_layer_norm(block.norm, state_dict[f"{prefix}.norm.weight"], state_dict[f"{prefix}.norm.bias"])
         _assign_dense(block.pwconv1, state_dict[f"{prefix}.pwconv1.weight"], state_dict[f"{prefix}.pwconv1.bias"])
         _assign_dense(block.pwconv2, state_dict[f"{prefix}.pwconv2.weight"], state_dict[f"{prefix}.pwconv2.bias"])
         gamma = _np_from_torch(state_dict[f"{prefix}.gamma"]).astype(tf.as_dtype(block.gamma.dtype).as_numpy_dtype)
         block.gamma.assign(gamma)
+        used.update(dw_keys)
         used.update(
             {
-                f"{prefix}.dwconv.weight",
-                f"{prefix}.dwconv.bias",
                 f"{prefix}.norm.weight",
                 f"{prefix}.norm.bias",
                 f"{prefix}.pwconv1.weight",
@@ -234,7 +267,10 @@ def load_pytorch_state_into_tf_generator(
     _assign_dense(model.head.out, state_dict["head.out.weight"], state_dict["head.out.bias"])
     used.update({"head.out.weight", "head.out.bias"})
 
-    ignored = {"head.istft.window"}
+    ignored = {
+        "head.istft.window",
+        "head.istft.overlap_add.deconv.weight",
+    }
     missing = sorted((set(state_dict.keys()) - ignored) - used)
     unexpected_ignored = sorted((set(state_dict.keys()) & ignored))
 

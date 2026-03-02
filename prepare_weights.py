@@ -1,3 +1,71 @@
+"""Prepare deployable Vocos weights (fp32/fp16/int8) from train_vocos checkpoints.
+
+This utility converts a `kokoro.train_vocos` training checkpoint into inference
+artifacts and optional quantized artifacts for downstream deployment experiments.
+
+Primary responsibilities:
+1) Load a training checkpoint and extract the generator weights.
+2) Infer generator architecture from checkpoint keys (streaming or legacy).
+3) Save:
+   - fp32 generator state: `vocos.pt`
+   - fp16 generator state: `vocos_fp16.pt`
+4) Run QAT/PT2E conversion on the quantizable core and save:
+   - slim int8-ish deployment state: `vocos_q8.pt`
+   - optional full state: `vocos_q8_full.pt` (with `--save-full-q8`)
+5) Optionally write sample audio for side-by-side qualitative checks.
+6) Print a summary table of parameter dtypes and rough op-type estimates.
+
+Streaming Vocos support:
+- `--vocos-impl auto` (default) infers backend from checkpoint keys.
+- For streaming checkpoints, the script builds `PairedVocosGenerator` with
+  streaming settings so exported fp32/fp16/int8 artifacts match training-time
+  architecture.
+
+Typical usage:
+
+1) Default conversion from a streaming train checkpoint (auto backend detect)
+   uv run python prepare_weights.py \
+     --input output/checkpoints/last.pt \
+     --output-dir output/weights
+
+2) Force streaming backend and explicit streaming repo path
+   uv run python prepare_weights.py \
+     --input output/checkpoints/last.pt \
+     --output-dir output/weights_streaming \
+     --vocos-impl streaming \
+     --streaming-vocos-repo third_party/vocos_streaming \
+     --backbone-causal \
+     --backbone-pad-mode constant \
+     --backbone-norm weight_norm
+
+3) Faster smoke run (small data + few QAT steps)
+   uv run python prepare_weights.py \
+     --input output/checkpoints/last.pt \
+     --output-dir output/weights_smoke \
+     --max-train-items 256 \
+     --batch-size 2 \
+     --qat-steps 20 \
+     --sample-count 2
+
+4) Disable adversarial losses during QAT fallback
+   uv run python prepare_weights.py \
+     --input output/checkpoints/last.pt \
+     --output-dir output/weights_no_adv \
+     --disable-adversarial
+
+5) Save both slim and full q8 outputs
+   uv run python prepare_weights.py \
+     --input output/checkpoints/last.pt \
+     --output-dir output/weights_q8_full \
+     --save-full-q8
+
+Important notes:
+- This script expects checkpoints produced by `kokoro/train_vocos.py`.
+- Quantization path uses PT2E/XNNPACK-style flow and may vary across torch/
+  executorch versions.
+- Generated sample audio is for qualitative sanity checking, not MOS scoring.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -59,6 +127,12 @@ class GeneratorConfig:
     backbone_dim: int
     backbone_intermediate_dim: int
     backbone_layers: int
+    backbone_kernel_size: int
+    vocos_impl: str
+    backbone_causal: bool
+    backbone_pad_mode: str
+    backbone_norm: str
+    streaming_vocos_repo: Optional[Path]
     n_fft: int
     hop_length: int
     padding: str
@@ -138,7 +212,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, required=True, help="Path to checkpoint produced by kokoro/train_vocos.py")
     parser.add_argument("--output-dir", type=Path, default=Path("."), help="Output directory for vocos.pt and vocos_q8.pt")
 
-    parser.add_argument("--data-root", type=Path, default=Path("/export/eingerman/audio/vocoder"))
+    parser.add_argument("--data-root", type=Path, default=Path("inputs/"))
     parser.add_argument("--train-filelist", type=Path, default=None)
     parser.add_argument("--manifest-root", type=Path, default=None)
     parser.add_argument("--max-train-items", type=int, default=4096)
@@ -150,6 +224,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-rate", type=int, default=24000)
     parser.add_argument("--hop-length", type=int, default=300)
     parser.add_argument("--padding", type=str, default="same")
+    parser.add_argument(
+        "--vocos-impl",
+        type=str,
+        choices=("auto", "streaming", "legacy"),
+        default="auto",
+        help="Generator backend to build for export. 'auto' infers from checkpoint keys.",
+    )
+    parser.add_argument(
+        "--streaming-vocos-repo",
+        type=Path,
+        default=Path("third_party/vocos_streaming"),
+        help="Path to local streaming-vocos repo root (contains src/components).",
+    )
+    parser.add_argument("--backbone-causal", dest="backbone_causal", action="store_true")
+    parser.add_argument("--no-backbone-causal", dest="backbone_causal", action="store_false")
+    parser.set_defaults(backbone_causal=True)
+    parser.add_argument("--backbone-pad-mode", type=str, default="constant")
+    parser.add_argument("--backbone-norm", type=str, default="weight_norm")
     parser.add_argument("--sample-count", type=int, default=5)
     parser.add_argument("--sample-max-frames", type=int, default=480)
     parser.add_argument("--samples-dir", type=Path, default=None)
@@ -206,18 +298,38 @@ def load_checkpoint(path: Path) -> tuple[Dict[str, object], Dict[str, torch.Tens
     return dict(raw), _strip_parallel_prefixes(generator)
 
 
-def infer_generator_config(state_dict: Mapping[str, torch.Tensor], hop_length: int, padding: str) -> GeneratorConfig:
+def _infer_vocos_impl(state_dict: Mapping[str, torch.Tensor], requested: str) -> str:
+    if requested in {"streaming", "legacy"}:
+        return requested
+    if "backbone.embed.conv.conv.weight_v" in state_dict or "backbone.convnext.0.dwconv.conv.conv.weight_v" in state_dict:
+        return "streaming"
+    return "legacy"
+
+
+def infer_generator_config(state_dict: Mapping[str, torch.Tensor], args: argparse.Namespace) -> GeneratorConfig:
+    vocos_impl = _infer_vocos_impl(state_dict, str(args.vocos_impl).lower())
     try:
         model_input_channels = int(state_dict["conditioner.0.weight"].shape[0])
         in_channels = int(state_dict["conditioner.0.weight"].shape[1])
-        backbone_dim = int(state_dict["backbone.embed.weight"].shape[0])
+        if vocos_impl == "streaming":
+            if "backbone.embed.conv.conv.weight_v" in state_dict:
+                embed_w = state_dict["backbone.embed.conv.conv.weight_v"]
+            elif "backbone.embed.conv.conv.weight" in state_dict:
+                embed_w = state_dict["backbone.embed.conv.conv.weight"]
+            else:
+                raise KeyError("backbone.embed.conv.conv.weight_v")
+            backbone_dim = int(embed_w.shape[0])
+            backbone_kernel_size = int(embed_w.shape[2])
+        else:
+            backbone_dim = int(state_dict["backbone.embed.weight"].shape[0])
+            backbone_kernel_size = int(state_dict["backbone.embed.weight"].shape[2])
         backbone_intermediate_dim = int(state_dict["backbone.convnext.0.pwconv1.weight"].shape[0])
         n_fft = int(state_dict["head.out.weight"].shape[0]) - 2
     except KeyError as exc:
         raise KeyError(f"Could not infer generator config, missing key: {exc}") from exc
 
     layer_ids = set()
-    pattern = re.compile(r"^backbone\.convnext\.(\d+)\.dwconv\.weight$")
+    pattern = re.compile(r"^backbone\.convnext\.(\d+)\.dwconv(\.conv\.conv)?\.weight(_v)?$")
     for key in state_dict.keys():
         m = pattern.match(key)
         if m:
@@ -232,9 +344,15 @@ def infer_generator_config(state_dict: Mapping[str, torch.Tensor], hop_length: i
         backbone_dim=backbone_dim,
         backbone_intermediate_dim=backbone_intermediate_dim,
         backbone_layers=backbone_layers,
+        backbone_kernel_size=backbone_kernel_size,
+        vocos_impl=vocos_impl,
+        backbone_causal=bool(args.backbone_causal),
+        backbone_pad_mode=str(args.backbone_pad_mode),
+        backbone_norm=str(args.backbone_norm),
+        streaming_vocos_repo=(Path(args.streaming_vocos_repo).resolve() if args.streaming_vocos_repo else None),
         n_fft=n_fft,
-        hop_length=hop_length,
-        padding=padding,
+        hop_length=int(args.hop_length),
+        padding=str(args.padding),
     )
 
 
@@ -248,6 +366,11 @@ def build_generator(cfg: GeneratorConfig, generator_state: Mapping[str, torch.Te
         n_fft=cfg.n_fft,
         hop_length=cfg.hop_length,
         padding=cfg.padding,
+        vocos_impl=cfg.vocos_impl,
+        streaming_vocos_repo=cfg.streaming_vocos_repo,
+        backbone_causal=cfg.backbone_causal,
+        backbone_pad_mode=cfg.backbone_pad_mode,
+        backbone_norm=cfg.backbone_norm,
     )
     missing, unexpected = model.load_state_dict(generator_state, strict=False)
     if missing or unexpected:
@@ -833,6 +956,11 @@ def run_fp16_inference(
         n_fft=cfg.n_fft,
         hop_length=cfg.hop_length,
         padding=cfg.padding,
+        vocos_impl=cfg.vocos_impl,
+        streaming_vocos_repo=cfg.streaming_vocos_repo,
+        backbone_causal=cfg.backbone_causal,
+        backbone_pad_mode=cfg.backbone_pad_mode,
+        backbone_norm=cfg.backbone_norm,
     ).half().eval()
     half_model.load_state_dict(fp16_state, strict=True)
     with torch.inference_mode():
@@ -890,7 +1018,13 @@ def main() -> None:
         raise FileNotFoundError(input_path)
 
     ckpt, generator_state = load_checkpoint(input_path)
-    config = infer_generator_config(generator_state, hop_length=args.hop_length, padding=args.padding)
+    config = infer_generator_config(generator_state, args=args)
+    logger.info(
+        "Inferred generator config: "
+        f"vocos_impl={config.vocos_impl}, in_channels={config.in_channels}, "
+        f"model_input_channels={config.model_input_channels}, backbone_dim={config.backbone_dim}, "
+        f"layers={config.backbone_layers}, n_fft={config.n_fft}, hop_length={config.hop_length}"
+    )
     generator = build_generator(config, generator_state).cpu().eval()
 
     out_dir = args.output_dir.resolve()

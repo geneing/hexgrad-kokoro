@@ -7,7 +7,7 @@ This utility:
 4) Writes WAV files, per-entry waveform plots, and aggregate metric reports.
 
 Primary usage:
-`uv run kokoro-test-kmodel-decoders --config-json /path/config.json --kokoro-checkpoint /path/kokoro.pth --vocos-checkpoint /path/vocos.pt --data-root /export/eingerman/audio/vocoder --num-entries 20 --output-dir output/decoder_compare`
+`uv run kokoro-test-kmodel-decoders --config-json /path/config.json --kokoro-checkpoint /path/kokoro.pth --vocos-checkpoint /path/vocos.pt --data-root inputs/ --num-entries 20 --output-dir output/decoder_compare`
 
 Alternative module usage:
 uv run python -m kokoro.test_kmodel_decoder_compare --config-json ../Kokoro/checkpoints/config.json --kokoro-checkpoint ../Kokoro/checkpoints/kokoro-v1_0.pth --vocos-checkpoint output/checkpoints/last.pt --data-root inputs/ --num-entries 20
@@ -318,7 +318,7 @@ def _streaming_decode_to_numpy(
     decoder.reset()
     chunks = list(decoder.streaming_decode(asr, f0, noise, style, is_last=True))
     if not chunks:
-        audio_t = decoder.decode_caches()
+        audio_t = torch.empty((1, 0), device=asr.device, dtype=asr.dtype)
     else:
         audio_t = torch.cat(chunks, dim=-1)
     return _to_numpy_audio(audio_t, expected_samples=expected_samples)

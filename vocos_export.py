@@ -1,3 +1,60 @@
+"""Export streaming-Vocos inference weights to LiteRT and validate outputs.
+
+This script consumes prepared generator weights (typically produced by
+`prepare_weights.py`) and exports LiteRT variants:
+- fp32
+- fp16
+- int8 (AI Edge Quantizer; full-integer static calibration preferred)
+
+It then runs quick validation inference on sample feature tensors and writes
+WAV artifacts for qualitative sanity checking.
+
+Streaming-vocos alignment:
+- Backend defaults to streaming (`--vocos-impl streaming`).
+- Generator config is inferred from checkpoint keys via `prepare_weights`
+  helper utilities and then rebuilt with matching architecture options.
+
+Inputs:
+- `vocos.pt` (required) and `vocos_fp16.pt` (required) in `--weights-dir`
+
+Outputs in `--output-dir`:
+- `vocos_fp32_litert.tflite`
+- `vocos_fp16_litert.tflite`
+- `vocos_int8_full_integer_litert.tflite` (if quantization succeeds)
+- `vocos_int8_litert.tflite` (selected int8 artifact used for validation)
+- `sample_audio/*.wav` generated validation clips
+
+Examples:
+
+1) Export all variants from streaming weights
+   uv run python vocos_export.py \
+     --weights-dir output/saved_infer_weights \
+     --output-dir output/litert_streaming
+
+2) Explicit streaming backend controls
+   uv run python vocos_export.py \
+     --weights-dir output/saved_infer_weights \
+     --output-dir output/litert_streaming \
+     --vocos-impl streaming \
+     --streaming-vocos-repo third_party/vocos_streaming \
+     --backbone-causal \
+     --backbone-pad-mode constant \
+     --backbone-norm weight_norm
+
+3) Export with 520-frame fixed input and extra calibration samples
+   uv run python vocos_export.py \
+     --weights-dir output/saved_infer_weights \
+     --output-dir output/litert_streaming_520f \
+     --num-frames 520 \
+     --int8-calib-samples 64
+
+4) Lightweight conversion mode
+   uv run python vocos_export.py \
+     --weights-dir output/saved_infer_weights \
+     --output-dir output/litert_streaming_light \
+     --lightweight-conversion
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -188,12 +245,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-rate", type=int, default=24000)
     parser.add_argument("--hop-length", type=int, default=300)
     parser.add_argument("--padding", type=str, default="same")
+    parser.add_argument(
+        "--vocos-impl",
+        type=str,
+        choices=("streaming", "auto", "legacy"),
+        default="streaming",
+        help="Generator backend expected by weights; streaming is default.",
+    )
+    parser.add_argument(
+        "--streaming-vocos-repo",
+        type=Path,
+        default=Path("third_party/vocos_streaming"),
+        help="Path to streaming-vocos repo root (contains src/components).",
+    )
+    parser.add_argument("--backbone-causal", dest="backbone_causal", action="store_true")
+    parser.add_argument("--no-backbone-causal", dest="backbone_causal", action="store_false")
+    parser.set_defaults(backbone_causal=True)
+    parser.add_argument("--backbone-pad-mode", type=str, default="constant")
+    parser.add_argument("--backbone-norm", type=str, default="weight_norm")
 
     parser.add_argument("--seed", type=int, default=4444)
     parser.add_argument("--sample-count", type=int, default=5)
     parser.add_argument("--sample-max-frames", type=int, default=480)
 
-    parser.add_argument("--data-root", type=Path, default=Path("/export/eingerman/audio/vocoder"))
+    parser.add_argument("--data-root", type=Path, default=Path("inputs/"))
     parser.add_argument("--train-filelist", type=Path, default=None)
     parser.add_argument("--manifest-root", type=Path, default=None)
     parser.add_argument("--max-train-items", type=int, default=4096)
@@ -373,7 +448,13 @@ def _load_models(args: argparse.Namespace) -> tuple[GeneratorConfig, nn.Module, 
             raise FileNotFoundError(path)
 
     fp32_state = _load_state(fp32_path)
-    config = infer_generator_config(fp32_state, hop_length=args.hop_length, padding=args.padding)
+    config = infer_generator_config(fp32_state, args=args)
+    logger.info(
+        "Using inferred export config: "
+        f"vocos_impl={config.vocos_impl}, in_channels={config.in_channels}, "
+        f"backbone_dim={config.backbone_dim}, layers={config.backbone_layers}, "
+        f"n_fft={config.n_fft}, hop={config.hop_length}"
+    )
 
     fp32_model = build_generator(config, fp32_state).eval()
     _patch_istft_for_export(fp32_model)

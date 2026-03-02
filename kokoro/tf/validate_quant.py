@@ -1,11 +1,52 @@
-"""TensorFlow quantization validation utility for converted Vocos checkpoints.
+"""Streaming-Vocos TensorFlow quantization validation utility.
 
-This script builds a TensorFlow generator from a PyTorch checkpoint, exports
-TFLite quantization variants, runs inference on held-out validation items, and
-computes signal-level metrics against reference waveforms.
+This script validates TensorFlow quantization behavior for checkpoints produced
+by `kokoro/train_vocos.py` (streaming-causal Vocos path).
 
-Use this for focused quantization diagnostics when you do not need the full
-QAT/export candidate-selection pipeline from `kokoro.tf.export`.
+Workflow:
+1) Load PyTorch checkpoint generator weights.
+2) Infer TF generator architecture from checkpoint keys.
+3) Build TF streaming-vocos-compatible generator and load mapped weights.
+4) Create quantized variants (fp16 and symmetric int8-dequantized weights).
+5) Run inference on validation samples and compute waveform metrics vs targets.
+6) Save generated audio, per-sample CSV metrics, and JSON summaries.
+
+Important:
+- By default this script expects a streaming-vocos checkpoint layout and will
+  fail fast if a legacy layout is detected.
+- Validation inference supports chunked cache-window decoding semantics aligned
+  with `kokoro.tf.export` (`--validation-chunked-inference`, default on).
+
+Examples:
+
+1) Default streaming quant validation (20 samples)
+   uv run python -m kokoro.tf.validate_quant \
+     --pytorch-checkpoint output/checkpoints/last.pt \
+     --val-filelist inputs/filelists/vocos.val.txt
+
+2) Smaller smoke run
+   uv run python -m kokoro.tf.validate_quant \
+     --pytorch-checkpoint output/checkpoints/last.pt \
+     --val-filelist inputs/filelists/vocos.val.txt \
+     --num-samples 4
+
+3) Write outputs to custom dirs
+   uv run python -m kokoro.tf.validate_quant \
+     --pytorch-checkpoint output/checkpoints/last.pt \
+     --val-filelist inputs/filelists/vocos.val.txt \
+     --quant-output-dir output/tf_quant_streaming \
+     --validation-output-dir output/tf_quant_streaming_eval
+
+4) Allow legacy checkpoint layout (not recommended for current pipeline)
+   uv run python -m kokoro.tf.validate_quant \
+     --pytorch-checkpoint output/checkpoints/legacy.pt \
+     --vocos-impl auto
+
+5) Disable chunked inference and use full-forward validation
+   uv run python -m kokoro.tf.validate_quant \
+     --pytorch-checkpoint output/checkpoints/last.pt \
+     --val-filelist inputs/filelists/vocos.val.txt \
+     --no-validation-chunked-inference
 """
 
 from __future__ import annotations
@@ -67,6 +108,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quant-output-dir", type=Path, default=Path("output/tf_quantized"))
     parser.add_argument("--validation-output-dir", type=Path, default=Path("output/tf_quant_validation"))
     parser.add_argument("--skip-fp32", action="store_true", help="Skip fp32 baseline generation/metrics")
+    parser.add_argument(
+        "--vocos-impl",
+        type=str,
+        choices=("streaming", "auto"),
+        default="streaming",
+        help="Expected checkpoint vocos implementation. 'streaming' enforces new streaming layout.",
+    )
+    parser.add_argument("--validation-chunked-inference", dest="validation_chunked_inference", action="store_true")
+    parser.add_argument("--no-validation-chunked-inference", dest="validation_chunked_inference", action="store_false")
+    parser.set_defaults(validation_chunked_inference=True)
+    parser.add_argument("--stream-chunk-size-ms", type=int, default=300)
+    parser.add_argument("--stream-padding-ms", type=int, default=40)
     return parser.parse_args()
 
 
@@ -114,14 +167,27 @@ def _load_val_items(val_filelist: Path, num_samples: int) -> List[ValItem]:
     return items
 
 
+def _infer_checkpoint_vocos_impl(state_dict: Dict[str, torch.Tensor]) -> str:
+    if "backbone.embed.conv.conv.weight_v" in state_dict or "backbone.convnext.0.dwconv.conv.conv.weight_v" in state_dict:
+        return "streaming"
+    return "legacy"
+
+
 def _build_tf_model_from_checkpoint(
-    pytorch_checkpoint: Path, hop_length: int, padding: str
+    pytorch_checkpoint: Path, hop_length: int, padding: str, expected_impl: str
 ) -> Tuple[tf.keras.Model, Dict[str, object], Dict[str, object]]:
     state, metadata = load_pytorch_generator_state(pytorch_checkpoint)
+    inferred_impl = _infer_checkpoint_vocos_impl(state)
+    if expected_impl == "streaming" and inferred_impl != "streaming":
+        raise RuntimeError(
+            "Checkpoint does not appear to be streaming vocos layout. "
+            f"expected=streaming inferred={inferred_impl}. "
+            "Use --vocos-impl auto only if you intentionally want to validate legacy layout."
+        )
     cfg = infer_tf_generator_config(state, hop_length=hop_length, padding=padding)
     model = build_tf_generator(cfg)
     report = load_pytorch_state_into_tf_generator(model, state)
-    return model, metadata, {"config": cfg, "report": report}
+    return model, metadata, {"config": cfg, "report": report, "vocos_impl": inferred_impl}
 
 
 def _converter_with_select_tf_ops(model: tf.keras.Model, in_channels: int) -> tf.lite.TFLiteConverter:
@@ -248,17 +314,86 @@ def _compute_metrics(pred: np.ndarray, target: np.ndarray) -> Dict[str, float]:
     return {"samples": float(n), "mae": mae, "rmse": rmse, "corr": corr}
 
 
+def _compute_streaming_window(
+    *,
+    backbone_layers: int,
+    n_fft: int,
+    hop_length: int,
+    sample_rate: int,
+    chunk_size_ms: int,
+    padding_ms: int,
+) -> tuple[int, int]:
+    requested_chunk = max(1, int(chunk_size_ms / 1000.0 * sample_rate / hop_length))
+    requested_padding = max(0, int(padding_ms / 1000.0 * sample_rate / hop_length))
+    receptive_frames = 9 + 6 * int(backbone_layers)
+    istft_half_frames = max(1, int(round((n_fft / float(hop_length)) / 2.0)))
+    min_padding = int(math.ceil((receptive_frames - 1) / 2.0)) + istft_half_frames
+    min_chunk = max(receptive_frames, 2 * min_padding)
+    return max(requested_chunk, min_chunk), max(requested_padding, min_padding)
+
+
+def _run_model_chunked_inference(
+    model: tf.keras.Model,
+    features_bct: np.ndarray,
+    *,
+    chunk_size: int,
+    padding: int,
+    hop_length: int,
+) -> np.ndarray:
+    feat = np.asarray(features_bct, dtype=np.float32)
+    if feat.ndim != 2:
+        raise ValueError(f"Expected features [C,T], got shape={feat.shape}")
+    ch, total_frames = feat.shape
+    if total_frames <= 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    cache = np.zeros((ch, int(chunk_size + 2 * padding)), dtype=np.float32)
+    cur_idx = -1
+    chunks: list[np.ndarray] = []
+
+    def _get_size(idx: int) -> int:
+        effective_size = idx + 1 - int(padding)
+        if effective_size <= 0:
+            return 0
+        return effective_size % int(chunk_size) or int(chunk_size)
+
+    for idx in range(total_frames):
+        cache = np.roll(cache, shift=-1, axis=1)
+        cache[:, -1] = feat[:, idx]
+        cur_idx += 1
+
+        is_last = idx == (total_frames - 1)
+        cur_size = _get_size(cur_idx)
+        if cur_size != int(chunk_size) and not is_last:
+            continue
+
+        y = model(tf.convert_to_tensor(cache[None, ...], dtype=tf.float32), training=False).numpy()[0]
+        audio = y.astype(np.float32, copy=False)
+        if int(padding) > 0:
+            audio = audio[int(padding) * int(hop_length) :]
+        if cur_size != int(chunk_size):
+            audio = audio[(int(chunk_size) - cur_size) * int(hop_length) :]
+        if not is_last:
+            audio = audio[: int(chunk_size) * int(hop_length)]
+        chunks.append(audio)
+
+    if not chunks:
+        return np.zeros((0,), dtype=np.float32)
+    return np.concatenate(chunks, axis=0).astype(np.float32, copy=False)
+
+
 def _clone_model_from_base(base: tf.keras.Model, in_channels: int, hop_length: int, padding: str) -> tf.keras.Model:
     # Rebuild a fresh graph and copy variables to avoid in-place corruption.
     cfg = {
-        "in_channels": in_channels,
-        "model_input_channels": int(base.conditioner.layers[0].filters),
-        "backbone_dim": int(base.backbone.embed.filters),
-        "backbone_intermediate_dim": int(base.backbone.blocks[0].pwconv1.units),
-        "backbone_layers": int(len(base.backbone.blocks)),
-        "n_fft": int(base.head.n_fft),
+        "in_channels": int(getattr(base, "in_channels", in_channels)),
+        "model_input_channels": int(base.model_input_channels),
+        "backbone_dim": int(base.backbone_dim),
+        "backbone_intermediate_dim": int(base.backbone_intermediate_dim),
+        "backbone_layers": int(base.backbone_layers),
+        "n_fft": int(base.n_fft),
         "hop_length": int(hop_length),
         "padding": padding,
+        "backbone_kernel_size": int(getattr(base, "backbone_kernel_size", 7)),
     }
     from .model import PairedVocosGeneratorTF
 
@@ -323,10 +458,12 @@ def main() -> None:
         pytorch_checkpoint=args.pytorch_checkpoint,
         hop_length=args.hop_length,
         padding=args.padding,
+        expected_impl=args.vocos_impl,
     )
     logger.info(
         "Loaded TF generator from PT checkpoint "
-        f"(loaded_keys={load_info['report']['num_loaded_keys']}, "
+        f"(vocos_impl={load_info['vocos_impl']}, "
+        f"loaded_keys={load_info['report']['num_loaded_keys']}, "
         f"ignored={load_info['report']['ignored_keys']}, meta={metadata})"
     )
     in_channels = int(load_info["config"].in_channels)
@@ -358,6 +495,7 @@ def main() -> None:
             "int8": {"mode": "weights_symmetric_int8_quant_dequant", "stats": int8_stats},
         },
         "load_report": {
+            "vocos_impl": load_info["vocos_impl"],
             "loaded_keys": load_info["report"]["num_loaded_keys"],
             "ignored_keys": load_info["report"]["ignored_keys"],
             "checkpoint_metadata": metadata,
@@ -373,6 +511,25 @@ def main() -> None:
     if not args.skip_fp32:
         variants = ["fp32"] + variants
 
+    chunk_cfg: Dict[str, int] | None = None
+    cfg = load_info["config"]
+    if args.validation_chunked_inference:
+        chunk_frames, padding_frames = _compute_streaming_window(
+            backbone_layers=int(cfg.backbone_layers),
+            n_fft=int(cfg.n_fft),
+            hop_length=int(cfg.hop_length),
+            sample_rate=int(args.sample_rate),
+            chunk_size_ms=int(args.stream_chunk_size_ms),
+            padding_ms=int(args.stream_padding_ms),
+        )
+        chunk_cfg = {"chunk_frames": int(chunk_frames), "padding_frames": int(padding_frames)}
+        logger.info(
+            "Validation chunked inference enabled: "
+            f"chunk_frames={chunk_frames}, padding_frames={padding_frames}, hop={args.hop_length}"
+        )
+    else:
+        logger.info("Validation uses full-forward inference (chunked inference disabled).")
+
     rows: List[Dict[str, object]] = []
     for item, feat in sample_cache:
         target, sr = _read_wav_mono(item.wav_path)
@@ -384,10 +541,20 @@ def main() -> None:
 
         for variant in variants:
             if variant == "fp32":
-                pred = model(tf.convert_to_tensor(feat, dtype=tf.float32), training=False).numpy()[0].astype(np.float32)
+                variant_model = model
             else:
-                pred = variant_models[variant](tf.convert_to_tensor(feat, dtype=tf.float32), training=False).numpy()[0]
+                variant_model = variant_models[variant]
+            if chunk_cfg is None:
+                pred = variant_model(tf.convert_to_tensor(feat, dtype=tf.float32), training=False).numpy()[0]
                 pred = pred.astype(np.float32, copy=False)
+            else:
+                pred = _run_model_chunked_inference(
+                    variant_model,
+                    feat[0],
+                    chunk_size=int(chunk_cfg["chunk_frames"]),
+                    padding=int(chunk_cfg["padding_frames"]),
+                    hop_length=int(args.hop_length),
+                )
             pred = pred[:expected]
 
             variant_dir = out_root / variant
@@ -438,6 +605,17 @@ def main() -> None:
                 "num_samples": len(items),
                 "variants": variants,
                 "quant_manifest": str(quant_manifest_path),
+                "chunked_inference": bool(chunk_cfg is not None),
+                "chunking": (
+                    {
+                        "chunk_frames": int(chunk_cfg["chunk_frames"]),
+                        "padding_frames": int(chunk_cfg["padding_frames"]),
+                        "chunk_size_ms": int(args.stream_chunk_size_ms),
+                        "padding_ms": int(args.stream_padding_ms),
+                    }
+                    if chunk_cfg is not None
+                    else None
+                ),
                 "summary": summary,
                 "metrics_csv": str(csv_path),
             },

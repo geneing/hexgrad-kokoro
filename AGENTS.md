@@ -1,143 +1,90 @@
 # AGENTS.md
 
 ## Project Summary
-This repository contains Kokoro streaming TTS code. Kokoro is based on the StyleTTS2 architecture and should be treated as a StyleTTS2-derived model with streaming-oriented adaptations.
+This repository contains Kokoro streaming TTS training and deployment utilities.
+Kokoro is a StyleTTS2-derived stack with streaming-oriented decoder paths.
 
-Primary objective:
-- Replace the current iSTFT-based decoder with a Vocos decoder.
-- Train only the Vocos decoder while keeping the rest of the Kokoro model fixed (frozen).
+Current decoder migration state:
+- The primary vocoder path is **streaming Vocos** (causal ConvNeXt + streaming ISTFT head).
+- Legacy non-streaming Vocos and iSTFT baseline code can still exist for comparison.
 
-Secondary objective:
-- Build an efficient training pipeline that preserves perceptual sound quality while fitting within 24GB VRAM.
+Primary goals:
+- Train decoder-only distillation from paired Kokoro vocoder features to waveform.
+- Keep non-decoder Kokoro modules frozen.
+- Preserve quality while fitting on a single ~24GB GPU.
 
-## Model Context
-- **Kokoro lineage:** Kokoro is derived from StyleTTS2.
-- **Training code source:** Reuse or adapt training logic from the StyleTTS2 repository where needed, especially for data flow, losses, and training loop structure.
-- **Decoder transition:** The decoder backend must move from iSTFT reconstruction to Vocos waveform generation.
+## Streaming Vocos Requirements
+When working with vocoder training/export/validation:
+- Treat streaming-vocos as the default architecture.
+- Expect streaming checkpoint keys such as:
+  - `backbone.embed.conv.conv.weight_v`
+  - `backbone.convnext.<i>.dwconv.conv.conv.weight_v`
+- Preserve these config alignments unless intentionally changing project-wide:
+  - `sample_rate=24000`
+  - `hop_length=300`
+  - `n_fft=1200`
+  - `n_mels=80`
+- Keep compatibility shims intact (`kokoro/*` wrappers that forward to `kokoro.tf.*`).
 
-## Technical Direction
-1. Keep non-decoder modules frozen during Vocos training:
-   - Text encoder / linguistic modules
-   - Duration/prosody/style predictors
-   - Any acoustic backbone components not part of the decoder
-2. Train the Vocos decoder to consume the same intermediate acoustic representation currently sent to the iSTFT path (or a well-defined mapped equivalent).
-3. Preserve output quality with objective and subjective checks:
-   - Spectral losses (e.g., multi-resolution STFT)
-   - Adversarial/perceptual components as appropriate for Vocos
-   - Listening-based validation on held-out samples
-4. Optimize for 24GB VRAM budget:
-   - Mixed precision (bf16/fp16 where stable)
-   - Gradient accumulation
-   - Checkpointing/activation recomputation where useful
-   - Efficient batch sizing and sequence bucketing
-   - Avoid unnecessary activations from frozen modules
+## Training Objectives and Constraints
+- Train only Vocos decoder path for paired-feature distillation.
+- Use weighted objective:
+  - `L_total = L_GAN + L_FM + L_MR-STFT + L_GroupDelay`
+- Default coefficients:
+  - `gan=1.0`, `fm=2.0`, `mrstft=45.0`, `group_delay=2.0`, `mrd=1.0`
+- Hardware target:
+  - Single GPU, ~24GB VRAM
+- Stability guidance:
+  - Mixed precision (`auto/fp16/bf16`) where safe
+  - Dynamic frame budgeting / accumulation as needed
+  - Deterministic, reproducible settings preferred over peak throughput
 
-## Implementation Expectations
-- Add a clear switch/config to select decoder type (`istft` vs `vocos`) during migration.
-- Ensure frozen parameters are explicitly set and verified (`requires_grad=False`) outside Vocos modules.
-- Log and monitor:
-  - Decoder-only trainable parameter count
-  - VRAM usage per step
-  - Throughput (steps/sec)
-  - Audio quality metrics and checkpoint samples
-- Keep changes modular so baseline iSTFT behavior remains reproducible for A/B comparison.
+## Core Workflows
+### 1) Environment Setup
+- `uv sync`
+- `uv pip install pip`
+- `uv run python -m unidic download`
 
-## Training Constraints
-- Target hardware: single GPU with ~24GB VRAM.
-- Prioritize stability and repeatability over maximum throughput.
-- Maintain compatibility with existing datasets and preprocessing conventions used by Kokoro/StyleTTS2 workflows.
+### 2) Generate Paired Vocoder Data
+- Download-only Kokoro assets:
+  - `uv run kokoro-vocoder-data --download-only --repo-id hexgrad/Kokoro-82M`
+- Smoke data generation:
+  - `uv run kokoro-vocoder-data --num-sentences 1 --libritts-root /export/eingerman/audio/LibriTTS/LibriTTS --output-root inputs/ --write-repo-config`
+- Full generation:
+  - `uv run kokoro-vocoder-data --libritts-root /export/eingerman/audio/LibriTTS/LibriTTS --output-root inputs/ --write-repo-config`
 
-## Definition of Done
-- Vocos decoder is integrated and selectable.
-- Training runs with frozen non-decoder Kokoro components.
-- End-to-end training fits within 24GB VRAM.
-- Generated audio quality is comparable to or better than the iSTFT baseline on project validation samples.
+### 3) Train Streaming Vocos Distillation
+- Typical run:
+  - `uv run python -m kokoro.train_vocos --data-root inputs/ --vocos-impl streaming --streaming-vocos-repo third_party/vocos_streaming --precision auto --tf32 --num-workers 8 --prefetch-factor 4 --log-every 20`
 
-## Data Generation (Vocoder Distillation)
-- Use `kokoro-vocoder-data` to generate paired iSTFTNet vocoder inputs and waveform targets.
-- Default sentence count per voice is `5000`.
-- Input text source is LibriTTS normalized text files.
+### 4) Prepare Inference and Quantized Weights
+- Streaming default:
+  - `uv run python prepare_weights.py --input output/checkpoints/last.pt --output-dir output/saved_infer_weights --vocos-impl streaming --streaming-vocos-repo third_party/vocos_streaming`
 
-### Prerequisites
-- Install project deps:
-  - `uv sync`
-- Ensure `pip` exists inside the environment (needed by some G2P backends):
-  - `uv pip install pip`
-- Install Japanese tokenizer dictionary (one-time):
-  - `uv run python -m unidic download`
+### 5) Export LiteRT Models
+- Streaming default:
+  - `uv run python vocos_export.py --weights-dir output/saved_infer_weights --output-dir output/litert --vocos-impl streaming --streaming-vocos-repo third_party/vocos_streaming`
 
-### Download Kokoro Weights + Voices
-- `uv run kokoro-vocoder-data --download-only --repo-id hexgrad/Kokoro-82M`
+### 6) TF Conversion + Validation
+- Convert PT checkpoint to TF:
+  - `uv run python -m kokoro.tf.convert --pytorch-checkpoint output/checkpoints/last.pt --output-dir output/tf_checkpoints`
+- Validate TF quantized variants:
+  - `uv run python -m kokoro.tf.validate_quant --pytorch-checkpoint output/checkpoints/last.pt --val-filelist inputs//filelists/vocos.val.txt --vocos-impl streaming`
 
-### Smoke Test (all voices, 1 sentence each)
-- `uv run kokoro-vocoder-data --num-sentences 1 --libritts-root /export/eingerman/audio/LibriTTS/LibriTTS --output-root /export/eingerman/audio/vocoder --write-repo-config`
+### 7) PT/TF Parity Checks
+- Full-forward + chunked compare:
+  - `uv run python -m kokoro.tf.smoke_compare_pt_tf --pytorch-checkpoint output/checkpoints/last.pt --pairs-root inputs//pairs --vocos-impl streaming --streaming-vocos-repo third_party/vocos_streaming`
 
-### Full Dataset Generation (default 5000)
-- `uv run kokoro-vocoder-data --libritts-root /export/eingerman/audio/LibriTTS/LibriTTS --output-root /export/eingerman/audio/vocoder --write-repo-config`
+## Important Paths
+- Paired features: `inputs//pairs/**/*.pt`
+- Target wavs: `inputs//audio/**/*.wav`
+- Filelists: `inputs//filelists/vocos.train.txt`, `inputs//filelists/vocos.val.txt`
 
-### Generated Artifacts
-- Wave targets: `/export/eingerman/audio/vocoder/audio/<voice>/*.wav`
-- Paired vocoder inputs: `/export/eingerman/audio/vocoder/pairs/<voice>/*.pt`
-  - `.pt` payload includes: `asr`, `f0`, `noise`, `style`, plus metadata
-- Per-voice manifests: `/export/eingerman/audio/vocoder/manifests/*.jsonl`
-- Vocos filelists: `/export/eingerman/audio/vocoder/filelists/vocos.train.txt` and `/export/eingerman/audio/vocoder/filelists/vocos.val.txt`
-- Generated Vocos config: `/export/eingerman/audio/vocoder/vocos-kokoro-24khz.yaml`
-
-## Vocos Training
-- Install Vocos training dependencies:
-  - `uv pip install -r third_party/vocos/requirements-train.txt`
-- Train with generated config:
-  - `uv run python third_party/vocos/train.py -c /export/eingerman/audio/vocoder/vocos-kokoro-24khz.yaml`
-- Repo copy of config is also available at:
-  - `configs/vocos-kokoro-24khz.yaml`
-
-## Kokoro Decoder Distillation Training (`kokoro/train_vocos.py`)
-- Use this script for paired Kokoro vocoder-input -> waveform distillation training.
-- Current generator objective is:
-  - `L_total = L_GAN + L_FM + L_MR-STFT + L_GroupDelay` (weighted sum)
-  - GAN term uses MPD + MRD adversarial outputs
-  - Feature-matching term uses MPD + MRD feature maps
-  - Spectral term uses multi-resolution STFT loss
-  - Group-delay term uses multi-resolution STFT phase-derivative alignment to reduce phase errors
-- Default objective weights (literature-style):
-  - `--gan-loss-coeff 1.0`
-  - `--fm-loss-coeff 2.0`
-  - `--mrstft-loss-coeff 45.0`
-  - `--group-delay-loss-coeff 2.0`
-  - `--mrd-loss-coeff 1.0` (scales MRD branch contribution inside GAN/FM terms)
-- Dynamic weighting behavior:
-  - `--pretrain-mel-steps` is used as adversarial warmup boundary (name kept for compatibility)
-  - GAN/FM are zero before warmup, then linearly ramp up
-  - MR-STFT and GroupDelay coefficients decay over training to `mrstft_final_ratio * base_coeff`
-  - Control decay endpoint with `--mrstft-final-ratio` (default `0.25`)
-- TensorBoard logs include separate raw and weighted loss parts:
-  - `train/gen_gan_raw`, `train/gen_feat_match_raw`, `train/gen_mrstft_raw`
-  - `train/gen_group_delay_raw`
-  - `train/gen_gan_weighted`, `train/gen_feat_match_weighted`, `train/gen_mrstft_weighted`
-  - `train/gen_group_delay_weighted`
-  - `train/weight_gan`, `train/weight_feat_match`, `train/weight_mrstft`, `train/weight_group_delay`
-  - `train/steps_per_sec`, `train/cuda_mem_gb`
-- Audio sample logging:
-  - Uses 5 cached preview samples by default from `af_bella,af_nicole,af_heart`
-  - Controlled by `--sample-voices`, `--sample-count`, `--sample-max-frames`
-
-### Performance/Throughput Parameters (single-GPU focus)
-- Precision/backend:
-  - `--precision {auto,fp32,fp16,bf16}`
-  - `--tf32` (enable TensorFloat-32 matmul/cuDNN on supported NVIDIA GPUs)
-- Data pipeline:
-  - `--num-workers`
-  - `--prefetch-factor`
-  - DataLoader uses persistent workers when worker count > 0
-- Logging overhead control:
-  - `--log-every` (scalar logging frequency)
-
-### Example (optimized 24GB GPU run)
-- `uv run python -m kokoro.train_vocos --data-root /export/eingerman/audio/vocoder --precision auto --tf32 --num-workers 8 --prefetch-factor 4 --log-every 20`
-
-## Config Alignment Requirements
-- Keep Vocos settings aligned to Kokoro/iSTFTNet output:
-  - `sample_rate: 24000`
-  - `hop_length: 300` (derived from Kokoro upsampling stack)
-  - `n_mels: 80`
-  - `n_fft: 1200`
+## Implementation Guardrails
+- Keep decoder migration modular so A/B baselines remain reproducible.
+- Do not silently switch checkpoint/key conventions; make format assumptions explicit.
+- If touching TF mapping logic, update `kokoro/tf/checkpoint_utils.py` and validate with:
+  - `uv run python -m py_compile kokoro/tf/*.py`
+  - `uv run python -m kokoro.tf.convert --help`
+  - `uv run python -m kokoro.tf.validate_quant --help`
+  - `uv run python -m kokoro.tf.export --help`

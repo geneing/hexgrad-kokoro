@@ -57,7 +57,26 @@ Examples:
      --skip-export --skip-qat \
      --output-dir output/tf_litert
 
-5) Force weight-only int8 export (quality-first)
+5) Validation with chunked inference settings aligned to PT chunk semantics
+   uv run python -m kokoro.tf.export \
+     --pytorch-checkpoint output/checkpoints/last.pt \
+     --data-root inputs \
+     --train-filelist inputs/filelists/vocos.train.txt \
+     --val-filelist inputs/filelists/vocos.val.txt \
+     --stream-chunk-size-ms 300 \
+     --stream-padding-ms 40 \
+     --output-dir output/tf_litert_chunked
+
+6) Disable chunked validation inference and use full-window inference
+   uv run python -m kokoro.tf.export \
+     --pytorch-checkpoint output/checkpoints/last.pt \
+     --data-root inputs \
+     --train-filelist inputs/filelists/vocos.train.txt \
+     --val-filelist inputs/filelists/vocos.val.txt \
+     --no-validation-chunked-inference \
+     --output-dir output/tf_litert_full_forward
+
+7) Force weight-only int8 export (quality-first)
    uv run python -m kokoro.tf.export \
      --pytorch-checkpoint output/checkpoints/last.pt \
      --data-root inputs \
@@ -66,7 +85,7 @@ Examples:
      --int8-recipe weight_only \
      --output-dir output/tf_litert_weight_only
 
-6) Force static-core int8 export (NPU-friendly)
+8) Force static-core int8 export (NPU-friendly)
    uv run python -m kokoro.tf.export \
      --pytorch-checkpoint output/checkpoints/last.pt \
      --data-root inputs \
@@ -75,7 +94,7 @@ Examples:
      --int8-recipe static \
      --output-dir output/tf_litert_static
 
-7) Force mixed-core int8 export (preferred for quality/perf balance)
+9) Force mixed-core int8 export (preferred for quality/perf balance)
    uv run python -m kokoro.tf.export \
      --pytorch-checkpoint output/checkpoints/last.pt \
      --data-root inputs \
@@ -86,6 +105,8 @@ Examples:
 
 Notes:
 - Fixed-frame export is enforced at 520 frames (input shape [1, 642, 520]).
+- Validation supports chunked inference over full-length features using a
+  cache-window decode path (`--validation-chunked-inference`, default on).
 - Quantization split mirrors PyTorch flow:
   - Float pre blocks: conditioner + embed + input norm
   - Quantized core: ConvNeXt stack
@@ -122,6 +143,7 @@ from ai_edge_quantizer.utils import tfl_interpreter_utils
 from loguru import logger
 
 from .checkpoint_utils import (
+    build_feature_from_pair_payload,
     build_tf_export_generator,
     infer_tf_generator_config,
     load_pytorch_generator_state,
@@ -199,6 +221,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dump-intermediates", action="store_true")
     parser.add_argument("--intermediate-max-tensors", type=int, default=192)
+    parser.add_argument("--validation-chunked-inference", dest="validation_chunked_inference", action="store_true")
+    parser.add_argument("--no-validation-chunked-inference", dest="validation_chunked_inference", action="store_false")
+    parser.set_defaults(validation_chunked_inference=True)
+    parser.add_argument("--stream-chunk-size-ms", type=int, default=300)
+    parser.add_argument("--stream-padding-ms", type=int, default=40)
 
     parser.add_argument("--skip-qat", action="store_true")
     parser.add_argument("--skip-export", action="store_true")
@@ -333,6 +360,19 @@ def _load_fixed_feature_and_target_audio(
     s = start * hop_length
     t = _repeat_pad_1d(wav[s : s + target_len], target_len).astype(np.float32)
     return feat, t
+
+
+def _load_full_feature_and_target_audio(
+    pair_path: Path,
+    wav_path: Path,
+    sample_rate: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    pair = torch.load(pair_path, map_location="cpu", weights_only=False)
+    feat = build_feature_from_pair_payload(pair).astype(np.float32, copy=False)
+    wav, sr = _read_wav_mono(wav_path)
+    if sr != sample_rate:
+        raise RuntimeError(f"Unexpected sample rate {sr} for {wav_path}; expected {sample_rate}")
+    return feat, wav.astype(np.float32, copy=False)
 
 
 class FixedFrameTrainLoader:
@@ -991,6 +1031,73 @@ def _metrics(pred: np.ndarray, target: np.ndarray) -> dict[str, float]:
     return {"samples": float(n), "mae": mae, "rmse": rmse, "corr": corr}
 
 
+def _compute_streaming_window(
+    *,
+    backbone_layers: int,
+    n_fft: int,
+    hop_length: int,
+    sample_rate: int,
+    chunk_size_ms: int,
+    padding_ms: int,
+) -> tuple[int, int]:
+    requested_chunk = max(1, int(chunk_size_ms / 1000.0 * sample_rate / hop_length))
+    requested_padding = max(0, int(padding_ms / 1000.0 * sample_rate / hop_length))
+    receptive_frames = 9 + 6 * int(backbone_layers)
+    istft_half_frames = max(1, int(round((n_fft / float(hop_length)) / 2.0)))
+    min_padding = int(math.ceil((receptive_frames - 1) / 2.0)) + istft_half_frames
+    min_chunk = max(receptive_frames, 2 * min_padding)
+    return max(requested_chunk, min_chunk), max(requested_padding, min_padding)
+
+
+def _run_tflite_chunked(
+    model_path: Path,
+    features_bct: np.ndarray,
+    *,
+    chunk_size: int,
+    padding: int,
+    hop_length: int,
+) -> np.ndarray:
+    feat = np.asarray(features_bct, dtype=np.float32)
+    if feat.ndim != 2:
+        raise ValueError(f"Expected features [C,T], got shape={feat.shape}")
+    ch, total_frames = feat.shape
+    if total_frames <= 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    cache = np.zeros((ch, int(chunk_size + 2 * padding)), dtype=np.float32)
+    cur_idx = -1
+    chunks: list[np.ndarray] = []
+
+    def _get_size(idx: int) -> int:
+        effective_size = idx + 1 - int(padding)
+        if effective_size <= 0:
+            return 0
+        return effective_size % int(chunk_size) or int(chunk_size)
+
+    for idx in range(total_frames):
+        cache = np.roll(cache, shift=-1, axis=1)
+        cache[:, -1] = feat[:, idx]
+        cur_idx += 1
+
+        is_last = idx == (total_frames - 1)
+        cur_size = _get_size(cur_idx)
+        if cur_size != int(chunk_size) and not is_last:
+            continue
+
+        audio = _run_tflite(model_path, cache).astype(np.float32, copy=False)
+        if int(padding) > 0:
+            audio = audio[int(padding) * int(hop_length) :]
+        if cur_size != int(chunk_size):
+            audio = audio[(int(chunk_size) - cur_size) * int(hop_length) :]
+        if not is_last:
+            audio = audio[: int(chunk_size) * int(hop_length)]
+        chunks.append(audio)
+
+    if not chunks:
+        return np.zeros((0,), dtype=np.float32)
+    return np.concatenate(chunks, axis=0).astype(np.float32, copy=False)
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -1280,21 +1387,65 @@ def main() -> None:
     if args.skip_validation:
         return
 
+    chunk_cfg: dict[str, int] | None = None
+    if args.validation_chunked_inference:
+        chunk_frames, padding_frames = _compute_streaming_window(
+            backbone_layers=cfg.backbone_layers,
+            n_fft=cfg.n_fft,
+            hop_length=cfg.hop_length,
+            sample_rate=args.sample_rate,
+            chunk_size_ms=args.stream_chunk_size_ms,
+            padding_ms=args.stream_padding_ms,
+        )
+        window_frames = int(chunk_frames + 2 * padding_frames)
+        if window_frames > int(args.fixed_frames):
+            raise ValueError(
+                "Chunked validation window exceeds exported fixed frame size: "
+                f"chunk={chunk_frames}, padding={padding_frames}, window={window_frames}, "
+                f"fixed_frames={args.fixed_frames}. Increase --fixed-frames or reduce chunk/padding."
+            )
+        chunk_cfg = {"chunk_frames": int(chunk_frames), "padding_frames": int(padding_frames)}
+        logger.info(
+            "Validation chunked inference enabled: "
+            f"chunk_frames={chunk_frames}, padding_frames={padding_frames}, "
+            f"window_frames={window_frames}, hop={args.hop_length}"
+        )
+    else:
+        logger.info("Validation uses full-window fixed-frame inference (chunked inference disabled).")
+
     val_items = _build_val_items(val_filelist, args.num_val_samples)
     rows: list[dict[str, object]] = []
     for item in val_items:
-        feat, target = _load_fixed_feature_and_target_audio(
-            pair_path=item.pair_path,
-            wav_path=item.wav_path,
-            fixed_frames=args.fixed_frames,
-            hop_length=args.hop_length,
-            sample_rate=args.sample_rate,
-            start_frame=0,
-        )
+        if chunk_cfg is None:
+            feat, target = _load_fixed_feature_and_target_audio(
+                pair_path=item.pair_path,
+                wav_path=item.wav_path,
+                fixed_frames=args.fixed_frames,
+                hop_length=args.hop_length,
+                sample_rate=args.sample_rate,
+                start_frame=0,
+            )
+        else:
+            feat, target = _load_full_feature_and_target_audio(
+                pair_path=item.pair_path,
+                wav_path=item.wav_path,
+                sample_rate=args.sample_rate,
+            )
         preds: dict[str, np.ndarray] = {}
         for variant, model_path in (("fp32", fp32_path), ("fp16", fp16_path), ("int8", int8_path)):
-            pred = _run_tflite(model_path, feat).astype(np.float32)
-            pred = pred[: args.fixed_frames * args.hop_length]
+            if chunk_cfg is None:
+                pred = _run_tflite(model_path, feat).astype(np.float32)
+                pred = pred[: args.fixed_frames * args.hop_length]
+            else:
+                pred = _run_tflite_chunked(
+                    model_path,
+                    feat,
+                    chunk_size=chunk_cfg["chunk_frames"],
+                    padding=chunk_cfg["padding_frames"],
+                    hop_length=args.hop_length,
+                )
+                expected_samples = int(feat.shape[-1] * args.hop_length)
+                pred = pred[:expected_samples]
             out_wav = val_out_dir / variant / f"{item.index:02d}_{item.wav_path.stem}_{variant}.wav"
             save_wav_16bit(out_wav, pred, sample_rate=args.sample_rate)
             preds[variant] = pred
@@ -1360,6 +1511,17 @@ def main() -> None:
         "num_samples": len(val_items),
         "variants": ["fp32", "fp16", "int8"],
         "metrics_csv": str(csv_path),
+        "chunked_inference": bool(chunk_cfg is not None),
+        "chunking": (
+            {
+                "chunk_frames": int(chunk_cfg["chunk_frames"]),
+                "padding_frames": int(chunk_cfg["padding_frames"]),
+                "chunk_size_ms": int(args.stream_chunk_size_ms),
+                "padding_ms": int(args.stream_padding_ms),
+            }
+            if chunk_cfg is not None
+            else None
+        ),
         "summary": summary,
     }
     (val_out_dir / "summary.json").write_text(json.dumps(summary_json, indent=2), encoding="utf-8")

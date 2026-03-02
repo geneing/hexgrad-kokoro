@@ -7,7 +7,7 @@ Default decoder backend:
 - `--vocos-impl streaming` (from `warisqr007/vocos`)
 
 Example (streaming training):
-`uv run python -m kokoro.train_vocos --data-root /export/eingerman/audio/vocoder --vocos-impl streaming --streaming-vocos-repo third_party/vocos_streaming`
+`uv run python -m kokoro.train_vocos --data-root inputs/ --vocos-impl streaming --streaming-vocos-repo third_party/vocos_streaming`
 """
 
 from __future__ import annotations

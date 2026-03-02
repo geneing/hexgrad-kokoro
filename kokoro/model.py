@@ -126,14 +126,19 @@ class KModel(torch.nn.Module):
                 backbone_layers=int(vocos_cfg.get('backbone_layers', 8)),
                 n_fft=int(vocos_cfg.get('n_fft', 1200)),
                 hop_length=int(vocos_cfg.get('hop_length', 300)),
-                padding=str(vocos_cfg.get('padding', 'same')),
                 checkpoint_path=vocos_cfg.get('checkpoint_path'),
+                vocos_impl=str(vocos_cfg.get('vocos_impl', 'auto')),
+                streaming_vocos_repo=vocos_cfg.get('streaming_vocos_repo', 'third_party/vocos_streaming'),
+                backbone_causal=bool(vocos_cfg.get('backbone_causal', True)),
+                backbone_pad_mode=str(vocos_cfg.get('backbone_pad_mode', 'constant')),
+                backbone_norm=str(vocos_cfg.get('backbone_norm', 'weight_norm')),
             )
+            if not use_streaming:
+                decoder_kwargs["padding"] = str(vocos_cfg.get('padding', 'same'))
             if use_streaming:
                 decoder_kwargs.update(
                     sample_rate=int(vocos_cfg.get('sample_rate', 24000)),
                     chunk_size_ms=int(vocos_cfg.get('chunk_size_ms', 300)),
-                    padding_ms=int(vocos_cfg.get('padding_ms', 40)),
                 )
             self.decoder = decoder_cls(**decoder_kwargs)
         elif self.decoder_type == 'tf_vocos':
@@ -148,14 +153,19 @@ class KModel(torch.nn.Module):
                 backbone_layers=int(vocos_cfg.get('backbone_layers', 8)),
                 n_fft=int(vocos_cfg.get('n_fft', 1200)),
                 hop_length=int(vocos_cfg.get('hop_length', 300)),
-                padding=str(vocos_cfg.get('padding', 'same')),
                 checkpoint_path=vocos_cfg.get('checkpoint_path'),
+                vocos_impl=str(vocos_cfg.get('vocos_impl', 'auto')),
+                streaming_vocos_repo=vocos_cfg.get('streaming_vocos_repo', 'third_party/vocos_streaming'),
+                backbone_causal=bool(vocos_cfg.get('backbone_causal', True)),
+                backbone_pad_mode=str(vocos_cfg.get('backbone_pad_mode', 'constant')),
+                backbone_norm=str(vocos_cfg.get('backbone_norm', 'weight_norm')),
             )
+            if not use_streaming:
+                decoder_kwargs["padding"] = str(vocos_cfg.get('padding', 'same'))
             if use_streaming:
                 decoder_kwargs.update(
                     sample_rate=int(vocos_cfg.get('sample_rate', 24000)),
                     chunk_size_ms=int(vocos_cfg.get('chunk_size_ms', 300)),
-                    padding_ms=int(vocos_cfg.get('padding_ms', 40)),
                 )
             self.decoder = decoder_cls(**decoder_kwargs)
         else:

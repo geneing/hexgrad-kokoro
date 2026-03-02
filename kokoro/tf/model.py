@@ -64,6 +64,11 @@ def _to_channels_last(x: tf.Tensor) -> tf.Tensor:
     return tf.transpose(x, [0, 2, 1])
 
 
+def _to_channels_first(x: tf.Tensor) -> tf.Tensor:
+    # [B, T, C] -> [B, C, T]
+    return tf.transpose(x, [0, 2, 1])
+
+
 def _repeat_pad_1d(x: tf.Tensor, target_length: int) -> tf.Tensor:
     x = tf.convert_to_tensor(x, dtype=tf.float32)
     if target_length <= 0:
@@ -112,12 +117,60 @@ def _repeat_pad_2d(x: tf.Tensor, target_length: int) -> tf.Tensor:
     )
 
 
-class ConvNeXtBlockTF(tf.keras.layers.Layer):
-    """ConvNeXt block used by Vocos backbone."""
+class CausalConv1DTF(tf.keras.layers.Layer):
+    """Causal Conv1D wrapper matching streaming-vocos non-streaming padding behavior."""
 
-    def __init__(self, dim: int, intermediate_dim: int, layer_scale_init_value: float, **kwargs):
+    def __init__(
+        self,
+        filters: int,
+        kernel_size: int,
+        strides: int = 1,
+        dilation_rate: int = 1,
+        groups: int = 1,
+        use_bias: bool = True,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
-        self.dwconv = tf.keras.layers.DepthwiseConv1D(kernel_size=7, padding="same", depthwise_initializer=_KERNEL_INIT)
+        self.filters = int(filters)
+        self.kernel_size = int(kernel_size)
+        self.strides = int(strides)
+        self.dilation_rate = int(dilation_rate)
+        self.groups = int(groups)
+        self.use_bias = bool(use_bias)
+        self.conv = tf.keras.layers.Conv1D(
+            filters=self.filters,
+            kernel_size=self.kernel_size,
+            strides=self.strides,
+            padding="valid",
+            dilation_rate=self.dilation_rate,
+            groups=self.groups,
+            use_bias=self.use_bias,
+            kernel_initializer=_KERNEL_INIT,
+            bias_initializer="zeros",
+        )
+
+    @property
+    def _effective_kernel_size(self) -> int:
+        return (self.kernel_size - 1) * self.dilation_rate + 1
+
+    def call(self, x_bct: tf.Tensor, training: bool = False) -> tf.Tensor:
+        x = _to_channels_last(tf.convert_to_tensor(x_bct))
+        t = tf.shape(x)[1]
+        padding_total = self._effective_kernel_size - self.strides
+        numer = t - self._effective_kernel_size + padding_total
+        rem = tf.math.floormod(numer, self.strides)
+        extra_padding = tf.math.floormod(self.strides - rem, self.strides)
+        x = tf.pad(x, [[0, 0], [padding_total, extra_padding], [0, 0]])
+        y = self.conv(x, training=training)
+        return _to_channels_first(y)
+
+
+class ConvNeXtBlockTF(tf.keras.layers.Layer):
+    """Streaming-causal ConvNeXt block used by Vocos backbone."""
+
+    def __init__(self, dim: int, intermediate_dim: int, layer_scale_init_value: float, kernel_size: int = 7, **kwargs):
+        super().__init__(**kwargs)
+        self.dwconv = CausalConv1DTF(filters=dim, kernel_size=kernel_size, groups=dim)
         self.norm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
         self.pwconv1 = tf.keras.layers.Dense(intermediate_dim, kernel_initializer=_KERNEL_INIT)
         self.act = tf.keras.layers.Activation("gelu")
@@ -136,20 +189,22 @@ class ConvNeXtBlockTF(tf.keras.layers.Layer):
             )
         super().build(input_shape)
 
-    def call(self, x: tf.Tensor, training: bool = False) -> tf.Tensor:
-        residual = x
-        y = self.dwconv(x, training=training)
+    def call(self, x_bct: tf.Tensor, training: bool = False) -> tf.Tensor:
+        residual = x_bct
+        y = self.dwconv(x_bct, training=training)
+        y = _to_channels_last(y)
         y = self.norm(y, training=training)
         y = self.pwconv1(y, training=training)
         y = self.act(y)
         y = self.pwconv2(y, training=training)
         if self.gamma is not None:
             y = y * self.gamma
+        y = _to_channels_first(y)
         return residual + y
 
 
 class VocosBackboneTF(tf.keras.layers.Layer):
-    """TensorFlow implementation of Vocos ConvNeXt backbone."""
+    """TensorFlow implementation of streaming-causal Vocos ConvNeXt backbone."""
 
     def __init__(
         self,
@@ -157,68 +212,80 @@ class VocosBackboneTF(tf.keras.layers.Layer):
         dim: int,
         intermediate_dim: int,
         num_layers: int,
+        kernel_size: int = 7,
         layer_scale_init_value: float | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.embed = tf.keras.layers.Conv1D(
-            filters=dim,
-            kernel_size=7,
-            padding="same",
-            kernel_initializer=_KERNEL_INIT,
-            bias_initializer="zeros",
-        )
+        self.input_channels = int(input_channels)
+        self.dim = int(dim)
+        self.intermediate_dim = int(intermediate_dim)
+        self.num_layers = int(num_layers)
+        self.kernel_size = int(kernel_size)
+        self.embed = CausalConv1DTF(filters=dim, kernel_size=kernel_size)
         self.norm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
         scale_init = float(layer_scale_init_value or (1.0 / max(1, num_layers)))
         self.blocks = [
-            ConvNeXtBlockTF(dim=dim, intermediate_dim=intermediate_dim, layer_scale_init_value=scale_init)
+            ConvNeXtBlockTF(
+                dim=dim,
+                intermediate_dim=intermediate_dim,
+                layer_scale_init_value=scale_init,
+                kernel_size=kernel_size,
+            )
             for _ in range(num_layers)
         ]
         self.final_layer_norm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
 
-    def call(self, x: tf.Tensor, training: bool = False) -> tf.Tensor:
-        # Input [B, T, C] -> output [B, T, H]
-        x = self.embed(x, training=training)
-        x = self.norm(x, training=training)
+    def call(self, x_bct: tf.Tensor, training: bool = False) -> tf.Tensor:
+        # Input [B, C, T] -> output [B, H, T]
+        x = self.embed(x_bct, training=training)
+        x = self.norm(_to_channels_last(x), training=training)
+        x = _to_channels_first(x)
         for block in self.blocks:
             x = block(x, training=training)
-        return self.final_layer_norm(x, training=training)
+        x = self.final_layer_norm(_to_channels_last(x), training=training)
+        return _to_channels_first(x)
 
 
 class ISTFTHeadTF(tf.keras.layers.Layer):
-    """TensorFlow ISTFT head equivalent to Vocos ISTFTHead."""
+    """TensorFlow ISTFT head equivalent to streaming-vocos ISTFT head."""
 
     def __init__(self, dim: int, n_fft: int, hop_length: int, padding: str = "same", **kwargs):
         super().__init__(**kwargs)
         self.n_fft = int(n_fft)
         self.hop_length = int(hop_length)
-        self.padding = padding
+        self.padding = str(padding)
         self.out = tf.keras.layers.Dense(self.n_fft + 2, kernel_initializer=_KERNEL_INIT, bias_initializer="zeros")
+        self.window = tf.constant(np.hanning(self.n_fft).astype(np.float32), dtype=tf.float32)
+        ola_kernel = np.zeros((self.n_fft, 1, self.n_fft), dtype=np.float32)
+        for i in range(self.n_fft):
+            ola_kernel[i, 0, i] = 1.0
+        self.ola_kernel = tf.constant(ola_kernel, dtype=tf.float32)
 
-    def call(self, x: tf.Tensor, training: bool = False) -> tf.Tensor:
-        # x: [B, T, H]
+    def call(self, x_bct: tf.Tensor, training: bool = False) -> tf.Tensor:
+        # x: [B, H, T]
+        x = _to_channels_last(x_bct)
         y = self.out(x, training=training)
         mag, phase = tf.split(y, 2, axis=-1)
-        mag = tf.exp(tf.clip_by_value(mag, -20.0, 20.0))
+        mag = tf.exp(mag)
+        mag = tf.clip_by_value(mag, clip_value_min=0.0, clip_value_max=1e2)
         real = tf.cast(mag * tf.cos(phase), tf.float32)
         imag = tf.cast(mag * tf.sin(phase), tf.float32)
-        spec = tf.complex(real, imag)
-        audio = tf.signal.inverse_stft(
-            spec,
-            frame_length=self.n_fft,
-            frame_step=self.hop_length,
-            fft_length=self.n_fft,
-            window_fn=tf.signal.inverse_stft_window_fn(
-                frame_step=self.hop_length, forward_window_fn=tf.signal.hann_window
-            ),
+        spec = tf.complex(real, imag)  # [B, T, F]
+        ifft = tf.signal.irfft(spec, [self.n_fft])  # [B, T, N]
+        ifft = ifft * self.window[None, None, :]
+        frames = tf.shape(ifft)[1]
+        output_size = (frames - 1) * self.hop_length + self.n_fft
+        out_shape = tf.stack([tf.shape(ifft)[0], output_size, 1], axis=0)
+        ola = tf.nn.conv1d_transpose(
+            ifft,
+            filters=self.ola_kernel,
+            output_shape=out_shape,
+            strides=self.hop_length,
+            padding="VALID",
         )
-        if self.padding == "same":
-            pad = (self.n_fft - self.hop_length) // 2
-            if pad > 0:
-                audio = audio[:, pad:-pad]
-        elif self.padding != "center":
-            raise ValueError("padding must be 'same' or 'center'")
-        return audio
+        audio = ola[:, :, 0]
+        return audio[:, : frames * self.hop_length]
 
 
 class PairedVocosGeneratorTF(tf.keras.Model):
@@ -234,9 +301,19 @@ class PairedVocosGeneratorTF(tf.keras.Model):
         n_fft: int,
         hop_length: int,
         padding: str = "same",
+        backbone_kernel_size: int = 7,
         **kwargs,
     ):
         super().__init__(**kwargs)
+        self.in_channels = int(in_channels)
+        self.model_input_channels = int(model_input_channels)
+        self.backbone_dim = int(backbone_dim)
+        self.backbone_intermediate_dim = int(backbone_intermediate_dim)
+        self.backbone_layers = int(backbone_layers)
+        self.n_fft = int(n_fft)
+        self.hop_length = int(hop_length)
+        self.padding = str(padding)
+        self.backbone_kernel_size = int(backbone_kernel_size)
         self.conditioner = tf.keras.Sequential(
             [
                 tf.keras.layers.Conv1D(
@@ -269,12 +346,14 @@ class PairedVocosGeneratorTF(tf.keras.Model):
             dim=backbone_dim,
             intermediate_dim=backbone_intermediate_dim,
             num_layers=backbone_layers,
+            kernel_size=backbone_kernel_size,
         )
         self.head = ISTFTHeadTF(dim=backbone_dim, n_fft=n_fft, hop_length=hop_length, padding=padding)
 
     def call(self, features_bct: tf.Tensor, training: bool = False) -> tf.Tensor:
         x = _to_channels_last(features_bct)
         x = self.conditioner(x, training=training)
+        x = _to_channels_first(x)
         x = self.backbone(x, training=training)
         return self.head(x, training=training)
 
@@ -288,8 +367,6 @@ class ExportSafeISTFTHeadTF(tf.keras.layers.Layer):
         self.hop_length = int(hop_length)
         self.fixed_frames = int(fixed_frames)
         self.padding = padding
-        if self.padding not in {"same", "center"}:
-            raise ValueError("padding must be 'same' or 'center'")
         self.out = tf.keras.layers.Dense(self.n_fft + 2, kernel_initializer=_KERNEL_INIT, bias_initializer="zeros")
 
         num_bins = self.n_fft // 2 + 1
@@ -306,29 +383,8 @@ class ExportSafeISTFTHeadTF(tf.keras.layers.Layer):
             ola_kernel[i, 0, i] = 1.0
         self.ola_kernel = tf.constant(ola_kernel, dtype=tf.float32)  # [K, out_ch, in_ch]
 
-        self._pad = (self.n_fft - self.hop_length) // 2 if self.padding == "same" else 0
         self.output_size = (self.fixed_frames - 1) * self.hop_length + self.n_fft
-        self.trimmed_size = self.output_size - (2 * self._pad)
-        self.envelope = tf.constant(
-            self._precompute_envelope(
-                n_fft=self.n_fft,
-                hop_length=self.hop_length,
-                frames=self.fixed_frames,
-                pad=self._pad,
-            ),
-            dtype=tf.float32,
-        )  # [trimmed_size]
-
-    @staticmethod
-    def _precompute_envelope(n_fft: int, hop_length: int, frames: int, pad: int) -> np.ndarray:
-        w2 = np.hanning(n_fft).astype(np.float32) ** 2
-        out = np.zeros((frames - 1) * hop_length + n_fft, dtype=np.float32)
-        for t in range(frames):
-            s = t * hop_length
-            out[s : s + n_fft] += w2
-        if pad > 0:
-            out = out[pad:-pad]
-        return np.maximum(out, 1e-11).astype(np.float32)
+        self.trimmed_size = self.fixed_frames * self.hop_length
 
     def _irfft_real(self, real: tf.Tensor, imag: tf.Tensor) -> tf.Tensor:
         # real/imag: [B, T, F], with F = n_fft//2 + 1
@@ -340,11 +396,13 @@ class ExportSafeISTFTHeadTF(tf.keras.layers.Layer):
         inner = inner - tf.einsum("btk,nk->btn", imag_mid, self.sin_basis)
         return (dc + nyquist + (2.0 * inner)) / float(self.n_fft)  # [B, T, N]
 
-    def call(self, x: tf.Tensor, training: bool = False) -> tf.Tensor:
-        # x: [B, T, H], with T assumed fixed to self.fixed_frames for export.
+    def call(self, x_bct: tf.Tensor, training: bool = False) -> tf.Tensor:
+        # x: [B, H, T], with T assumed fixed to self.fixed_frames for export.
+        x = _to_channels_last(x_bct)
         y = self.out(x, training=training)
         mag, phase = tf.split(y, 2, axis=-1)  # [B, T, F]
-        mag = tf.exp(tf.clip_by_value(mag, -20.0, 20.0))
+        mag = tf.exp(mag)
+        mag = tf.clip_by_value(mag, clip_value_min=0.0, clip_value_max=1e2)
         real = tf.cast(mag * tf.cos(phase), tf.float32)
         imag = tf.cast(mag * tf.sin(phase), tf.float32)
 
@@ -361,9 +419,7 @@ class ExportSafeISTFTHeadTF(tf.keras.layers.Layer):
             padding="VALID",
         )  # [B, output_size, 1]
         audio = ola[:, :, 0]
-        if self._pad > 0:
-            audio = audio[:, self._pad : (self.output_size - self._pad)]
-        return audio / self.envelope[None, :]
+        return audio[:, : self.trimmed_size]
 
 
 class PairedVocosGeneratorExportTF(tf.keras.Model):
@@ -380,9 +436,19 @@ class PairedVocosGeneratorExportTF(tf.keras.Model):
         hop_length: int,
         fixed_frames: int = DEFAULT_FIXED_FRAMES,
         padding: str = "same",
+        backbone_kernel_size: int = 7,
         **kwargs,
     ):
         super().__init__(**kwargs)
+        self.in_channels = int(in_channels)
+        self.model_input_channels = int(model_input_channels)
+        self.backbone_dim = int(backbone_dim)
+        self.backbone_intermediate_dim = int(backbone_intermediate_dim)
+        self.backbone_layers = int(backbone_layers)
+        self.n_fft = int(n_fft)
+        self.hop_length = int(hop_length)
+        self.padding = str(padding)
+        self.backbone_kernel_size = int(backbone_kernel_size)
         self.fixed_frames = int(fixed_frames)
         self.conditioner = tf.keras.Sequential(
             [
@@ -416,6 +482,7 @@ class PairedVocosGeneratorExportTF(tf.keras.Model):
             dim=backbone_dim,
             intermediate_dim=backbone_intermediate_dim,
             num_layers=backbone_layers,
+            kernel_size=backbone_kernel_size,
         )
         self.head = ExportSafeISTFTHeadTF(
             dim=backbone_dim,
@@ -429,6 +496,7 @@ class PairedVocosGeneratorExportTF(tf.keras.Model):
         # Fixed-frame export path: [B, C, 520] -> [B, 520 * hop]
         x = _to_channels_last(features_bct)
         x = self.conditioner(x, training=training)
+        x = _to_channels_first(x)
         x = self.backbone(x, training=training)
         return self.head(x, training=training)
 
@@ -458,8 +526,10 @@ class FloatPreBlocksTF(tf.keras.Model):
     def call(self, features_bct: tf.Tensor, training: bool = False) -> tf.Tensor:
         x = _to_channels_last(features_bct)
         x = self.conditioner(x, training=training)
+        x = _to_channels_first(x)
         x = self.embed(x, training=training)
-        x = self.norm(x, training=training)
+        x = self.norm(_to_channels_last(x), training=training)
+        x = _to_channels_first(x)
         return x
 
 
@@ -472,7 +542,8 @@ class FloatPostBlocksTF(tf.keras.Model):
         self.head = export_generator.head
 
     def call(self, x: tf.Tensor, training: bool = False) -> tf.Tensor:
-        x = self.final_layer_norm(x, training=training)
+        x = self.final_layer_norm(_to_channels_last(x), training=training)
+        x = _to_channels_first(x)
         return self.head(x, training=training)
 
 
