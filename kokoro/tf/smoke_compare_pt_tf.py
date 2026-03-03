@@ -6,8 +6,8 @@ same paired conditioning features (`asr`, `f0`, `noise`, `style`) through:
    - PyTorch generator (from checkpoint)
    - TensorFlow generator loaded from same checkpoint via mapping utilities
 2) Optional chunked streaming inference comparison:
-   - PT side uses corrected cache-window chunked decoding
-   - TF side uses the same corrected cache-window chunked decoding
+   - PT side uses conditioner-once + chunked backbone+head decoding
+   - TF side uses the same conditioner-once + chunked backbone+head decoding
 
 What it checks:
 - Waveform-level parity metrics: max_abs, MAE, RMSE, correlation.
@@ -46,8 +46,7 @@ Examples:
    uv run python -m kokoro.tf.smoke_compare_pt_tf \
      --pytorch-checkpoint output/checkpoints/last.pt \
      --pairs-root inputs/pairs \
-     --stream-chunk-size-ms 200 \
-     --stream-padding-ms 40
+     --stream-chunk-size-ms 200
 
 4) Stricter thresholds and artifact export
    uv run python -m kokoro.tf.smoke_compare_pt_tf \
@@ -71,7 +70,6 @@ from __future__ import annotations
 import argparse
 import math
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 import tensorflow as tf
@@ -114,7 +112,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-compare-streaming-chunked", dest="compare_streaming_chunked", action="store_false")
     parser.set_defaults(compare_streaming_chunked=True)
     parser.add_argument("--stream-chunk-size-ms", type=int, default=300)
-    parser.add_argument("--stream-padding-ms", type=int, default=40)
+    parser.add_argument(
+        "--stream-padding-ms",
+        type=int,
+        default=40,
+        help="Deprecated/ignored. Chunking now uses conditioner-once + backbone/head chunking semantics.",
+    )
     parser.add_argument(
         "--vocos-impl",
         type=str,
@@ -201,70 +204,92 @@ def _compute_metrics(a: np.ndarray, b: np.ndarray) -> dict[str, float]:
     }
 
 
-def _compute_streaming_window(
-    *,
-    backbone_layers: int,
-    n_fft: int,
-    hop_length: int,
-    sample_rate: int,
-    chunk_size_ms: int,
-    padding_ms: int,
-) -> tuple[int, int]:
-    requested_chunk = max(1, int(chunk_size_ms / 1000.0 * sample_rate / hop_length))
-    requested_padding = max(0, int(padding_ms / 1000.0 * sample_rate / hop_length))
-    receptive_frames = 9 + 6 * int(backbone_layers)
-    istft_half_frames = max(1, int(round((n_fft / float(hop_length)) / 2.0)))
-    min_padding = int(math.ceil((receptive_frames - 1) / 2.0)) + istft_half_frames
-    min_chunk = max(receptive_frames, 2 * min_padding)
-    return max(requested_chunk, min_chunk), max(requested_padding, min_padding)
+def _stream_chunk_frames(*, sample_rate: int, hop_length: int, chunk_size_ms: int) -> int:
+    return max(1, int(chunk_size_ms / 1000.0 * sample_rate / hop_length))
 
 
-def _streaming_decode_features(
-    features: torch.Tensor,
-    *,
-    chunk_size: int,
-    padding: int,
-    hop_length: int,
-    run_decode: Callable[[torch.Tensor], torch.Tensor],
-) -> torch.Tensor:
+def _split_full_and_tail(features: torch.Tensor, chunk_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     if features.ndim != 3:
         raise ValueError(f"Expected [B,C,T], got {tuple(features.shape)}")
     bsz, ch, total_frames = features.shape
-    if total_frames <= 0:
-        return torch.empty((bsz, 0), dtype=features.dtype, device=features.device)
+    n_full = int(total_frames // int(chunk_size))
+    tail = int(total_frames - n_full * int(chunk_size))
+    if n_full > 0:
+        full = features[:, :, : n_full * int(chunk_size)]
+        full = full.reshape(bsz, ch, n_full, int(chunk_size)).permute(0, 2, 1, 3).reshape(bsz * n_full, ch, int(chunk_size))
+    else:
+        full = features.new_empty((0, ch, int(chunk_size)))
+    tail_chunk = features[:, :, -tail:] if tail > 0 else features.new_empty((0, ch, 0))
+    return full, tail_chunk
 
-    cache = torch.zeros((bsz, ch, chunk_size + 2 * padding), dtype=features.dtype, device=features.device)
-    cur_idx = -1
-    chunks: list[torch.Tensor] = []
 
-    def _get_size(idx: int) -> int:
-        effective_size = idx + 1 - padding
-        if effective_size <= 0:
-            return 0
-        return effective_size % chunk_size or chunk_size
+def _streaming_decode_conditioned_pt(
+    model: torch.nn.Module,
+    features: torch.Tensor,
+    *,
+    chunk_size: int,
+    hop_length: int,
+) -> torch.Tensor:
+    if features.ndim != 3:
+        raise ValueError(f"Expected [B,C,T], got {tuple(features.shape)}")
+    with torch.inference_mode():
+        conditioned = model.conditioner(features)
+        bsz = int(conditioned.shape[0])
+        full, tail = _split_full_and_tail(conditioned, int(chunk_size))
+        outs: list[torch.Tensor] = []
+        if full.shape[0] > 0:
+            y = model.head(model.backbone(full))
+            if y.ndim == 3 and y.shape[1] == 1:
+                y = y[:, 0, :]
+            y = y.reshape(bsz, -1, y.shape[-1]).reshape(bsz, -1)
+            outs.append(y)
+        if tail.shape[0] > 0:
+            y_tail = model.head(model.backbone(tail))
+            if y_tail.ndim == 3 and y_tail.shape[1] == 1:
+                y_tail = y_tail[:, 0, :]
+            tail_samples = int(tail.shape[-1]) * int(hop_length)
+            outs.append(y_tail[:, :tail_samples])
+        if not outs:
+            return features.new_empty((bsz, 0))
+        return torch.cat(outs, dim=-1)
 
-    for idx, frame in enumerate(torch.unbind(features, dim=2)):
-        cache = torch.roll(cache, shifts=-1, dims=2)
-        cache[:, :, -1] = frame
-        cur_idx += 1
 
-        is_last_feature = idx == (total_frames - 1)
-        cur_size = _get_size(cur_idx)
-        if cur_size != chunk_size and not is_last_feature:
-            continue
+def _streaming_decode_conditioned_tf(
+    model: tf.keras.Model,
+    features: torch.Tensor,
+    *,
+    chunk_size: int,
+    hop_length: int,
+) -> torch.Tensor:
+    if features.ndim != 3:
+        raise ValueError(f"Expected [B,C,T], got {tuple(features.shape)}")
+    device = features.device
+    dtype = features.dtype
+    feat_np = features.detach().cpu().numpy().astype(np.float32, copy=False)
+    feat_tf = tf.convert_to_tensor(feat_np, dtype=tf.float32)
+    conditioned = tf.transpose(model.conditioner(tf.transpose(feat_tf, [0, 2, 1]), training=False), [0, 2, 1]).numpy()
+    cond_t = torch.from_numpy(conditioned).to(device=device, dtype=dtype)
+    bsz = int(cond_t.shape[0])
+    full, tail = _split_full_and_tail(cond_t, int(chunk_size))
+    outs: list[torch.Tensor] = []
 
-        audio = run_decode(cache)
-        if padding > 0:
-            audio = audio[:, padding * hop_length :]
-        if cur_size != chunk_size:
-            audio = audio[:, (chunk_size - cur_size) * hop_length :]
-        if not is_last_feature:
-            audio = audio[:, : chunk_size * hop_length]
-        chunks.append(audio)
-
-    if not chunks:
-        return torch.empty((bsz, 0), dtype=features.dtype, device=features.device)
-    return torch.cat(chunks, dim=-1)
+    if full.shape[0] > 0:
+        full_np = full.detach().cpu().numpy().astype(np.float32, copy=False)
+        h_np = model.backbone(tf.convert_to_tensor(full_np, dtype=tf.float32), training=False)
+        y_np = model.head(h_np, training=False).numpy()
+        y = torch.from_numpy(y_np).to(device=device, dtype=dtype)
+        y = y.reshape(bsz, -1, y.shape[-1]).reshape(bsz, -1)
+        outs.append(y)
+    if tail.shape[0] > 0:
+        tail_np = tail.detach().cpu().numpy().astype(np.float32, copy=False)
+        h_tail = model.backbone(tf.convert_to_tensor(tail_np, dtype=tf.float32), training=False)
+        y_tail_np = model.head(h_tail, training=False).numpy()
+        y_tail = torch.from_numpy(y_tail_np).to(device=device, dtype=dtype)
+        tail_samples = int(tail.shape[-1]) * int(hop_length)
+        outs.append(y_tail[:, :tail_samples])
+    if not outs:
+        return torch.empty((bsz, 0), dtype=dtype, device=device)
+    return torch.cat(outs, dim=-1)
 
 
 def _plot_waveforms(
@@ -385,39 +410,28 @@ def main() -> None:
     pt_audio_stream_np: np.ndarray | None = None
     tf_audio_stream_np: np.ndarray | None = None
     if args.compare_streaming_chunked:
-        chunk_size_cache, padding = _compute_streaming_window(
-            backbone_layers=cfg.backbone_layers,
-            n_fft=cfg.n_fft,
-            hop_length=cfg.hop_length,
+        chunk_size_frames = _stream_chunk_frames(
             sample_rate=args.sample_rate,
             chunk_size_ms=args.stream_chunk_size_ms,
-            padding_ms=args.stream_padding_ms,
+            hop_length=cfg.hop_length,
         )
         logger.info(
             "Running chunked streaming parity: "
-            f"cache-window chunk_frames={chunk_size_cache}, padding_frames={padding}, hop={cfg.hop_length}"
+            f"conditioned chunk_frames={chunk_size_frames}, hop={cfg.hop_length}"
         )
 
-        with torch.inference_mode():
-            pt_stream = _streaming_decode_features(
-                feat_pt,
-                chunk_size=chunk_size_cache,
-                padding=padding,
-                hop_length=cfg.hop_length,
-                run_decode=lambda cache: pt_model(cache),
-            )
-
-        def _tf_decode(cache: torch.Tensor) -> torch.Tensor:
-            cache_np = cache.detach().cpu().numpy().astype(np.float32, copy=False)
-            out_np = tf_model(tf.convert_to_tensor(cache_np, dtype=tf.float32), training=False).numpy()
-            return torch.from_numpy(out_np).to(device=cache.device, dtype=cache.dtype)
-
-        tf_stream = _streaming_decode_features(
+        pt_stream = _streaming_decode_conditioned_pt(
+            pt_model,
             feat_pt,
-            chunk_size=chunk_size_cache,
-            padding=padding,
+            chunk_size=chunk_size_frames,
             hop_length=cfg.hop_length,
-            run_decode=_tf_decode,
+        )
+
+        tf_stream = _streaming_decode_conditioned_tf(
+            tf_model,
+            feat_pt,
+            chunk_size=chunk_size_frames,
+            hop_length=cfg.hop_length,
         )
 
         pt_audio_stream_np = pt_stream.detach().cpu().numpy()[0].astype(np.float32, copy=False)

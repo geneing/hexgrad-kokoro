@@ -55,6 +55,7 @@ kokoro-vocos-validate-tf-quant = "kokoro.tf.validate_quant:main"
 kokoro-vocos-litert-pipeline = "kokoro.tf.export:main"
 kokoro-test-kmodel-decoders = "kokoro.test_kmodel_decoder_compare:main"
 kokoro-vocos-quant-compare = "kokoro.investigate_chunked_streaming_vocos:main"
+kokoro-vocos-quant-compare-tf = "kokoro.tf.investigate_chunked_streaming_vocos_tf:main"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["kokoro"]

@@ -256,7 +256,8 @@ class ISTFTHeadTF(tf.keras.layers.Layer):
         self.hop_length = int(hop_length)
         self.padding = str(padding)
         self.out = tf.keras.layers.Dense(self.n_fft + 2, kernel_initializer=_KERNEL_INIT, bias_initializer="zeros")
-        self.window = tf.constant(np.hanning(self.n_fft).astype(np.float32), dtype=tf.float32)
+        # Match torch.hann_window default behavior used by streaming-vocos (periodic=True).
+        self.window = tf.signal.hann_window(self.n_fft, periodic=True, dtype=tf.float32)
         ola_kernel = np.zeros((self.n_fft, 1, self.n_fft), dtype=np.float32)
         for i in range(self.n_fft):
             ola_kernel[i, 0, i] = 1.0
@@ -376,7 +377,8 @@ class ExportSafeISTFTHeadTF(tf.keras.layers.Layer):
         self.cos_basis = tf.constant(np.cos(angle), dtype=tf.float32)  # [N, K]
         self.sin_basis = tf.constant(np.sin(angle), dtype=tf.float32)  # [N, K]
         self.nyquist_sign = tf.constant(np.power(-1.0, np.arange(self.n_fft, dtype=np.float32)), dtype=tf.float32)  # [N]
-        self.window = tf.constant(np.hanning(self.n_fft).astype(np.float32), dtype=tf.float32)  # [N]
+        # Match torch.hann_window default behavior used by streaming-vocos (periodic=True).
+        self.window = tf.signal.hann_window(self.n_fft, periodic=True, dtype=tf.float32)  # [N]
 
         ola_kernel = np.zeros((self.n_fft, 1, self.n_fft), dtype=np.float32)
         for i in range(self.n_fft):

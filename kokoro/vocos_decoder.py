@@ -537,11 +537,20 @@ class StreamingTFVocosDecoder(TFVocosDecoder):
             raise ValueError(f"Expected features shape [B,C,T], got {tuple(features.shape)}")
         device = features.device
         dtype = features.dtype
-        for feat_chunk in features.split(self.chunk_size, dim=2):
-            if feat_chunk.shape[-1] == 0:
+        # Match PT streaming chunk semantics: run non-streaming conditioner once,
+        # then chunk only backbone+head.
+        feat_np = features.detach().cpu().numpy().astype(np.float32, copy=False)
+        feat_tf = self._tf.convert_to_tensor(feat_np)
+        conditioned = self.generator.conditioner(self._tf.transpose(feat_tf, [0, 2, 1]), training=False)
+        conditioned = self._tf.transpose(conditioned, [0, 2, 1])
+        total_frames = int(conditioned.shape[-1])
+        for start in range(0, total_frames, self.chunk_size):
+            end = min(total_frames, start + self.chunk_size)
+            feat_chunk = conditioned[:, :, start:end]
+            if int(feat_chunk.shape[-1]) == 0:
                 continue
-            feat_np = feat_chunk.detach().cpu().numpy().astype(np.float32, copy=False)
-            audio_np = self.generator(self._tf.convert_to_tensor(feat_np), training=False).numpy()
+            x = self.generator.backbone(feat_chunk, training=False)
+            audio_np = self.generator.head(x, training=False).numpy()
             audio_t = torch.from_numpy(audio_np).to(device=device, dtype=dtype)
             yield audio_t
 
