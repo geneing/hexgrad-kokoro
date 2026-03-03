@@ -4,11 +4,13 @@ Purpose
 - Compare non-chunked decoding (`PTVocosDecoder`) against chunked streaming
   decoding (`StreamingPTVocosDecoder`) using the same conditioning inputs.
 - Compare chunked outputs across quantization variants (`fp32`, `fp16`, `int8`)
-  against fp32 chunked reference.
+  against full fp32 reference (and optionally variant-matched full decode).
 - Export quantized PT weights for causal streaming vocos.
 - Measure objective deltas that correlate with perceived quality loss:
-  `snr_db`, `l1`, `rmse`, `stft_logmag_l1`, and a chunk-boundary click score.
-- Identify whether chunk size or padding settings are causing regressions.
+  `snr_db`, `l1`, `rmse`, `stft_logmag_l1`, boundary click/jump metrics, and
+  clipping/peak error indicators.
+- Save waveform plots comparing full vs chunked waveforms, including chunk-
+  boundary zoom views, to diagnose audible artifacts that global metrics can miss.
 
 Sample selection
 - This script automatically selects random English samples from distinct voices.
@@ -34,6 +36,8 @@ Outputs
 - Audio files are saved by default (`--save-audio`), with one folder per sample:
   - `full_fp32.wav`, plus `full_<variant>.wav` for quantized variants
   - `stream_<variant>_chunk_<N>ms.wav` for each requested chunk size.
+- Waveform plots are saved by default (`--save-plots`) under each sample folder:
+  - `plot_<variant>_chunk_<N>ms.png` comparing full and chunked waveforms.
 
 Examples
 1) Default run (20 random English samples, default chunk sizes):
@@ -123,6 +127,20 @@ def _parse_csv_variants(text: str) -> List[str]:
     return out
 
 
+def _parse_csv_variants_subset(text: str, allowed: Sequence[str]) -> List[str]:
+    allowed_set = {v.strip().lower() for v in allowed}
+    out: List[str] = []
+    for part in text.split(","):
+        v = part.strip().lower()
+        if not v:
+            continue
+        if v not in allowed_set:
+            raise ValueError(f"Unsupported variant '{v}'. Allowed: {sorted(allowed_set)}")
+        if v not in out:
+            out.append(v)
+    return out
+
+
 def _load_pair(path: Path) -> Dict[str, torch.Tensor]:
     row = torch.load(path, map_location="cpu", weights_only=False)
     asr = row["asr"].float()
@@ -179,6 +197,107 @@ def _boundary_click_score(audio: torch.Tensor, chunk_samples: int) -> float:
         return 0.0
     jumps = torch.abs(audio[idx] - audio[idx - 1])
     return float(jumps.mean().item())
+
+
+def _clip_fraction(audio: torch.Tensor, threshold: float = 0.999) -> float:
+    if audio.numel() == 0:
+        return 0.0
+    return float((audio.abs() >= float(threshold)).float().mean().item())
+
+
+def _boundary_error_metrics(ref: torch.Tensor, pred: torch.Tensor, chunk_samples: int, window_samples: int) -> Dict[str, float]:
+    ref, pred = _align_audio(ref, pred)
+    if ref.numel() == 0:
+        return {"boundary_err_rmse": 0.0, "boundary_err_peak": 0.0}
+    err = pred - ref
+    if chunk_samples <= 0:
+        rmse = float(torch.sqrt(torch.mean(err * err)).item())
+        return {"boundary_err_rmse": rmse, "boundary_err_peak": float(err.abs().max().item())}
+    t = int(err.shape[-1])
+    idx = torch.arange(chunk_samples, t, chunk_samples, device=err.device)
+    if idx.numel() == 0:
+        return {"boundary_err_rmse": 0.0, "boundary_err_peak": 0.0}
+    w = max(1, int(window_samples))
+    chunks: List[torch.Tensor] = []
+    for i in idx.tolist():
+        lo = max(0, int(i) - w)
+        hi = min(t, int(i) + w)
+        if hi > lo:
+            chunks.append(err[lo:hi])
+    if not chunks:
+        return {"boundary_err_rmse": 0.0, "boundary_err_peak": 0.0}
+    cat = torch.cat(chunks, dim=-1)
+    return {
+        "boundary_err_rmse": float(torch.sqrt(torch.mean(cat * cat)).item()),
+        "boundary_err_peak": float(cat.abs().max().item()),
+    }
+
+
+def _save_waveform_plot(
+    out_path: Path,
+    ref: torch.Tensor,
+    pred: torch.Tensor,
+    sample_rate: int,
+    chunk_samples: int,
+    title: str,
+    boundary_window_ms: float,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Could not import matplotlib for plots: {exc}")
+        return
+
+    ref, pred = _align_audio(ref.detach().cpu().float(), pred.detach().cpu().float())
+    if ref.numel() == 0:
+        return
+    err = pred - ref
+    n = int(ref.shape[-1])
+    x = np.arange(n, dtype=np.float32) / float(sample_rate)
+    ref_np = ref.numpy()
+    pred_np = pred.numpy()
+    err_np = err.numpy()
+
+    boundaries = np.arange(chunk_samples, n, chunk_samples, dtype=np.int64) if chunk_samples > 0 else np.array([], dtype=np.int64)
+
+    window_samples = max(1, int(boundary_window_ms * sample_rate / 1000.0))
+    worst_boundary = int(boundaries[0]) if boundaries.size > 0 else n // 2
+    if boundaries.size > 0:
+        scores: List[float] = []
+        for b in boundaries.tolist():
+            lo = max(0, b - window_samples)
+            hi = min(n, b + window_samples)
+            scores.append(float(np.max(np.abs(err_np[lo:hi])) if hi > lo else 0.0))
+        worst_boundary = int(boundaries[int(np.argmax(np.asarray(scores)))])
+    zoom_lo = max(0, worst_boundary - window_samples)
+    zoom_hi = min(n, worst_boundary + window_samples)
+    zx = x[zoom_lo:zoom_hi]
+
+    fig, axes = plt.subplots(3, 1, figsize=(13, 8), constrained_layout=True)
+    axes[0].plot(x, ref_np, linewidth=0.6, label="full_fp32", alpha=0.9)
+    axes[0].plot(x, pred_np, linewidth=0.6, label="chunked", alpha=0.75)
+    if boundaries.size <= 120:
+        for b in boundaries.tolist():
+            axes[0].axvline(float(b) / float(sample_rate), color="0.75", linewidth=0.4)
+    axes[0].set_title(title)
+    axes[0].set_ylabel("Amplitude")
+    axes[0].legend(loc="upper right")
+
+    axes[1].plot(x, err_np, color="tab:red", linewidth=0.5)
+    axes[1].axhline(0.0, color="black", linewidth=0.5)
+    axes[1].set_ylabel("Error")
+    axes[1].set_title("Full - Chunked Error")
+
+    axes[2].plot(zx, ref_np[zoom_lo:zoom_hi], linewidth=0.9, label="full_fp32", alpha=0.9)
+    axes[2].plot(zx, pred_np[zoom_lo:zoom_hi], linewidth=0.9, label="chunked", alpha=0.8)
+    axes[2].axvline(float(worst_boundary) / float(sample_rate), color="tab:orange", linewidth=1.0, label="worst boundary")
+    axes[2].set_xlabel("Time (s)")
+    axes[2].set_ylabel("Amplitude")
+    axes[2].set_title(f"Boundary Zoom (+/- {boundary_window_ms:.1f} ms)")
+    axes[2].legend(loc="upper right")
+
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
 
 
 def _is_english_voice(voice: str) -> bool:
@@ -316,6 +435,7 @@ def run(args: argparse.Namespace) -> None:
     base_state = _copy_state(base_full_decoder.generator.state_dict())
 
     variant_names = _parse_csv_variants(args.quantization_variants)
+    plot_variants = _parse_csv_variants_subset(args.plot_variants, variant_names)
     variant_states: Dict[str, Dict[str, torch.Tensor]] = {"fp32": _copy_state(base_state)}
     if "fp16" in variant_names:
         variant_states["fp16"] = _fp16_qdq_state(base_state)
@@ -415,7 +535,16 @@ def run(args: argparse.Namespace) -> None:
             "experiments": [],
         }
 
-        chunked_ref: Dict[int, torch.Tensor] = {}
+        full_by_variant: Dict[str, torch.Tensor] = {"fp32": full_ref}
+        for variant in variant_names:
+            if variant == "fp32":
+                continue
+            with torch.no_grad():
+                full_variant = full_decoders[variant](asr, f0, noise, style)[0].detach().cpu()
+            full_by_variant[variant] = full_variant
+            if args.save_audio:
+                _save_wav(sample_dir / f"full_{variant}.wav", full_variant, sample_rate=args.sample_rate)
+
         for chunk_ms in chunk_sizes:
             stream_decoder = stream_decoders_by_variant["fp32"][chunk_ms]
             chunks: List[torch.Tensor] = []
@@ -424,15 +553,10 @@ def run(args: argparse.Namespace) -> None:
                     if part.numel() > 0:
                         chunks.append(part.detach().cpu())
             stream_audio = torch.cat([c[0] for c in chunks], dim=-1) if chunks else torch.empty(0, dtype=full_ref.dtype)
-            chunked_ref[chunk_ms] = stream_audio
             if args.save_audio:
                 _save_wav(sample_dir / f"stream_fp32_chunk_{chunk_ms}ms.wav", stream_audio, sample_rate=args.sample_rate)
 
         for variant in variant_names:
-            if args.save_audio and variant != "fp32":
-                with torch.no_grad():
-                    full_variant = full_decoders[variant](asr, f0, noise, style)[0].detach().cpu()
-                _save_wav(sample_dir / f"full_{variant}.wav", full_variant, sample_rate=args.sample_rate)
             for chunk_ms in chunk_sizes:
                 stream_decoder = stream_decoders_by_variant[variant][chunk_ms]
                 chunks: List[torch.Tensor] = []
@@ -444,16 +568,48 @@ def run(args: argparse.Namespace) -> None:
                 if args.save_audio and variant != "fp32":
                     _save_wav(sample_dir / f"stream_{variant}_chunk_{chunk_ms}ms.wav", stream_audio, sample_rate=args.sample_rate)
 
-                m = _metrics(chunked_ref[chunk_ms], stream_audio)
+                m = _metrics(full_ref, stream_audio)
                 m["variant"] = variant
                 m["chunk_ms"] = chunk_ms
                 m["effective_chunk_frames"] = int(stream_decoder.chunk_size)
                 m["effective_padding_frames"] = 0
-                m["boundary_click_score"] = _boundary_click_score(
-                    torch.abs(stream_audio - chunked_ref[chunk_ms]),
-                    stream_decoder.chunk_size * args.hop_length,
+                chunk_samples = stream_decoder.chunk_size * args.hop_length
+                m["boundary_click_score"] = _boundary_click_score(stream_audio, chunk_samples)
+                ref_aligned, pred_aligned = _align_audio(full_ref, stream_audio)
+                err = pred_aligned - ref_aligned
+                m["boundary_err_click_score"] = _boundary_click_score(
+                    torch.abs(err),
+                    chunk_samples,
+                )
+                vs_variant = _metrics(full_by_variant[variant], stream_audio)
+                m["snr_db_vs_variant_full"] = vs_variant["snr_db"]
+                m["l1_vs_variant_full"] = vs_variant["l1"]
+                m["rmse_vs_variant_full"] = vs_variant["rmse"]
+                m["stft_logmag_l1_vs_variant_full"] = vs_variant["stft_logmag_l1"]
+                m["pred_peak_abs"] = float(pred_aligned.abs().max().item()) if pred_aligned.numel() else 0.0
+                m["pred_clip_fraction"] = _clip_fraction(pred_aligned)
+                m["err_peak_abs"] = float(err.abs().max().item()) if err.numel() else 0.0
+                m["err_p99_abs"] = float(torch.quantile(err.abs(), 0.99).item()) if err.numel() else 0.0
+                m.update(
+                    _boundary_error_metrics(
+                        ref_aligned,
+                        pred_aligned,
+                        chunk_samples=chunk_samples,
+                        window_samples=max(1, int(args.boundary_window_ms * args.sample_rate / 1000.0)),
+                    )
                 )
                 sample_entry["experiments"].append(m)
+
+                if args.save_plots and variant in plot_variants:
+                    _save_waveform_plot(
+                        out_path=sample_dir / f"plot_{variant}_chunk_{chunk_ms}ms.png",
+                        ref=full_ref,
+                        pred=stream_audio,
+                        sample_rate=args.sample_rate,
+                        chunk_samples=chunk_samples,
+                        title=f"{voice}/{stem} - {variant} chunk={chunk_ms}ms",
+                        boundary_window_ms=float(args.boundary_window_ms),
+                    )
 
         report["samples"].append(sample_entry)
 
@@ -472,6 +628,14 @@ def run(args: argparse.Namespace) -> None:
                 "rmse": _mean_std([float(r["rmse"]) for r in rows]),
                 "stft_logmag_l1": _mean_std([float(r["stft_logmag_l1"]) for r in rows]),
                 "boundary_click_score": _mean_std([float(r["boundary_click_score"]) for r in rows]),
+                "boundary_err_click_score": _mean_std([float(r["boundary_err_click_score"]) for r in rows]),
+                "boundary_err_rmse": _mean_std([float(r["boundary_err_rmse"]) for r in rows]),
+                "boundary_err_peak": _mean_std([float(r["boundary_err_peak"]) for r in rows]),
+                "pred_peak_abs": _mean_std([float(r["pred_peak_abs"]) for r in rows]),
+                "pred_clip_fraction": _mean_std([float(r["pred_clip_fraction"]) for r in rows]),
+                "err_peak_abs": _mean_std([float(r["err_peak_abs"]) for r in rows]),
+                "err_p99_abs": _mean_std([float(r["err_p99_abs"]) for r in rows]),
+                "snr_db_vs_variant_full": _mean_std([float(r["snr_db_vs_variant_full"]) for r in rows]),
             }
     report["aggregate_by_chunk_variant"] = aggregate
 
@@ -488,7 +652,9 @@ def run(args: argparse.Namespace) -> None:
                 f"variant={variant} chunk={chunk_ms}ms snr={agg['snr_db']['mean']:.2f}±{agg['snr_db']['std']:.2f}dB "
                 f"l1={agg['l1']['mean']:.6f}±{agg['l1']['std']:.6f} "
                 f"lsd={agg['stft_logmag_l1']['mean']:.6f}±{agg['stft_logmag_l1']['std']:.6f} "
-                f"click={agg['boundary_click_score']['mean']:.6f}±{agg['boundary_click_score']['std']:.6f}"
+                f"jump={agg['boundary_click_score']['mean']:.6f}±{agg['boundary_click_score']['std']:.6f} "
+                f"b_rmse={agg['boundary_err_rmse']['mean']:.6f}±{agg['boundary_err_rmse']['std']:.6f} "
+                f"clip={agg['pred_clip_fraction']['mean']:.6f}±{agg['pred_clip_fraction']['std']:.6f}"
             )
     print(f"Saved report: {report_path}")
 
@@ -506,6 +672,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--save-audio", dest="save_audio", action="store_true")
     p.add_argument("--no-save-audio", dest="save_audio", action="store_false")
     p.set_defaults(save_audio=True)
+    p.add_argument("--save-plots", dest="save_plots", action="store_true")
+    p.add_argument("--no-save-plots", dest="save_plots", action="store_false")
+    p.set_defaults(save_plots=True)
+    p.add_argument("--plot-variants", type=str, default="fp32", help="Comma-separated variants to plot")
+    p.add_argument("--boundary-window-ms", type=float, default=20.0)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
 
     p.add_argument("--sample-rate", type=int, default=24000)

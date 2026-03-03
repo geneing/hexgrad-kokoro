@@ -28,6 +28,7 @@ Direct construction examples:
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import importlib.util
 import sys
@@ -341,26 +342,54 @@ class StreamingPTVocosDecoder(PTVocosDecoder):
         self.hop_length = int(hop_length)
         self.sample_rate = int(sample_rate)
         self.chunk_size = max(1, int(chunk_size_ms / 1000.0 * self.sample_rate / self.hop_length))
+        self._stream_ctx: Optional[contextlib.ExitStack] = None
+        self._stream_batch_size = 0
 
     def reset(self) -> None:
-        return
+        if self._stream_ctx is not None:
+            self._stream_ctx.close()
+        self._stream_ctx = None
+        self._stream_batch_size = 0
+
+    def _ensure_streaming_context(self, batch_size: int) -> None:
+        if self._stream_ctx is not None and self._stream_batch_size == int(batch_size):
+            return
+        self.reset()
+        stack = contextlib.ExitStack()
+        if hasattr(self.generator.backbone, "streaming"):
+            stack.enter_context(self.generator.backbone.streaming(int(batch_size)))
+        if hasattr(self.generator.head, "streaming"):
+            stack.enter_context(self.generator.head.streaming(int(batch_size)))
+        self._stream_ctx = stack
+        self._stream_batch_size = int(batch_size)
 
     @torch.no_grad()
     def decode_caches(self) -> torch.Tensor:
         device = next(self.generator.parameters()).device
         dtype = next(self.generator.parameters()).dtype
-        return torch.empty((1, 0), device=device, dtype=dtype)
+        bsz = max(1, int(self._stream_batch_size))
+        self.reset()
+        return torch.empty((bsz, 0), device=device, dtype=dtype)
 
     @torch.no_grad()
     def streaming_decode_features(self, features: torch.Tensor, is_last: bool = False):
-        _ = is_last
         if features.ndim != 3:
             raise ValueError(f"Expected features shape [B,C,T], got {tuple(features.shape)}")
-        for feat_chunk in features.split(self.chunk_size, dim=2):
+        bsz = int(features.shape[0])
+        self._ensure_streaming_context(bsz)
+        # The conditioner contains a non-streaming k=3 conv. Running it per-chunk
+        # introduces artificial boundary transients. Condition once, then stream.
+        conditioned = self.generator.conditioner(features)
+        for feat_chunk in conditioned.split(self.chunk_size, dim=2):
             if feat_chunk.shape[-1] == 0:
                 continue
-            audio = self.generator(feat_chunk)
+            x = self.generator.backbone(feat_chunk)
+            audio = self.generator.head(x)
+            if getattr(self.generator, "_head_has_channel_axis", False) and audio.ndim == 3 and audio.shape[1] == 1:
+                audio = audio[:, 0, :]
             yield audio
+        if is_last:
+            self.reset()
 
     @torch.no_grad()
     def streaming_decode(
