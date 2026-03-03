@@ -7,6 +7,9 @@ Kokoro is a StyleTTS2-derived stack with streaming-oriented decoder paths.
 Current decoder migration state:
 - The primary vocoder path is **streaming Vocos** (causal ConvNeXt + streaming ISTFT head).
 - Legacy non-streaming Vocos and iSTFT baseline code can still exist for comparison.
+- PT/TF chunked inference semantics are aligned to:
+  - run conditioner once on full feature sequence,
+  - then chunk only backbone + ISTFT head.
 
 Primary goals:
 - Train decoder-only distillation from paired Kokoro vocoder features to waveform.
@@ -74,6 +77,8 @@ When working with vocoder training/export/validation:
 ### 7) PT/TF Parity Checks
 - Full-forward + chunked compare:
   - `uv run python -m kokoro.tf.smoke_compare_pt_tf --pytorch-checkpoint output/checkpoints/last.pt --pairs-root inputs//pairs --vocos-impl streaming --streaming-vocos-repo third_party/vocos_streaming`
+- TF full-vs-chunked investigation (converted TF weights):
+  - `uv run kokoro-vocos-quant-compare-tf --tf-config output/tf_checkpoints/generator_config.json --tf-weights output/tf_checkpoints/generator.weights.h5 --data-root inputs/ --out-dir output/tf_chunked_vocos_compare --chunked-variant both`
 
 ## Important Paths
 - Paired features: `inputs//pairs/**/*.pt`
@@ -83,6 +88,8 @@ When working with vocoder training/export/validation:
 ## Implementation Guardrails
 - Keep decoder migration modular so A/B baselines remain reproducible.
 - Do not silently switch checkpoint/key conventions; make format assumptions explicit.
+- Do not reintroduce cache-window/rolling-cache chunk logic in parity tools.
+  Use conditioner-once + chunked backbone/head semantics consistently.
 - If touching TF mapping logic, update `kokoro/tf/checkpoint_utils.py` and validate with:
   - `uv run python -m py_compile kokoro/tf/*.py`
   - `uv run python -m kokoro.tf.convert --help`

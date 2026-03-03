@@ -9,6 +9,9 @@ Current expectation:
   `kokoro/train_vocos.py`.
 - Checkpoint mapping supports streaming key layout and weight-norm-derived conv
   weights via `checkpoint_utils.py`.
+- Chunked parity semantics match PT:
+  - run conditioner once on full features,
+  - then chunk backbone + ISTFT head.
 
 ## Module Responsibilities
 - `model.py`
@@ -30,7 +33,11 @@ Current expectation:
 - `smoke_test_from_pt_ckpt.py`
   - Minimal conversion/inference sanity path.
 - `smoke_compare_pt_tf.py`
-  - PT vs TF parity checks (full-forward and chunked comparisons).
+  - PT vs TF parity checks (full-forward and chunked comparisons using
+    conditioner-once chunking).
+- `investigate_chunked_streaming_vocos_tf.py`
+  - TF full-vs-chunked quality investigation with waveform plots and boundary
+    diagnostics.
 
 ## Streaming Vocos Notes
 - Streaming checkpoints typically contain keys like:
@@ -49,6 +56,9 @@ Current expectation:
 ### PT/TF parity smoke compare
 - `uv run python -m kokoro.tf.smoke_compare_pt_tf --pytorch-checkpoint output/checkpoints/last.pt --pairs-root inputs//pairs --vocos-impl streaming --streaming-vocos-repo third_party/vocos_streaming`
 
+### TF chunked-vs-full investigation (converted TF weights)
+- `uv run kokoro-vocos-quant-compare-tf --tf-config output/tf_checkpoints/generator_config.json --tf-weights output/tf_checkpoints/generator.weights.h5 --data-root inputs/ --out-dir output/tf_chunked_vocos_compare --chunked-variant both`
+
 ### TF training from paired data
 - `uv run python -m kokoro.tf.training --data-root inputs/ --train-filelist inputs//filelists/vocos.train.txt --val-filelist inputs//filelists/vocos.val.txt`
 
@@ -64,6 +74,8 @@ Current expectation:
   - `hop_length=300`
   - `n_fft=1200`
 - Avoid silent architecture drift between PT and TF decoder paths.
+- Keep chunked inference semantics consistent across TF tools; avoid legacy
+  cache-window chunking helpers.
 
 ## Validation Expectations
 When editing this directory, run at minimum:

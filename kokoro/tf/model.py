@@ -8,6 +8,8 @@ Scope:
 - Export-safe fixed-frame generator wrappers.
 - Discriminators and adversarial/STFT/group-delay loss helpers for TF training.
 - Utility functions shared across TF training and export pipelines.
+- This module defines generator architecture only. Chunk scheduling/stateful
+  streaming wrappers are implemented in decoder/test utilities, not here.
 
 Pipeline entrypoints:
 - Training: `kokoro.tf.training`
@@ -44,6 +46,7 @@ Examples:
 Notes:
 - LiteRT path is fixed to 520 frames (`DEFAULT_FIXED_FRAMES`).
 - Pre/post blocks stay float for quality; ConvNeXt core is tuned for int8.
+- ISTFT windows use periodic Hann to match PT/streaming-vocos behavior.
 """
 
 from __future__ import annotations

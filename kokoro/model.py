@@ -30,10 +30,16 @@ Config examples:
      "vocos": {
        "checkpoint_path": "/path/to/vocos_last.pt",
        "streaming": true,
-       "chunk_size_ms": 300,
-       "padding_ms": 40
+       "chunk_size_ms": 300
      }
    }
+
+Streaming note:
+- Chunked parity semantics in this repo are:
+  1) run conditioner once on full vocoder features,
+  2) chunk only backbone + ISTFT head.
+- PT streaming decoder uses streaming-vocos module contexts.
+- TF streaming decoder mirrors the same chunk boundaries/conditioning strategy.
 
 Quick smoke test:
 `uv run python -c "from kokoro import KModel; m=KModel(config='/path/config.json', model='/path/kokoro.pth'); print(type(m.decoder).__name__)"`
