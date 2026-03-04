@@ -46,6 +46,13 @@ audio2 = decoder.synthesize_chunk(chunk2)
 # Reset state when stream ends.
 decoder.reset()
 ```
+
+Explicit-state usage (export-friendly):
+```python
+state = decoder.init_state(batch_size=1)
+audio_a, state = decoder.synthesize_chunk_with_state(chunk1, state)
+audio_b, state = decoder.synthesize_chunk_with_state(chunk2, state)
+```
 """
 
 from __future__ import annotations
@@ -212,10 +219,10 @@ class StreamingVocosConfig:
 
 @dataclass
 class _StreamingConvState:
-    previous: Optional[Tensor] = None
+    previous: Tensor
 
     def reset(self) -> None:
-        self.previous = None
+        self.previous.zero_()
 
 
 @dataclass
@@ -229,12 +236,12 @@ class _StreamingConvPadState:
 
 @dataclass
 class _StreamingAddState:
-    previous_x: Optional[Tensor] = None
-    previous_y: Optional[Tensor] = None
+    previous_x: Tensor
+    previous_y: Tensor
 
     def reset(self) -> None:
-        self.previous_x = None
-        self.previous_y = None
+        self.previous_x.zero_()
+        self.previous_y.zero_()
 
 
 @dataclass
@@ -275,6 +282,59 @@ class _StreamingModule(nn.Module):
     def _init_streaming_state(self, batch_size: int) -> Any:  # pragma: no cover - interface
         raise NotImplementedError
 
+    def _iter_streaming_modules(self):
+        for name, module in self.named_modules():
+            if isinstance(module, _StreamingModule):
+                yield name, module
+
+    def export_streaming_state_tensors(self) -> Dict[str, Tensor]:
+        out: Dict[str, Tensor] = {}
+        for name, module in self._iter_streaming_modules():
+            state = module._streaming_state
+            if state is None:
+                continue
+            base = name or "__root__"
+            if isinstance(state, _StreamingConvState):
+                out[f"{base}.previous"] = state.previous
+            elif isinstance(state, _StreamingConvPadState):
+                out[f"{base}.padding_to_add"] = torch.tensor(
+                    [int(state.padding_to_add)], dtype=torch.int64, device=next(module.parameters(), torch.empty(0)).device
+                )
+                out[f"{base}.original_padding_to_add"] = torch.tensor(
+                    [int(state.original_padding_to_add)],
+                    dtype=torch.int64,
+                    device=next(module.parameters(), torch.empty(0)).device,
+                )
+            elif isinstance(state, _StreamingAddState):
+                out[f"{base}.previous_x"] = state.previous_x
+                out[f"{base}.previous_y"] = state.previous_y
+            elif isinstance(state, _StreamingISTFTState):
+                out[f"{base}.prev_buffer"] = state.prev_buffer
+        return out
+
+    def load_streaming_state_tensors(self, state_tensors: Mapping[str, Tensor]) -> None:
+        for name, module in self._iter_streaming_modules():
+            state = module._streaming_state
+            if state is None:
+                continue
+            base = name or "__root__"
+            if isinstance(state, _StreamingConvState):
+                key = f"{base}.previous"
+                state.previous = state_tensors[key].to(device=state.previous.device, dtype=state.previous.dtype)
+            elif isinstance(state, _StreamingConvPadState):
+                key_pad = f"{base}.padding_to_add"
+                key_orig = f"{base}.original_padding_to_add"
+                state.padding_to_add = int(state_tensors[key_pad].reshape(-1)[0].item())
+                state.original_padding_to_add = int(state_tensors[key_orig].reshape(-1)[0].item())
+            elif isinstance(state, _StreamingAddState):
+                key_x = f"{base}.previous_x"
+                key_y = f"{base}.previous_y"
+                state.previous_x = state_tensors[key_x].to(device=state.previous_x.device, dtype=state.previous_x.dtype)
+                state.previous_y = state_tensors[key_y].to(device=state.previous_y.device, dtype=state.previous_y.dtype)
+            elif isinstance(state, _StreamingISTFTState):
+                key = f"{base}.prev_buffer"
+                state.prev_buffer = state_tensors[key].to(device=state.prev_buffer.device, dtype=state.prev_buffer.dtype)
+
 
 def _get_extra_padding_for_conv1d(x: Tensor, kernel_size: int, stride: int, padding_total: int = 0) -> int:
     length = x.shape[-1]
@@ -304,8 +364,14 @@ class _RawStreamingConv1d(nn.Conv1d, _StreamingModule):
             raise ValueError("Raw streaming conv expects external padding.")
 
     def _init_streaming_state(self, batch_size: int) -> _StreamingConvState:
-        _ = batch_size
-        return _StreamingConvState()
+        prev = torch.zeros(
+            batch_size,
+            self.in_channels,
+            0,
+            dtype=self.weight.dtype,
+            device=self.weight.device,
+        )
+        return _StreamingConvState(previous=prev)
 
     def forward(self, x: Tensor) -> Tensor:
         stride = self.stride[0]
@@ -411,19 +477,22 @@ class _StreamingConv1d(_StreamingModule):
 
 
 class _StreamingAdd(_StreamingModule):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.channels = int(channels)
+        self.register_buffer("_state_anchor", torch.empty(0), persistent=False)
+
     def _init_streaming_state(self, batch_size: int) -> _StreamingAddState:
-        _ = batch_size
-        return _StreamingAddState()
+        empty = torch.zeros(batch_size, self.channels, 0, device=self._state_anchor.device, dtype=self._state_anchor.dtype)
+        return _StreamingAddState(previous_x=empty, previous_y=empty.clone())
 
     def forward(self, x: Tensor, y: Tensor) -> Tensor:
         if self._streaming_state is None:
             return x + y
         prev_x = self._streaming_state.previous_x
         prev_y = self._streaming_state.previous_y
-        if prev_x is not None:
-            x = torch.cat([prev_x, x], dim=-1)
-        if prev_y is not None:
-            y = torch.cat([prev_y, y], dim=-1)
+        x = torch.cat([prev_x, x], dim=-1)
+        y = torch.cat([prev_y, y], dim=-1)
         m = min(x.shape[-1], y.shape[-1])
         self._streaming_state.previous_x = x[..., m:]
         self._streaming_state.previous_y = y[..., m:]
@@ -471,7 +540,7 @@ class _ConvNeXtBlock(_StreamingModule):
         self.act = nn.GELU()
         self.pwconv2 = nn.Linear(int(mlp_ratio * dim), dim)
         self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim,)))
-        self.add = _StreamingAdd()
+        self.add = _StreamingAdd(channels=dim)
 
     def _init_streaming_state(self, batch_size: int) -> None:
         _ = batch_size
@@ -729,6 +798,81 @@ class StreamingVocos:
         self._stream_batch_size = int(batch_size)
 
     @torch.inference_mode()
+    def init_state(self, batch_size: int) -> Dict[str, Tensor]:
+        """Create explicit streaming state tensors for functional chunked inference."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+        self.model._start_streaming(int(batch_size))
+        try:
+            state = self.model.export_streaming_state_tensors()
+            return {k: v.detach().clone() for k, v in state.items()}
+        finally:
+            self.model._stop_streaming()
+
+    @torch.inference_mode()
+    def synthesize_chunk_with_state(
+        self,
+        features_chunk: Tensor,
+        state: Mapping[str, Tensor],
+    ) -> tuple[Tensor, Dict[str, Tensor]]:
+        """Synthesize one chunk using explicit state tensors.
+
+        Args:
+            features_chunk: [B, C, T] where T == self.chunk_frames.
+            state: state from `init_state` or prior `synthesize_chunk_with_state`.
+        Returns:
+            (audio_chunk [B, T*hop], next_state)
+        """
+        if features_chunk.ndim != 3:
+            raise ValueError(f"Expected features_chunk to have shape [B,C,T], got {tuple(features_chunk.shape)}")
+        if int(features_chunk.shape[-1]) != self.chunk_frames:
+            raise ValueError(
+                f"Expected chunk length {self.chunk_frames} frames, got {int(features_chunk.shape[-1])}."
+            )
+        features_chunk = features_chunk.to(device=self.device, dtype=self._model_dtype)
+        bsz = int(features_chunk.shape[0])
+        self.model._start_streaming(bsz)
+        try:
+            self.model.load_streaming_state_tensors(state)
+            conditioned = self.model.conditioner(features_chunk)
+            x = self.model.backbone(conditioned)
+            y = self.model.head(x)
+            next_state = self.model.export_streaming_state_tensors()
+        finally:
+            self.model._stop_streaming()
+        if y.ndim == 3 and y.shape[1] == 1:
+            y = y[:, 0, :]
+        return y, {k: v.detach().clone() for k, v in next_state.items()}
+
+    @torch.inference_mode()
+    def synthesize_with_state(
+        self,
+        features: Tensor,
+        state: Mapping[str, Tensor],
+    ) -> tuple[Tensor, Dict[str, Tensor]]:
+        """Synthesize variable-length features and return updated explicit state."""
+        if features.ndim != 3:
+            raise ValueError(f"Expected features to have shape [B,C,T], got {tuple(features.shape)}")
+        outputs = []
+        next_state: Dict[str, Tensor] = dict(state)
+        total_frames = int(features.shape[-1])
+        pos = 0
+        while pos < total_frames:
+            end = min(total_frames, pos + self.chunk_frames)
+            chunk = features[..., pos:end]
+            valid_frames = int(end - pos)
+            if valid_frames < self.chunk_frames:
+                chunk = F.pad(chunk, (0, self.chunk_frames - valid_frames))
+            chunk_audio, next_state = self.synthesize_chunk_with_state(chunk, next_state)
+            outputs.append(chunk_audio[..., : valid_frames * self.config.hop_length])
+            pos = end
+        if not outputs:
+            audio = torch.empty(int(features.shape[0]), 0, device=self.device, dtype=self._model_dtype)
+        else:
+            audio = torch.cat(outputs, dim=-1)
+        return audio, next_state
+
+    @torch.inference_mode()
     def synthesize_chunk(self, features_chunk: Tensor) -> Tensor:
         """Synthesize one fixed-size chunk.
 
@@ -778,7 +922,7 @@ class StreamingVocos:
             pos = end
 
         if not outputs:
-                audio = torch.empty(int(bsz), 0, device=self.device, dtype=self._model_dtype)
+            audio = torch.empty(int(bsz), 0, device=self.device, dtype=self._model_dtype)
         else:
             audio = torch.cat(outputs, dim=-1)
         if is_last:
