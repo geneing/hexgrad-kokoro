@@ -46,6 +46,7 @@ dependencies = [
     "typer>=0.21.0",
     "litert-torch>=0.8.0",
     "tensorflow[gpu]>=2.19.0",
+    "torchao>=0.16.0",
 ]
 
 [project.scripts]

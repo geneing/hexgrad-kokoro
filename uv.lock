@@ -1514,6 +1514,7 @@ dependencies = [
     { name = "tensorflow" },
     { name = "tf-keras" },
     { name = "torch" },
+    { name = "torchao" },
     { name = "transformers" },
     { name = "typer" },
 ]
@@ -1546,6 +1547,7 @@ requires-dist = [
     { name = "tensorflow", extras = ["gpu"], specifier = ">=2.19.0" },
     { name = "tf-keras", specifier = ">=2.20.1" },
     { name = "torch", specifier = ">=2.9.0" },
+    { name = "torchao", specifier = ">=0.16.0" },
     { name = "transformers" },
     { name = "typer", specifier = ">=0.21.0" },
 ]
