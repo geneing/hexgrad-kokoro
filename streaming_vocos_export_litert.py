@@ -581,15 +581,27 @@ def _pt_to_keras_bilstm_weights(pt_lstm: nn.LSTM):
 
 
 def build_acoustic_expand_keras(pt_module: AcousticExpandModule) -> tf.keras.Model:
-    """Build a Keras Bidirectional(LSTM) model matching AcousticExpandModule."""
+    """Build a Keras Bidirectional(LSTM) model matching AcousticExpandModule.
+
+    Uses RNN(LSTMCell) instead of LSTM to avoid the CudnnRNNV3 kernel selected
+    by tf.keras.layers.LSTM when a GPU is visible.  CudnnRNNV3 is not a
+    standard TFLite op and causes conversion to fail.
+    """
     pt_lstm = pt_module.shared
     H = pt_lstm.hidden_size
     I = pt_lstm.input_size
 
     inp = tf.keras.Input(shape=(None, I), batch_size=1, name="d_enc_expanded")
-    fwd_lstm = tf.keras.layers.LSTM(H, return_sequences=True, name="fwd")
-    bwd_lstm = tf.keras.layers.LSTM(H, return_sequences=True, go_backwards=True, name="bwd")
-    out = tf.keras.layers.Bidirectional(fwd_lstm, backward_layer=bwd_lstm,
+    # LSTMCell + RNN always uses the portable kernel path — never CuDNN.
+    fwd_rnn = tf.keras.layers.RNN(
+        tf.keras.layers.LSTMCell(H, name="fwd_cell"),
+        return_sequences=True, name="fwd",
+    )
+    bwd_rnn = tf.keras.layers.RNN(
+        tf.keras.layers.LSTMCell(H, name="bwd_cell"),
+        return_sequences=True, go_backwards=True, name="bwd",
+    )
+    out = tf.keras.layers.Bidirectional(fwd_rnn, backward_layer=bwd_rnn,
                                         merge_mode="concat", name="bilstm")(inp)
     model = tf.keras.Model(inputs=inp, outputs=out, name="acoustic_expand")
     fwd_w, bwd_w = _pt_to_keras_bilstm_weights(pt_lstm)
@@ -625,6 +637,15 @@ def export_acoustic_expand_tflite(
         assert max_diff < 1e-3, f"Numerical mismatch too large: {max_diff}"
 
         converter = tf.lite.TFLiteConverter.from_keras_model(keras_model)
+        # RNN(LSTMCell) spells out the recurrent loop with TensorList ops.
+        # SELECT_TF_OPS enables the flex delegate to handle them;
+        # _experimental_lower_tensor_list_ops=False stops the converter from
+        # trying (and failing) to inline the loop into native TFLite ops.
+        converter.target_spec.supported_ops = [
+            tf.lite.OpsSet.TFLITE_BUILTINS,
+            tf.lite.OpsSet.SELECT_TF_OPS,
+        ]
+        converter._experimental_lower_tensor_list_ops = False
         tflite_bytes = converter.convert()
         path.write_bytes(tflite_bytes)
 
