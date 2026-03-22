@@ -298,11 +298,11 @@ class _StreamingModule(nn.Module):
                 out[f"{base}.previous"] = state.previous
             elif isinstance(state, _StreamingConvPadState):
                 out[f"{base}.padding_to_add"] = torch.tensor(
-                    [int(state.padding_to_add)], dtype=torch.int64, device=next(module.parameters(), torch.empty(0)).device
+                    [int(state.padding_to_add)], dtype=torch.int32, device=next(module.parameters(), torch.empty(0)).device
                 )
                 out[f"{base}.original_padding_to_add"] = torch.tensor(
                     [int(state.original_padding_to_add)],
-                    dtype=torch.int64,
+                    dtype=torch.int32,
                     device=next(module.parameters(), torch.empty(0)).device,
                 )
             elif isinstance(state, _StreamingAddState):

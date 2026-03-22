@@ -119,7 +119,7 @@ class KModel(torch.nn.Module):
         input_tensor = d.transpose(-1, -2)
 
         boundaries = torch.cumsum(pred_dur, dim=0)
-        values = torch.arange(boundaries[-1], device=pred_dur.device)
+        values = torch.arange(boundaries[-1], device=pred_dur.device, dtype=torch.int32)
         expanded_indices = torch.sum(boundaries.unsqueeze(1) <= values.unsqueeze(0), dim=0)
         en = torch.index_select(input_tensor, 2, expanded_indices)
 

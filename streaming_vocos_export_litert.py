@@ -258,10 +258,10 @@ def expand_durations(pred_dur: Tensor, T_max: int = T_ACOUSTIC_MAX) -> Tuple[Ten
     """
     boundaries = torch.cumsum(pred_dur, dim=0)
     T_acoustic = min(int(boundaries[-1].item()), T_max)
-    values = torch.arange(boundaries[-1])
+    values = torch.arange(boundaries[-1], dtype = torch.int32)
     expanded_indices = torch.sum(
         boundaries.unsqueeze(1) <= values.unsqueeze(0), dim=0
-    ).long()
+    )
     return expanded_indices, T_acoustic
 
 

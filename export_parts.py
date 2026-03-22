@@ -100,7 +100,7 @@ def export_duration_predictor(model, input, output_dir):
             boundaries = torch.cumsum(pred_dur, dim=0)
             # print(f'\n\n\nboundaries: {boundaries=}\n\n\n')
             print(f'\n\n\nboundaries: {boundaries.shape=} {boundaries=}\n\n\n')
-            values = torch.arange(boundaries[-1], device=pred_dur.device)
+            values = torch.arange(boundaries[-1], device=pred_dur.device, dtype = torch.int32)
             expanded_indices = torch.sum(boundaries.unsqueeze(1) <= values.unsqueeze(0), dim=0)
             print(f"\n\n\nvalues: {expanded_indices.shape=} {expanded_indices=}\n\n\n")
             en = torch.index_select(input_tensor, 2, expanded_indices)
