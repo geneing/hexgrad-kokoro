@@ -1,0 +1,9 @@
+[project]
+name = "onnx2tf-conversion"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12.8,<3.13"
+dependencies = [
+    "onnx2tf>=2.3.16",
+]
