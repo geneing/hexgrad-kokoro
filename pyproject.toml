@@ -16,7 +16,7 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent"
 ]
-requires-python = ">=3.10, <3.13"
+requires-python = ">=3.12.8, <3.13"
 dependencies = [
     "huggingface_hub",
     "ipykernel>=7.1.0",
@@ -25,27 +25,24 @@ dependencies = [
     "misaki[en]>=0.9.4",
     "numpy",
     "onnx-graphsurgeon>=0.5.8",
-    "onnx2tf>=1.28.7",
-    "onnxruntime>=1.23.2",
+    "onnx2tf>=2.3.17",
+    "onnxruntime>=1.24.3",
     "onnxsim>=0.6.2",
     "pip>=25.3",
+    "protobuf==4.25.5",
     "sounddevice>=0.5.3",
     "soundfile>=0.13.1",
-    "tf-keras>=2.20.1",
+    "tf-keras>=2.19.0",
     "torch>=2.9.0",
     "transformers",
-    "onnx==1.19.1",
+    "onnx>=1.20.0",
     "ai-edge-litert>=2.1.0",
     "sng4onnx>=1.0.4",
-    "olive-ai[gpu]>=0.10.1",
     "scipy>=1.15.3",
-    "ai-edge-torch>=0.7.1",
     "matplotlib>=3.10.8",
-    "tensorflow>=2.20.0",
     "spacy>=3.8.11",
     "typer>=0.21.0",
-    "litert-torch>=0.8.0",
-    "tensorflow[gpu]>=2.19.0",
+    "tensorflow>=2.19.0",
     "torchao>=0.16.0",
 ]
 
@@ -55,6 +52,9 @@ kokoro = "kokoro.__main__:main"
 [tool.hatch.build.targets.wheel]
 only-include = ["kokoro"]
 only-packages = true
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'" ]
 
 [project.urls]
 Homepage = "https://github.com/hexgrad/kokoro"

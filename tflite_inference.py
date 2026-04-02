@@ -23,7 +23,7 @@ onnx2tf converts some I/O tensors between ONNX ``(N, C, T)`` and TFLite
   acoustic_expand        | d_enc: NTC    | en: NTC
   f0n_predictor          | en: NCT       | F0/N: N×T
   vocoder_conditioner    | features: NTC | conditioned: NCT
-  vocoder_stream_chunk   | conditioned: NCT | audio: [N×samples]
+  vocoder_stream_chunk   | chunk: NCT or NTC (auto-detected) + state → audio + state
 
 This module handles all required transposes so that callers see the same
 NumPy / Torch tensor conventions as the original PyTorch pipeline.
@@ -66,7 +66,6 @@ import ai_edge_litert.interpreter as litert
 
 from kokoro import KModel, KPipeline
 from kokoro.model import KModelForONNX
-from streaming_vocos import StreamingVocos
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -79,6 +78,9 @@ _T_ACOUSTIC = 543    # acoustic_expand / f0n_predictor time dimension
 _T_F0 = 1086         # 2 × _T_ACOUSTIC; conditioner time dimension
 _CHUNK_FRAMES = 16   # vocos backbone chunk size
 _HOP = 300           # vocos hop length
+_WIN_LEN = 1200      # ISTFT window length (= n_fft for vocos)
+_VOCOS_N_FFT = 1200  # same as WIN_LEN for this model
+_ISTFT_TAIL = _WIN_LEN - _HOP  # overlap tail between chunks (900)
 _VOCOS_EMBED_IN = 192
 _VOCOS_BLOCK_DIM = 384
 _VOCOS_KERNEL_M1 = 6    # k−1 context frames per causal conv
@@ -87,6 +89,27 @@ _VOCOS_KERNEL_M1 = 6    # k−1 context frames per causal conv
 # ---------------------------------------------------------------------------
 # Shared helpers (mirror the notebook)
 # ---------------------------------------------------------------------------
+
+def _overlap_add(
+    time_frames: np.ndarray,   # [1, F, win_len]  (NTC)
+    istft_prev:  np.ndarray,   # [1, tail]
+    hop: int,
+    tail: int,
+) -> "Tuple[np.ndarray, np.ndarray]":
+    """Overlap-add one chunk of windowed time frames.
+
+    Returns ``(audio [1, F*hop], new_istft_prev [1, tail])``.
+    """
+    B, F, win_len = time_frames.shape
+    # Buffer extends to the end of the last frame: (F-1)*hop + win_len = F*hop + tail
+    buf = np.zeros((B, F * hop + tail), dtype=np.float32)
+    for f in range(F):
+        buf[:, f * hop : f * hop + win_len] += time_frames[:, f, :]
+    buf[:, :tail] += istft_prev
+    audio          = buf[:, :F * hop]
+    new_istft_prev = buf[:, F * hop:]
+    return audio, new_istft_prev
+
 
 def _expand_durations(pred_dur: np.ndarray) -> Tuple[np.ndarray, int]:
     """Compute per-frame phoneme indices from rounded per-phoneme durations.
@@ -145,23 +168,24 @@ def _to_numpy(t: Tensor) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 class KokoroTFLiteTTS:
-    """Kokoro TTS inference using onnx2tf-converted TFLite models.
+    """Kokoro TTS inference using onnx2tf-converted TFLite models (full pipeline).
 
-    Five of the six pipeline stages run on TFLite (``bert``, ``duration_predictor``,
-    ``acoustic_expand``, ``f0n_predictor``, ``vocoder_conditioner``).  The sixth stage
-    (``vocoder_stream_chunk``) falls back to PyTorch because the converted
-    TFLite model contains an unresolvable ``ONNX_DFT`` custom op for
-    ``torch.fft.irfft``.  The vocoder backbone + head are therefore run via the
-    ``StreamingVocos`` PyTorch checkpoint.
+    All six pipeline stages run on TFLite: ``bert``, ``duration_predictor``,
+    ``acoustic_expand``, ``f0n_predictor``, ``vocoder_conditioner``, and
+    ``vocoder_stream_chunk``.
+
+    The ``vocoder_stream_chunk_float32.tflite`` model is converted from
+    ``VocosStreamChunkNoOLA``, which replaces ``torch.fft.irfft`` with explicit
+    real-arithmetic IDFT (cos/sin matrix multiplications) and removes the
+    ``ConvTranspose1d`` overlap-add layer.  The overlap-add is performed in
+    Python/NumPy instead, avoiding the ~26× amplitude error that
+    ``onnx2tf flatbuffer_direct`` produces for that ConvTranspose.
 
     Parameters
     ----------
     saved_model_dir:
         Directory containing ``*_float32.tflite`` files produced by onnx2tf.
         Defaults to ``"onnx2tf_conversion/saved_model"``.
-    vocos_checkpoint:
-        Path to the streaming Vocos ``.pt`` checkpoint.
-        Defaults to ``"vocos_fp16.pt"``.
     config_path:
         Kokoro ``config.json`` path.
         Defaults to ``"checkpoints/config.json"``.
@@ -186,7 +210,6 @@ class KokoroTFLiteTTS:
     def __init__(
         self,
         saved_model_dir: str = "onnx2tf_conversion/saved_model",
-        vocos_checkpoint: str = "vocos_fp16.pt",
         config_path: str = "checkpoints/config.json",
         kokoro_checkpoint: str = "checkpoints/kokoro-v1_0.pth",
         voice_path: str = "checkpoints/voices/af_bella.pt",
@@ -202,19 +225,33 @@ class KokoroTFLiteTTS:
         self._kpipeline = KPipeline(lang_code="a", model=kmodel, device="cpu")
 
         # ── TFLite models ────────────────────────────────────────────────────
-        self._bert_interp = self._load_interpreter("bert_float32.tflite")
-        self._dur_interp = self._load_interpreter("duration_predictor_float32.tflite")
+        self._bert_interp  = self._load_interpreter("bert_float32.tflite")
+        self._dur_interp   = self._load_interpreter("duration_predictor_float32.tflite")
         self._acexp_interp = self._load_interpreter("acoustic_expand_float32.tflite")
-        self._f0n_interp = self._load_interpreter("f0n_predictor_float32.tflite")
-        self._cond_interp = self._load_interpreter("vocoder_conditioner_float32.tflite")
+        self._f0n_interp   = self._load_interpreter("f0n_predictor_float32.tflite")
+        self._cond_interp  = self._load_interpreter("vocoder_conditioner_float32.tflite")
+        self._vocos_interp = self._load_interpreter("vocoder_stream_chunk_float32.tflite")
 
         # Verify static dimensions match expected constants
         self._verify_model_dimensions()
 
-        # ── PyTorch vocoder (backbone + head only, skip conditioner) ─────────
-        # Note: vocoder_stream_chunk TFLite model contains unresolvable ONNX_DFT op
-        self._vocos = StreamingVocos.from_checkpoint(
-            vocos_checkpoint, chunk_frames=_CHUNK_FRAMES, device="cpu", use_fp16=False
+        # ── Pre-compute Hann window for IRFFT windowing ──────────────────────
+        import torch as _torch
+        self._vocos_window = _torch.hann_window(_WIN_LEN).numpy()   # [win_len]
+
+        # ── Auto-detect vocoder chunk input/output layouts ────────────────
+        # onnx2tf may transpose NCT tensors to NTC (last-dim = channels).
+        # conditioned_chunk input: [1, 192, 16] NCT → [1, 16, 192] NTC
+        # x_real/x_imag outputs: [1, F, K=601] NTK or [1, K, F] NKT
+        _vsc_in0_shape  = self._vocos_interp.get_input_details()[0]["shape"]
+        _vsc_out0_shape = self._vocos_interp.get_output_details()[0]["shape"]
+        _K = _VOCOS_N_FFT // 2 + 1
+        self._vocos_chunk_ntc: bool = (
+            len(_vsc_in0_shape) == 3 and _vsc_in0_shape[-1] == _VOCOS_EMBED_IN
+        )
+        # x_real is NTK when last dim equals K (601)
+        self._vocos_xreal_ntk: bool = (
+            len(_vsc_out0_shape) == 3 and _vsc_out0_shape[-1] == _K
         )
 
     # ── Model loading helpers ────────────────────────────────────────────────
@@ -310,49 +347,74 @@ class KokoroTFLiteTTS:
         return interp.get_tensor(interp.get_output_details()[0]["index"])  # [1, 192, T_F0]
 
     def _run_vocos_stream_chunk(self, conditioned: np.ndarray) -> np.ndarray:
-        """Run the streaming Vocos backbone + iSTFT head via PyTorch.
+        """Run the streaming Vocos backbone via TFLite, apply numpy IRFFT + OLA.
+
+        The TFLite model (VocosPreIRFFT) outputs x_real/x_imag [1,F,K] — the
+        complex spectrum just before irfft.  numpy.fft.irfft (= tf.signal.irfft)
+        is applied here in Python, followed by Hann-window and overlap-add.
 
         Parameters
         ----------
         conditioned:
-            ``[1, 192, T_f0_actual]`` float32 NCT array — pre-conditioned Vocos
-            features produced by the TFLite conditioner.
+            ``[1, 192, T_f0_actual]`` float32 NCT array.
 
         Returns
         -------
-        audio: np.ndarray, shape ``(T_f0_actual * HOP,)``
+        audio: np.ndarray, shape ``(T_f0_actual * _HOP,)``
         """
-        conditioned_t = torch.from_numpy(conditioned.astype(np.float32))  # [1, 192, T_f0]
-        state: Dict = self._vocos.init_state(batch_size=1)
+        interp = self._vocos_interp
+        in_d   = interp.get_input_details()
+        out_d  = interp.get_output_details()
 
-        hop = self._vocos.config.hop_length
-        total_frames = conditioned_t.shape[-1]
+        total = conditioned.shape[-1]   # conditioned is NCT: [1, 192, T_f0]
+        _K    = _VOCOS_N_FFT // 2 + 1
+
+        state      = [np.zeros(d["shape"], dtype=np.float32) for d in in_d[1:]]
+        istft_prev = np.zeros((1, _ISTFT_TAIL), dtype=np.float32)
+
         chunks: List[np.ndarray] = []
         pos = 0
-        with torch.no_grad():
-            while pos < total_frames:
-                end = min(total_frames, pos + _CHUNK_FRAMES)
-                valid = end - pos
-                chunk = conditioned_t[..., pos:end]
-                if valid < _CHUNK_FRAMES:
-                    chunk = F.pad(chunk, (0, _CHUNK_FRAMES - valid))
+        while pos < total:
+            end   = min(total, pos + _CHUNK_FRAMES)
+            valid = end - pos
+            chunk = conditioned[..., pos:end]        # [1, 192, valid] NCT
+            if valid < _CHUNK_FRAMES:
+                chunk = np.pad(chunk, ((0, 0), (0, 0), (0, _CHUNK_FRAMES - valid)))
 
-                # Run backbone + head (skip conditioner — features already conditioned)
-                bsz = 1
-                self._vocos.model._start_streaming(bsz)
-                try:
-                    self._vocos.model.load_streaming_state_tensors(state)
-                    x = self._vocos.model.backbone(chunk)
-                    y = self._vocos.model.head(x)
-                    state = {k: v.detach().clone()
-                             for k, v in self._vocos.model.export_streaming_state_tensors().items()}
-                finally:
-                    self._vocos.model._stop_streaming()
+            if self._vocos_chunk_ntc:
+                chunk = np.transpose(chunk, (0, 2, 1))   # NCT → NTC
 
-                if y.ndim == 3 and y.shape[1] == 1:
-                    y = y[:, 0, :]  # [1, chunk_samples]
-                chunks.append(y[0, : valid * hop].cpu().numpy())
-                pos = end
+            interp.set_tensor(in_d[0]["index"], chunk.astype(np.float32))
+            for i, s in enumerate(state):
+                interp.set_tensor(in_d[1 + i]["index"], s)
+            interp.invoke()
+
+            # x_real / x_imag: [1, F, K] NTK or [1, K, F] NKT
+            xr_raw = interp.get_tensor(out_d[0]["index"])
+            xi_raw = interp.get_tensor(out_d[1]["index"])
+            if self._vocos_xreal_ntk:
+                x_real, x_imag = xr_raw, xi_raw          # already [1, F, K]
+            else:
+                x_real = np.transpose(xr_raw, (0, 2, 1)) # NKT → NTK [1, F, K]
+                x_imag = np.transpose(xi_raw, (0, 2, 1))
+
+            # numpy IRFFT (= tf.signal.irfft) + Hann window
+            spec = x_real + 1j * x_imag
+            tf_chunk = np.fft.irfft(spec, n=_VOCOS_N_FFT, axis=-1)[..., : _WIN_LEN].astype(np.float32)
+            tf_chunk = tf_chunk * self._vocos_window                # [1, F, win_len]
+
+            audio_chunk, istft_prev = _overlap_add(tf_chunk, istft_prev, _HOP, _ISTFT_TAIL)
+            chunks.append(audio_chunk[0, : valid * _HOP])
+
+            # Update backbone state; transpose NCT → NTC where needed
+            new_state: List[np.ndarray] = []
+            for i, s_in_d in enumerate(in_d[1:]):
+                s_out = interp.get_tensor(out_d[2 + i]["index"])   # outputs 0,1 = x_real,x_imag
+                if s_out.ndim == 3 and tuple(s_out.shape) != tuple(s_in_d["shape"]):
+                    s_out = np.transpose(s_out, (0, 2, 1))
+                new_state.append(s_out)
+            state = new_state
+            pos = end
 
         return np.concatenate(chunks, axis=-1)
 
@@ -513,6 +575,7 @@ class KokoroPTTTS:
         kmodel = KModel(config=config_path, model=kokoro_checkpoint, disable_complex=True).to(device)
         self._kmodel_onnx = KModelForONNX(kmodel).eval()
         self._kpipeline = KPipeline(lang_code="a", model=kmodel, device=device)
+        from streaming_vocos import StreamingVocos
         self._vocos = StreamingVocos.from_checkpoint(
             vocos_checkpoint, chunk_frames=chunk_frames, device=device, use_fp16=False
         )
@@ -705,6 +768,7 @@ def compare_outputs(
     # Numerical comparison
     L = min(len(wav_tflite), len(wav_pt))
     diff = np.abs(wav_tflite[:L] - wav_pt[:L])
+    corr = float(np.corrcoef(wav_tflite[:L], wav_pt[:L])[0, 1])
     summary = {
         "text": text,
         "tflite_duration_s": round(t_tflite, 3),
@@ -716,6 +780,7 @@ def compare_outputs(
         "rms_diff": float(np.sqrt(np.mean(diff**2))),
         "pt_rms": float(np.sqrt(np.mean(wav_pt**2))),
         "tflite_rms": float(np.sqrt(np.mean(wav_tflite**2))),
+        "correlation": corr,
     }
     print(
         f"\n{'─'*60}\n"
@@ -726,8 +791,78 @@ def compare_outputs(
         f"  Max |TFLite−PT|  : {summary['max_abs_diff']:.6f}\n"
         f"  Mean |TFLite−PT| : {summary['mean_abs_diff']:.6f}\n"
         f"  RMS diff         : {summary['rms_diff']:.6f}\n"
+        f"  Correlation      : {corr:.6f}\n"
         f"{'─'*60}"
     )
+
+    # ── Waveform comparison plot ─────────────────────────────────────────────
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        t_axis = np.arange(L) / sample_rate
+        zoom_end = min(L, sample_rate * 2)   # first 2 s for the zoom panel
+        t_zoom = np.arange(zoom_end) / sample_rate
+
+        fig, axes = plt.subplots(4, 1, figsize=(14, 12))
+        fig.suptitle(
+            f'Waveform comparison — TFLite vs PyTorch\n"{text[:80]}{"…" if len(text) > 80 else ""}"\n'
+            f'Corr={corr:.4f}  RMS_diff={summary["rms_diff"]:.4f}  '
+            f'Max_diff={summary["max_abs_diff"]:.4f}',
+            fontsize=11,
+        )
+
+        # Full-length overlay
+        ax = axes[0]
+        ax.plot(t_axis, wav_pt[:L],     color="#2196F3", lw=0.6, alpha=0.85, label="PyTorch")
+        ax.plot(t_axis, wav_tflite[:L], color="#FF5722", lw=0.6, alpha=0.75, label="TFLite")
+        ax.set_title("Full waveform (overlay)")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Amplitude")
+        ax.legend(loc="upper right", fontsize=9)
+        ax.set_xlim(0, L / sample_rate)
+
+        # First 2 s zoom overlay
+        ax = axes[1]
+        ax.plot(t_zoom, wav_pt[:zoom_end],     color="#2196F3", lw=0.8, alpha=0.85, label="PyTorch")
+        ax.plot(t_zoom, wav_tflite[:zoom_end], color="#FF5722", lw=0.8, alpha=0.75, label="TFLite")
+        ax.set_title("First 2 s (zoom overlay)")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Amplitude")
+        ax.legend(loc="upper right", fontsize=9)
+
+        # Difference signal
+        ax = axes[2]
+        ax.plot(t_axis, wav_tflite[:L] - wav_pt[:L], color="#9C27B0", lw=0.5, alpha=0.9)
+        ax.axhline(0, color="black", lw=0.4, ls="--")
+        ax.set_title("Difference (TFLite − PyTorch)")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Amplitude")
+        ax.set_xlim(0, L / sample_rate)
+
+        # Spectrogram of difference
+        ax = axes[3]
+        ax.specgram(
+            wav_tflite[:L] - wav_pt[:L],
+            Fs=sample_rate,
+            NFFT=512,
+            noverlap=256,
+            cmap="viridis",
+        )
+        ax.set_title("Spectrogram of difference")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Frequency (Hz)")
+
+        fig.tight_layout()
+        png_path = out_dir / "waveform_comparison.png"
+        fig.savefig(str(png_path), dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved: {png_path}")
+        summary["waveform_png"] = str(png_path)
+    except Exception as _plot_err:
+        print(f"  [waveform plot skipped: {_plot_err}]")
+
     return summary
 
 
@@ -757,7 +892,6 @@ def main() -> None:
     print("Loading TFLite TTS …")
     tflite_tts = KokoroTFLiteTTS(
         saved_model_dir=args.saved_model_dir,
-        vocos_checkpoint=args.vocos_ckpt,
         config_path=args.config,
         kokoro_checkpoint=args.kokoro_ckpt,
         voice_path=args.voice,
