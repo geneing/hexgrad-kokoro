@@ -280,12 +280,23 @@ class KokoroTFLiteTTS:
 
     # ── Stage helpers ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _norm_name(raw: str) -> str:
+        """Normalize onnx2tf tensor names: strip 'serving_default_' prefix and ':N' suffix."""
+        n = raw
+        if n.startswith("serving_default_"):
+            n = n[len("serving_default_"):]
+        colon = n.rfind(":")
+        if colon != -1:
+            n = n[:colon]
+        return n
+
     def _run_bert(
         self, input_ids: np.ndarray, text_mask: np.ndarray
     ) -> np.ndarray:
         """BERT encoder: (input_ids [1,510], text_mask [1,510]) → d_en [1, 510, 512] NTC."""
         interp = self._bert_interp
-        ins = {d["name"]: d["index"] for d in interp.get_input_details()}
+        ins = {self._norm_name(d["name"]): d["index"] for d in interp.get_input_details()}
         interp.set_tensor(ins["input_ids"], input_ids.astype(np.int32))
         interp.set_tensor(ins["text_mask"], text_mask.astype(np.float32))
         interp.invoke()
@@ -301,15 +312,28 @@ class KokoroTFLiteTTS:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Duration predictor → (pred_dur [510], d_enc [1,640,510] NCT, t_en_static [1,512,510] NCT)."""
         interp = self._dur_interp
-        ins = {d["name"]: d["index"] for d in interp.get_input_details()}
+        ins = {self._norm_name(d["name"]): d["index"] for d in interp.get_input_details()}
+        # Detect dtype for 'speed' and 'input_ids' from model (may differ across exports)
+        dtype_map = {self._norm_name(d["name"]): d["dtype"] for d in interp.get_input_details()}
+        speed_dtype = dtype_map.get("speed", np.int32)
+        ids_dtype   = dtype_map.get("input_ids", np.int32)
         interp.set_tensor(ins["d_en"], d_en.astype(np.float32))
         interp.set_tensor(ins["style"], style.astype(np.float32))
         interp.set_tensor(ins["text_mask"], text_mask.astype(np.float32))
-        interp.set_tensor(ins["speed"], speed.astype(np.int32))
-        interp.set_tensor(ins["input_ids"], input_ids.astype(np.int32))
+        interp.set_tensor(ins["speed"], speed.astype(speed_dtype))
+        interp.set_tensor(ins["input_ids"], input_ids.astype(ids_dtype))
         interp.invoke()
-        outs = {d["name"]: interp.get_tensor(d["index"]) for d in interp.get_output_details()}
-        return outs["pred_dur"], outs["d_enc"], outs["t_en_static"]
+        # Map outputs by canonical name (handles both old direct names and new StatefulPartitionedCall:N)
+        outs_raw = {d["name"]: (interp.get_tensor(d["index"]), d["shape"]) for d in interp.get_output_details()}
+        norm_outs = {self._norm_name(k): v for k, v in outs_raw.items()}
+        if "pred_dur" in norm_outs:
+            return norm_outs["pred_dur"][0], norm_outs["d_enc"][0], norm_outs["t_en_static"][0]
+        # Fallback: map by shape — [510]=pred_dur, [1,640,510]=d_enc, [1,512,510]=t_en_static
+        by_shape: dict = {}
+        for raw_name, (arr, shp) in outs_raw.items():
+            key = tuple(shp.tolist() if hasattr(shp, 'tolist') else shp)
+            by_shape[key] = arr
+        return by_shape[(510,)], by_shape[(1, 640, 510)], by_shape[(1, 512, 510)]
 
     def _run_acoustic_expand(self, d_enc_exp_ntc: np.ndarray) -> np.ndarray:
         """Acoustic expand: d_enc_expanded [1, T_ACOUSTIC, 640] NTC → en [1, T_ACOUSTIC, 512] NTC."""
@@ -516,11 +540,10 @@ class KokoroTFLiteTTS:
 
         en_ntc = self._run_acoustic_expand(d_enc_exp_ntc)     # [1, T_ACOUSTIC, 512]
 
-        # Trim + transpose to NCT for f0n
-        en_nct = np.transpose(en_ntc[:, :T_acoustic, :], (0, 2, 1))  # [1, 512, T_acoustic]
-        if T_acoustic < self.T_ACOUSTIC:
-            pad = self.T_ACOUSTIC - T_acoustic
-            en_nct = np.pad(en_nct, ((0, 0), (0, 0), (0, pad)))      # [1, 512, T_ACOUSTIC]
+        # Transpose to NCT for f0n — do NOT trim to T_acoustic before sending to f0n.
+        # The full T_ACOUSTIC output from the BiLSTM acoustic_expand is used as-is,
+        # matching the PT reference which also uses the full shared-LSTM output.
+        en_nct = np.transpose(en_ntc, (0, 2, 1))              # [1, 512, T_ACOUSTIC] NCT
 
         # ── Stage 5: F0 / noise predictor ────────────────────────────────
         # IN:  en [1, 512, T_ACOUSTIC] NCT, style [1, 256]
@@ -662,7 +685,12 @@ class KokoroPTTTS:
         return input_ids, mask
 
     def generate(self, text: str, speed: int = 1) -> np.ndarray:
-        """Synthesise ``text`` and return a mono float32 waveform at 24 kHz."""
+        """Synthesise ``text`` and return a mono float32 waveform at 24 kHz.
+
+        Uses the same static-shape padding strategy as the TFLite pipeline
+        (pads acoustic_expand, f0n, and conditioner inputs to fixed sizes)
+        so that outputs can be compared directly against ``KokoroTFLiteTTS.generate()``.
+        """
         phonemes, raw_ids = self._text_to_input_ids(text)
         style = self._load_voice(phonemes)
         speed_t = torch.IntTensor([speed])
@@ -677,19 +705,23 @@ class KokoroPTTTS:
 
             # Stage 3: Expand durations
             expanded_indices_np, T_acoustic = _expand_durations(pred_dur.cpu().numpy())
+            T_acoustic = min(T_acoustic, _T_ACOUSTIC)
+            expanded_indices_np = expanded_indices_np[:T_acoustic]
             expanded_indices = torch.from_numpy(expanded_indices_np).long()
 
             d_enc_exp = torch.index_select(d_enc, 2, expanded_indices)       # [1, h, T_acoustic]
             asr_full = torch.index_select(t_en_static, 2, expanded_indices)  # [1, 512, T_acoustic]
 
-            # Stage 4: Acoustic expand
-            en = self._acexp_m(d_enc_exp)   # [1, T_acoustic, h']
+            # Stage 4: Acoustic expand — pad to static T_ACOUSTIC (matches TFLite)
+            pad4 = _T_ACOUSTIC - T_acoustic
+            d_enc_exp_padded = F.pad(d_enc_exp, (0, pad4))                 # [1, h, T_ACOUSTIC]
+            en_padded = self._acexp_m(d_enc_exp_padded)                    # [1, T_ACOUSTIC, h']
 
-            # Stage 5: F0/N predictor
-            F0_full, N_full = self._f0n_m(en, style)
-            T_f0 = 2 * T_acoustic
-            F0 = F0_full[:, :T_f0]
-            N = N_full[:, :T_f0]
+            # Stage 5: F0/N predictor — use padded en (matches TFLite)
+            T_f0_actual = 2 * T_acoustic
+            F0_full, N_full = self._f0n_m(en_padded, style)
+            F0 = F0_full[:, :T_f0_actual]
+            N = N_full[:, :T_f0_actual]
             asr = asr_full[:, :, :T_acoustic]
 
             # Stage 6: Vocos conditioner
@@ -698,7 +730,7 @@ class KokoroPTTTS:
                     _to_numpy(asr), _to_numpy(F0), _to_numpy(N), _to_numpy(style)
                 )
             )
-            conditioned = self._cond_m(features.float())   # [1, 192, T_f0]
+            conditioned = self._cond_m(features.float())   # [1, 192, T_f0_actual]
 
             # Stage 7: Streaming Vocos (backbone + head)
             state = self._vocos.init_state(batch_size=1)
@@ -727,6 +759,7 @@ class KokoroPTTTS:
 
         audio = torch.cat(chunks).cpu().numpy()
         return audio
+
 
 
 # ---------------------------------------------------------------------------

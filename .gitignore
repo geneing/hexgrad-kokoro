@@ -3,6 +3,15 @@ checkpoints/
 .venv/
 saved_model/
 onnx/
+onnx_streaming_vocos/
+onnx2tf_conversion/
+tflite_outputs/
+debug_dft/
+onnx_android/
+tflite_android/
+
+*.pt
+*.pkl
 *.wav
 *.png
 
