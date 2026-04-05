@@ -175,11 +175,10 @@ class KokoroTFLiteTTS:
     ``vocoder_stream_chunk``.
 
     The ``vocoder_stream_chunk_float32.tflite`` model is converted from
-    ``VocosStreamChunkNoOLA``, which replaces ``torch.fft.irfft`` with explicit
-    real-arithmetic IDFT (cos/sin matrix multiplications) and removes the
-    ``ConvTranspose1d`` overlap-add layer.  The overlap-add is performed in
-    Python/NumPy instead, avoiding the ~26× amplitude error that
-    ``onnx2tf flatbuffer_direct`` produces for that ConvTranspose.
+    ``VocosStreamChunkReal``, which performs the full pipeline internally:
+    real-arithmetic IDFT (cos/sin matrix multiplications) replaces
+    ``torch.fft.irfft``, and pad-sum overlap-add replaces ``ConvTranspose1d``.
+    Audio is output directly — no external IRFFT or OLA required.
 
     Parameters
     ----------
@@ -235,23 +234,12 @@ class KokoroTFLiteTTS:
         # Verify static dimensions match expected constants
         self._verify_model_dimensions()
 
-        # ── Pre-compute Hann window for IRFFT windowing ──────────────────────
-        import torch as _torch
-        self._vocos_window = _torch.hann_window(_WIN_LEN).numpy()   # [win_len]
-
-        # ── Auto-detect vocoder chunk input/output layouts ────────────────
+        # ── Auto-detect vocoder chunk input layout ─────────────────────────
         # onnx2tf may transpose NCT tensors to NTC (last-dim = channels).
         # conditioned_chunk input: [1, 192, 16] NCT → [1, 16, 192] NTC
-        # x_real/x_imag outputs: [1, F, K=601] NTK or [1, K, F] NKT
         _vsc_in0_shape  = self._vocos_interp.get_input_details()[0]["shape"]
-        _vsc_out0_shape = self._vocos_interp.get_output_details()[0]["shape"]
-        _K = _VOCOS_N_FFT // 2 + 1
         self._vocos_chunk_ntc: bool = (
             len(_vsc_in0_shape) == 3 and _vsc_in0_shape[-1] == _VOCOS_EMBED_IN
-        )
-        # x_real is NTK when last dim equals K (601)
-        self._vocos_xreal_ntk: bool = (
-            len(_vsc_out0_shape) == 3 and _vsc_out0_shape[-1] == _K
         )
 
     # ── Model loading helpers ────────────────────────────────────────────────
@@ -371,11 +359,11 @@ class KokoroTFLiteTTS:
         return interp.get_tensor(interp.get_output_details()[0]["index"])  # [1, 192, T_F0]
 
     def _run_vocos_stream_chunk(self, conditioned: np.ndarray) -> np.ndarray:
-        """Run the streaming Vocos backbone via TFLite, apply numpy IRFFT + OLA.
+        """Run the streaming Vocos backbone via TFLite and return audio.
 
-        The TFLite model (VocosPreIRFFT) outputs x_real/x_imag [1,F,K] — the
-        complex spectrum just before irfft.  numpy.fft.irfft (= tf.signal.irfft)
-        is applied here in Python, followed by Hann-window and overlap-add.
+        The TFLite model (VocosStreamChunkReal) performs the full pipeline
+        internally: real-matmul IDFT (cos/sin basis) + pad-sum overlap-add.
+        Output [0] is audio ``[1, CHUNK_FRAMES * HOP]`` directly.
 
         Parameters
         ----------
@@ -391,10 +379,9 @@ class KokoroTFLiteTTS:
         out_d  = interp.get_output_details()
 
         total = conditioned.shape[-1]   # conditioned is NCT: [1, 192, T_f0]
-        _K    = _VOCOS_N_FFT // 2 + 1
 
-        state      = [np.zeros(d["shape"], dtype=np.float32) for d in in_d[1:]]
-        istft_prev = np.zeros((1, _ISTFT_TAIL), dtype=np.float32)
+        # Initialise all state tensors (embed + 8 blocks + istft_prev)
+        state = [np.zeros(d["shape"], dtype=np.float32) for d in in_d[1:]]
 
         chunks: List[np.ndarray] = []
         pos = 0
@@ -413,27 +400,14 @@ class KokoroTFLiteTTS:
                 interp.set_tensor(in_d[1 + i]["index"], s)
             interp.invoke()
 
-            # x_real / x_imag: [1, F, K] NTK or [1, K, F] NKT
-            xr_raw = interp.get_tensor(out_d[0]["index"])
-            xi_raw = interp.get_tensor(out_d[1]["index"])
-            if self._vocos_xreal_ntk:
-                x_real, x_imag = xr_raw, xi_raw          # already [1, F, K]
-            else:
-                x_real = np.transpose(xr_raw, (0, 2, 1)) # NKT → NTK [1, F, K]
-                x_imag = np.transpose(xi_raw, (0, 2, 1))
+            # Output 0 is audio [1, CHUNK_FRAMES * HOP]
+            audio_chunk = interp.get_tensor(out_d[0]["index"])
+            chunks.append(audio_chunk.flatten()[: valid * _HOP])
 
-            # numpy IRFFT (= tf.signal.irfft) + Hann window
-            spec = x_real + 1j * x_imag
-            tf_chunk = np.fft.irfft(spec, n=_VOCOS_N_FFT, axis=-1)[..., : _WIN_LEN].astype(np.float32)
-            tf_chunk = tf_chunk * self._vocos_window                # [1, F, win_len]
-
-            audio_chunk, istft_prev = _overlap_add(tf_chunk, istft_prev, _HOP, _ISTFT_TAIL)
-            chunks.append(audio_chunk[0, : valid * _HOP])
-
-            # Update backbone state; transpose NCT → NTC where needed
+            # Update state: outputs 1+ map positionally to inputs 1+
             new_state: List[np.ndarray] = []
             for i, s_in_d in enumerate(in_d[1:]):
-                s_out = interp.get_tensor(out_d[2 + i]["index"])   # outputs 0,1 = x_real,x_imag
+                s_out = interp.get_tensor(out_d[1 + i]["index"])
                 if s_out.ndim == 3 and tuple(s_out.shape) != tuple(s_in_d["shape"]):
                     s_out = np.transpose(s_out, (0, 2, 1))
                 new_state.append(s_out)

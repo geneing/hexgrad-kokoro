@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""export_tflite.py — Export Kokoro TTS TFLite models to export_models/tflite/
+
+Produces three precision variants for each of the 6 pipeline stages:
+
+  bert_float32.tflite                  float32  (25 MB)
+  bert_float16.tflite                  float16  (13 MB)
+
+  duration_predictor_float32.tflite    float32  (52 MB)
+  duration_predictor_float16.tflite    float16  (26 MB)
+  duration_predictor_full_int8.tflite  INT8     (14 MB)
+
+  acoustic_expand_float32.tflite       float32  (7.1 MB)
+  acoustic_expand_float16.tflite       float16  (3.6 MB)
+  acoustic_expand_full_int8.tflite     INT8     (2.4 MB)
+
+  f0n_predictor_float32.tflite         float32  (26 MB)
+  f0n_predictor_float16.tflite         float16  (14 MB)
+
+  vocoder_conditioner_float32.tflite   float32  (1.1 MB)
+  vocoder_conditioner_float16.tflite   float16  (0.5 MB)
+  vocoder_conditioner_full_int8.tflite INT8     (0.3 MB)
+
+  vocoder_stream_chunk_float32.tflite  float32  (31 MB)
+  vocoder_stream_chunk_float16.tflite  float16  (16 MB)
+  vocoder_stream_chunk_full_int8.tflite INT8    (8.1 MB)
+
+Note: bert and f0n_predictor do not have full INT8 TFLite variants. Use float16 for
+those two stages. See Android_Inference_Specification_tflite.md for recommended
+mixed-precision configuration.
+
+Source for FP32/FP16: onnx_streaming_vocos/tflite/  (onnx2tf conversions of models
+from streaming_vocos_export.ipynb with VocosStreamChunkReal — real-matmul IDFT
+and pad-sum OLA fully inside the TFLite model, no external IRFFT needed).
+New INT8 models can be generated from scratch via the --regenerate-int8 flag,
+which reruns onnx2tf with calibration data from quantize_int8.py.
+
+Usage
+-----
+    TF_ENABLE_ONEDNN_OPTS=0 uv run python export_tflite.py
+    TF_ENABLE_ONEDNN_OPTS=0 uv run python export_tflite.py --precision float32 float16
+    TF_ENABLE_ONEDNN_OPTS=0 uv run python export_tflite.py --models bert --force
+    TF_ENABLE_ONEDNN_OPTS=0 uv run python export_tflite.py --regenerate-int8
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, Optional
+
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Source: TFLite models converted from onnx_streaming_vocos/ (VocosStreamChunkReal)
+TFLITE_SRC_DIR = Path("onnx_streaming_vocos/tflite")
+
+# ONNX source for regenerating INT8 from scratch
+ONNX_SRC_DIR = Path("onnx_streaming_vocos")
+
+# Destination
+OUTPUT_DIR = Path("export_models/tflite")
+
+ALL_MODELS = [
+    "bert",
+    "duration_predictor",
+    "acoustic_expand",
+    "f0n_predictor",
+    "vocoder_conditioner",
+    "vocoder_stream_chunk",
+]
+
+# Models that have a validated full INT8 variant in onnx_streaming_vocos/tflite/
+INT8_MODELS = [
+    "duration_predictor",
+    "acoustic_expand",
+    "vocoder_conditioner",
+    "vocoder_stream_chunk",
+]
+
+ALL_PRECISIONS = ["float32", "float16", "int8"]
+
+# Source filename suffix per precision (onnx_streaming_vocos/tflite/ naming convention)
+SRC_SUFFIX: Dict[str, str] = {
+    "float32": "",          # e.g. bert.tflite
+    "float16": "_fp16",     # e.g. bert_fp16.tflite
+    "int8": "_full_int8",   # e.g. bert_full_int8.tflite (generated)
+}
+
+# Destination filename suffix (export_models/tflite/ naming convention)
+DST_SUFFIX: Dict[str, str] = {
+    "float32": "_float32",
+    "float16": "_float16",
+    "int8": "_full_int8",
+}
+
+
+# ---------------------------------------------------------------------------
+# Copy from onnx_streaming_vocos/tflite/
+# ---------------------------------------------------------------------------
+
+def _copy_model(
+    model_name: str,
+    precision: str,
+    src_dir: Path,
+    output_dir: Path,
+    force: bool,
+) -> Optional[Path]:
+    """Copy a pre-converted TFLite model to output_dir with standardised naming."""
+    src_fname = f"{model_name}{SRC_SUFFIX[precision]}.tflite"
+    dst_fname = f"{model_name}{DST_SUFFIX[precision]}.tflite"
+    src = src_dir / src_fname
+    dst = output_dir / dst_fname
+
+    if not src.exists():
+        return None  # silently skip if variant doesn't exist
+
+    if dst.exists() and not force:
+        size = dst.stat().st_size / 1e6
+        print(f"  [exists]  {dst.name:55s}  {size:6.1f} MB")
+        return dst
+
+    shutil.copy2(src, dst)
+    size = dst.stat().st_size / 1e6
+    print(f"  [copied]  {dst.name:55s}  {size:6.1f} MB")
+    return dst
+
+
+# ---------------------------------------------------------------------------
+# INT8 regeneration via onnx2tf + quantize_int8.py calibration
+# ---------------------------------------------------------------------------
+
+def _regenerate_int8(
+    model_names: List[str],
+    output_dir: Path,
+    force: bool,
+    onnx_src_dir: Path = None,
+) -> None:
+    """Regenerate full INT8 TFLite models from ONNX using onnx2tf with calibration.
+
+    Only runs for models that are known to produce good INT8 TFLite quality.
+    This reuses quantize_int8.py's generate_calibration_data() and
+    save_calib_npy() helpers.
+    """
+    try:
+        from onnx2tf import convert as onnx2tf_convert
+    except ImportError:
+        print("  ERROR: onnx2tf not installed. Run from onnx2tf_conversion/.venv.")
+        return
+
+    import quantize_int8 as q8
+
+    if onnx_src_dir is not None:
+        q8.ONNX_DIR = onnx_src_dir
+
+    targets = [m for m in model_names if m in INT8_MODELS]
+    if not targets:
+        print("  No INT8-capable models selected.")
+        return
+
+    needed = []
+    for name in targets:
+        dst = output_dir / f"{name}_full_int8.tflite"
+        if dst.exists() and not force:
+            size = dst.stat().st_size / 1e6
+            print(f"  [exists]  {dst.name:55s}  {size:6.1f} MB")
+        else:
+            src = ONNX_SRC_DIR / f"{name}.onnx"
+            if not src.exists():
+                print(f"  [missing] ONNX source {src} — cannot regenerate {name}")
+            else:
+                needed.append(name)
+
+    if not needed:
+        return
+
+    print(f"\n  Regenerating INT8 via onnx2tf for: {', '.join(needed)}")
+
+    original_onnx_dir = q8.ONNX_DIR
+    q8.ONNX_DIR = ONNX_SRC_DIR
+
+    try:
+        _, kpipeline = q8.load_kokoro_pipeline()
+        calib_data = q8.generate_calibration_data(kpipeline)
+        q8.quantize_litert(
+            model_names=needed,
+            output_dir=output_dir,
+            dynamic_range=False,
+            full_integer=True,
+            source_dir=ONNX_SRC_DIR,
+            calib_data=calib_data,
+        )
+    finally:
+        q8.ONNX_DIR = original_onnx_dir
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Export Kokoro TTS TFLite models to export_models/tflite/",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=ALL_MODELS,
+        choices=ALL_MODELS,
+        metavar="MODEL",
+        help="Models to export.",
+    )
+    parser.add_argument(
+        "--precision",
+        nargs="+",
+        default=ALL_PRECISIONS,
+        choices=ALL_PRECISIONS,
+        metavar="PREC",
+        help="Precisions: float32, float16, int8.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=OUTPUT_DIR,
+        help="Output directory.",
+    )
+    parser.add_argument(
+        "--source",
+        type=Path,
+        default=TFLITE_SRC_DIR,
+        help="Source onnx_streaming_vocos/tflite/ directory.",
+    )
+    parser.add_argument(
+        "--onnx-source",
+        type=Path,
+        default=ONNX_SRC_DIR,
+        dest="onnx_source",
+        help="Source onnx_streaming_vocos/ directory (used when --regenerate-int8).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-export even if output files already exist.",
+    )
+    parser.add_argument(
+        "--regenerate-int8",
+        action="store_true",
+        dest="regenerate_int8",
+        help=(
+            "Regenerate INT8 models via onnx2tf + calibration instead of "
+            "copying from onnx_streaming_vocos/tflite/. Requires onnx2tf environment."
+        ),
+    )
+    args = parser.parse_args()
+
+    src_dir = args.source
+    onnx_src_dir = args.onnx_source
+    output_dir = args.output
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not src_dir.exists() and not args.regenerate_int8:
+        print(
+            f"ERROR: Source directory '{src_dir}' not found.\n"
+            "Run onnx2tf conversion (streaming_vocos_export.ipynb) first, or\n"
+            "use --regenerate-int8 to produce INT8 models from ONNX sources.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"Exporting to {output_dir}/")
+    print(f"Models:     {', '.join(args.models)}")
+    print(f"Precisions: {', '.join(args.precision)}")
+    print()
+
+    t_total = time.perf_counter()
+
+    # ── Float32 and Float16 (copy) ────────────────────────────────────────────
+    for prec in ("float32", "float16"):
+        if prec not in args.precision:
+            continue
+        label = "Float32" if prec == "float32" else "Float16"
+        print(f"── {label} (copy from {src_dir}/) ──")
+        found = 0
+        for name in args.models:
+            if _copy_model(name, prec, src_dir, output_dir, args.force):
+                found += 1
+        if found == 0:
+            print(f"  (no {prec} models found in {src_dir}/)")
+        print()
+
+    # ── INT8 ─────────────────────────────────────────────────────────────────
+    if "int8" in args.precision:
+        if args.regenerate_int8:
+            print("── Full INT8 (regenerate via onnx2tf + calibration) ──")
+            _regenerate_int8(args.models, output_dir, args.force, onnx_src_dir)
+        else:
+            print(f"── Full INT8 (copy from {src_dir}/) ──")
+            found = 0
+            for name in args.models:
+                if name not in INT8_MODELS:
+                    print(
+                        f"  [skip]    {name}_full_int8.tflite"
+                        f"  (no validated INT8 variant — use float16)"
+                    )
+                    continue
+                if _copy_model(name, "int8", src_dir, output_dir, args.force):
+                    found += 1
+            if found == 0:
+                print(
+                    f"  (no INT8 models found — run with --regenerate-int8 to generate)"
+                )
+        print()
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    elapsed = time.perf_counter() - t_total
+    files = sorted(output_dir.glob("*.tflite"))
+    total_mb = sum(f.stat().st_size for f in files) / 1e6
+    print("── Summary ──")
+    print(f"  {len(files)} models in {output_dir}/  ({total_mb:.0f} MB total)  [{elapsed:.0f}s]")
+    for f in files:
+        print(f"  {f.stat().st_size/1e6:6.1f} MB  {f.name}")
+
+    # Deployment guide
+    print()
+    print("── Recommended Android configuration ──")
+    print("  FP16 (GPU delegate):   bert_float16 + duration_predictor_float16 +")
+    print("                         acoustic_expand_float16 + f0n_predictor_float16 +")
+    print("                         vocoder_conditioner_float16 + vocoder_stream_chunk_float16")
+    print("  Mixed INT8 (NNAPI NPU): bert_float16 + duration_predictor_full_int8 +")
+    print("                          acoustic_expand_full_int8 + f0n_predictor_float16 +")
+    print("                          vocoder_conditioner_full_int8 + vocoder_stream_chunk_full_int8")
+    print("  Total mixed INT8: ~52 MB  (vs ~73 MB FP16)")
+
+
+if __name__ == "__main__":
+    main()

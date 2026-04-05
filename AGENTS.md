@@ -40,15 +40,17 @@ cd onnx2tf_conversion
 TF_ENABLE_ONEDNN_OPTS=0 uv run onnx2tf -i duration_predictor.onnx -osd -o saved_model
 ```
 
-### Export ONNX for Android (FastGELU + VocosPreIRFFT)
+### Export ONNX models (VocosStreamChunkReal — internal DFT)
 ```bash
-TF_ENABLE_ONEDNN_OPTS=0 uv run python onnx_export_android.py
+# Run streaming_vocos_export.ipynb (cells 1–12) to export all ONNX + TFLite models.
+# Models are written to onnx_streaming_vocos/ and onnx_streaming_vocos/tflite/
 ```
-Outputs to `onnx_android/` — FP32 + opt + FP16 variants + comparison test.
 
-### Re-export vocoder
+### Re-export vocoder (VocosStreamChunkReal)
 ```bash
-TF_ENABLE_ONEDNN_OPTS=0 uv run python export_real_vocoder.py
+# Re-run notebook cell 9 (ONNX Export) in streaming_vocos_export.ipynb
+# or run streaming_vocos_export_litert.py for the full export pipeline
+TF_ENABLE_ONEDNN_OPTS=0 uv run python streaming_vocos_export_litert.py
 ```
 
 ### Re-convert vocoder to TFLite
@@ -61,15 +63,18 @@ TF_ENABLE_ONEDNN_OPTS=0 uv run onnx2tf -i vocoder_stream_chunk.onnx -osd -o save
 
 | File | Role |
 |------|------|
-| `onnx_export_android.py` | Android ONNX export: FastGELU, VocosPreIRFFTAndroid, comparison test |
+| `streaming_vocos_export.ipynb` | Main export notebook: BERT, duration, acoustic_expand, F0N, conditioner, VocosStreamChunkReal (internal DFT) → ONNX + TFLite |
+| `streaming_vocos_export_litert.py` | Script version of the full ONNX+TFLite export pipeline |
 | `tflite_inference.py` | Main TFLite inference pipeline. `KokoroTFLiteTTS` runs all 7 stages. `KokoroPTTTS` is the PyTorch reference (with matching padding) |
-| `export_real_vocoder.py` | Exports `VocosPreIRFFT` (backbone+head minus IRFFT/OLA) to ONNX → TFLite |
-| `streaming_vocos_export.ipynb` | Exports BERT, duration, acoustic_expand, F0N, conditioner |
+| `export_onnx.py` | Packages ONNX models from `onnx_streaming_vocos/` into `export_models/onnx/` with FP16/INT8 variants |
+| `export_tflite.py` | Packages TFLite models from `onnx_streaming_vocos/tflite/` into `export_models/tflite/` |
 | `onnx2tf_conversion/main.py` | Runs onnx2tf for all models |
 | `streaming_vocos.py` | `StreamingVocos` — PyTorch stateful streaming vocoder |
 | `kokoro/model.py` | `KModel`, `KModelForONNX` — Kokoro model definition |
 | `kokoro/modules.py` | `TextEncoder`, `ProsodyPredictor`, `DurationEncoder` |
 | `kokoro/pipeline.py` | `KPipeline` — g2p + voice loading |
+| `kotlin/example_onnx_inference.py` | End-to-end ONNX Runtime inference example (audio output directly from model) |
+| `kotlin/example_tflite_inference.py` | End-to-end LiteRT inference example (audio output directly from model) |
 | `kotlin/Android_Inference_Specification_tflite.md` | Full Android LiteRT inference spec |
 | `kotlin/Android_Inference_Specification_onnx.md` | Full Android ONNX Runtime inference spec |
 | `PLAN.md` | Architecture decisions |
@@ -90,8 +95,10 @@ TF_ENABLE_ONEDNN_OPTS=0 uv run onnx2tf -i vocoder_stream_chunk.onnx -osd -o save
 
 2. **en-trim bug**: Never trim `en` (acoustic_expand output) to `T_acoustic` before sending to F0N predictor. Always send the full `T_ACOUSTIC`-length output.
 
-3. **Vocos state transpose**: `Identity_3..10` outputs are `[1, 384, 6]` NCT but next invocation inputs are `[1, 6, 384]` NTC. Transpose before feeding back.
+3. **Vocos state transpose**: `Identity_1..9` state outputs may be `[1, 384, 6]` NCT while corresponding inputs expect `[1, 6, 384]` NTC. Transpose before feeding back (handled automatically in inference code).
 
 4. **Duration predictor speed input**: float32 (not int32). input_ids: int64 (not int32).
 
 5. **Weight norm**: Remove with `nn.utils.remove_weight_norm(layer)` before any ONNX export that uses `weight_norm`'d layers. onnx2tf incorrectly handles `weight_g`/`weight_v` parameters.
+
+6. **Vocoder DFT**: All exported ONNX and TFLite vocoder models use `VocosStreamChunkReal` — real-matmul IDFT (cos/sin basis) + pad-sum OLA, fully inside the network. No external `numpy.fft.irfft` is needed at inference time.
