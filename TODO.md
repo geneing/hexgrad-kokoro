@@ -11,6 +11,13 @@
 - [x] Full pipeline validation (corr=1.0000)
 - [x] Write Android/Kotlin specification `kotlin/Android_Inference_Specification.md`
 - [x] Write PLAN.md, PROGRESS.md
+- [x] Replace `torch.fft.irfft` with real-matmul IDFT (cos/sin basis) in `VocosStreamChunkReal` — no DFT op in export
+- [x] Replace `ConvTranspose1d` OLA with pad+sum OLA — fixes onnx2tf axis-transposition crash
+- [x] FastGELU (`x * sigmoid(1.702x)`) replacing `nn.GELU` throughout Vocos backbone — no unsupported GELU op
+- [x] `streaming_vocos_export.ipynb` LiteRT pipeline (cell 16): correlation 1.0 vs ONNX reference
+- [x] onnx2tf conversion: use `-osd` (SavedModel path) for `vocoder_stream_chunk` to avoid `flatbuffer_direct` bug
+- [x] `package_models.py` — zip ONNX + TFLite weights for download (`kokoro_streaming_vocos_models.zip`)
+- [x] Update notebook specs (cell 1) with exact filenames, TFLite implementation notes
 
 ## 🔄 In Progress
 
@@ -31,4 +38,5 @@
 
 - Duration predictor TFLite uses `serving_default_*:0` naming and int64 input_ids / float32 speed
 - Vocos state outputs `Identity_3..10` are [1,384,6] NCT but inputs expect [1,6,384] NTC — transpose required
+- Vocoder TFLite (`vocoder_stream_chunk.tflite`) uses `-osd` onnx2tf conversion; source is `vocoder_stream_chunk_osd/vocoder_stream_chunk_float32.tflite`
 - For long texts, split at sentence boundaries and concatenate audio for best quality
