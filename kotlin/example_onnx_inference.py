@@ -88,11 +88,11 @@ PRECISION_SUFFIX: Dict[str, Dict[str, str]] = {
     # int8_mixed: quality-preserving config (~114 MB vs 151 MB fp32, 25% reduction)
     # Keeps models with poor INT8 quality in fp32/fp16.
     "int8_mixed": {
-        "bert":                 "_fp32",           # poor INT8 quality (0.17 cosine_sim)
+        "bert":                 "_fp32",           # bert INT8 cosine_sim=0.57 cascades badly; stay fp32
         "duration_predictor":   "_int8_static",    # improved: LSTM excluded; 0.9992 cosine_sim
         "acoustic_expand":      "_int8_static",    # lossless INT8 (1.000 cosine_sim)
         "f0n_predictor":        "_int8_static",    # good quality (0.76 pearson)
-        "vocoder_conditioner":  "_fp32",           # tiny (1.1 MB); catastrophic INT8
+        "vocoder_conditioner":  "_fp32",           # tiny (1.1 MB); all-nodes-excluded → use fp32
         "vocoder_stream_chunk": "_fp16",           # fp16 = fp32 quality on CPU; avoids state accumulation
     },
 }

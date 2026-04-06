@@ -312,7 +312,7 @@ PRECISION_MAPS = {
     "fp32":   {m: "_fp32"         for m in MODEL_NAMES},
     "fp16":   {m: "_fp16"         for m in MODEL_NAMES},
     "int8":   {m: "_int8_static"  for m in MODEL_NAMES},
-    # int8_mixed: quality-preserving config, bert/conditioner fp32, vocoder fp16
+    # int8_mixed: quality-preserving config, bert fp32 (INT8 cascades badly at 0.57 cosine_sim), conditioner fp32, vocoder fp16
     "int8_mixed": {
         "bert":                 "_fp32",
         "duration_predictor":   "_int8_static",

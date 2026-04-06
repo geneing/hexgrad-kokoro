@@ -400,7 +400,15 @@ def _nodes_to_exclude(model_name: str, src: Path) -> List[str]:
     """Return nodes that should NOT be quantized for a given model.
 
     Strategy per model:
-    - bert: exclude Softmax (attention) + LayerNorm (narrow/shifted range)
+    - bert: exclude Softmax + LayerNorm + all MatMuls + attention-mask Add nodes.
+      Root cause analysis: the ALBERT ONNX model routes weight matrices through
+      Identity nodes, so activation quantization (Q/DQ pairs) is inserted around
+      all intermediate tensors. Specifically, the Add nodes that apply the attention
+      mask produce -inf values (float approximately -3.4e38) for padding positions;
+      including these in calibration completely destroys the INT8 scale factor.
+      Additionally, LayerNorm output outliers (|x| up to 25) corrupt downstream
+      MatMul activations. Weight matrices are still stored as INT8 initializers
+      (compression preserved), but activation Q/DQ pairs are suppressed.
     - duration_predictor: exclude LSTM (extremely sensitive to quantization)
     - acoustic_expand: nothing — BiLSTM quantizes losslessly
     - f0n_predictor: nothing — ConvNet quantizes well
@@ -411,10 +419,46 @@ def _nodes_to_exclude(model_name: str, src: Path) -> List[str]:
     try:
         m = onnx.load(str(src))
         if model_name == "bert":
+            # Build output tensor → node map to find Softmax parents
+            output_to_node: Dict[str, object] = {}
+            for n in m.graph.node:
+                for o in n.output:
+                    output_to_node[o] = n
+
+            # Find Add nodes that are direct parents of each Softmax input.
+            # These Add nodes apply the attention mask, introducing -inf values
+            # that would catastrophically skew the INT8 calibration scale.
+            softmax_parent_add_names: set = set()
+            for n in m.graph.node:
+                if n.op_type == "Softmax":
+                    parent = output_to_node.get(n.input[0])
+                    if parent is not None and parent.op_type == "Add" and parent.name:
+                        softmax_parent_add_names.add(parent.name)
+
+            # Build Identity-forwarding map.  ALBERT exports shared weights via
+            # Identity nodes (e.g. initializer → Identity → Identity → MatMul).
+            # Direct initializer names aren't the immediate inputs of most MatMuls.
+            init_names: set = {i.name for i in m.graph.initializer}
+
             for n in m.graph.node:
                 if n.op_type in ("Softmax", "LayerNormalization"):
                     if n.name:
                         excludes.append(n.name)
+                elif n.name in softmax_parent_add_names:
+                    excludes.append(n.name)
+                elif n.op_type == "MatMul":
+                    # Exclude MatMuls where neither input is DIRECTLY an initializer.
+                    # This covers all MatMuls that receive weights via Identity nodes
+                    # (the majority) AND pure activation MatMuls (Q×Kᵀ, attn_weights×V).
+                    # Effect: only the 8 MatMuls that take initializers as a direct input
+                    # are quantized; those are the "head" copies of each unique weight
+                    # matrix, giving full INT8 weight compression.  The remaining ~90
+                    # Identity-forwarded MatMuls have their activation Q/DQ pairs
+                    # suppressed, avoiding the outlier-driven scale corruption from
+                    # LayerNorm outputs (|x| up to 25σ) and -inf attention mask values.
+                    if not any(inp in init_names for inp in n.input):
+                        if n.name:
+                            excludes.append(n.name)
         elif model_name == "duration_predictor":
             for n in m.graph.node:
                 if n.op_type in ("LSTM", "GRU", "RNN"):
