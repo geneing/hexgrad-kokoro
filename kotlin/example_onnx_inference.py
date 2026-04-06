@@ -65,11 +65,36 @@ TAIL = 900              # overlap-add tail (win_len - hop = 1200 - 300)
 KERN = 6                # causal conv context depth (kernel_size - 1)
 N_BLOCKS = 8            # Vocos ConvNeXt blocks
 
-# Model name → suffix map per precision
-PRECISION_SUFFIX: Dict[str, str] = {
-    "fp32": "_fp32",
-    "fp16": "_fp16",
-    "int8": "_int8_static",
+# Model name → suffix map per precision.
+# For 'int8' the map is per-model to keep fragile models in fp32:
+#   bert: ALBERT attention MatMuls degrade too much even with Softmax/LN excluded
+#   vocoder_conditioner: tiny (1.1 MB), catastrophic INT8 quality
+#   vocoder_stream_chunk: streaming state accumulates INT8 errors over chunks → use fp16
+#                         (fp16 ONNX ≡ fp32 quality on CPU; 2× smaller on-disk)
+PRECISION_SUFFIX: Dict[str, Dict[str, str]] = {
+    "fp32": {m: "_fp32"         for m in [
+        "bert", "duration_predictor", "acoustic_expand",
+        "f0n_predictor", "vocoder_conditioner", "vocoder_stream_chunk",
+    ]},
+    "fp16": {m: "_fp16"         for m in [
+        "bert", "duration_predictor", "acoustic_expand",
+        "f0n_predictor", "vocoder_conditioner", "vocoder_stream_chunk",
+    ]},
+    # int8: all models use static INT8 (for compatibility / testing all INT8 models)
+    "int8": {m: "_int8_static"  for m in [
+        "bert", "duration_predictor", "acoustic_expand",
+        "f0n_predictor", "vocoder_conditioner", "vocoder_stream_chunk",
+    ]},
+    # int8_mixed: quality-preserving config (~114 MB vs 151 MB fp32, 25% reduction)
+    # Keeps models with poor INT8 quality in fp32/fp16.
+    "int8_mixed": {
+        "bert":                 "_fp32",           # poor INT8 quality (0.17 cosine_sim)
+        "duration_predictor":   "_int8_static",    # improved: LSTM excluded; 0.9992 cosine_sim
+        "acoustic_expand":      "_int8_static",    # lossless INT8 (1.000 cosine_sim)
+        "f0n_predictor":        "_int8_static",    # good quality (0.76 pearson)
+        "vocoder_conditioner":  "_fp32",           # tiny (1.1 MB); catastrophic INT8
+        "vocoder_stream_chunk": "_fp16",           # fp16 = fp32 quality on CPU; avoids state accumulation
+    },
 }
 
 
@@ -86,6 +111,22 @@ def _make_session(path: Path, use_nnapi: bool = False) -> ort.InferenceSession:
     # On Android, replace CPUExecutionProvider with NNAPIExecutionProvider:
     #   providers = ["NNAPIExecutionProvider", "CPUExecutionProvider"]
     return ort.InferenceSession(str(path), sess_options=opts, providers=providers)
+
+
+_ORT_FLOAT_TYPES = {"tensor(float16)": np.float16, "tensor(float)": np.float32}
+
+
+def _run(session: ort.InferenceSession, feed: Dict[str, np.ndarray]) -> List[np.ndarray]:
+    """Run session, auto-casting float inputs to the session's declared dtypes."""
+    casted = {}
+    for inp in session.get_inputs():
+        if inp.name in feed:
+            arr = feed[inp.name]
+            target = _ORT_FLOAT_TYPES.get(inp.type)
+            if target is not None and arr.dtype != target:
+                arr = arr.astype(target)
+            casted[inp.name] = arr
+    return session.run(None, casted)
 
 
 # ---------------------------------------------------------------------------
@@ -121,8 +162,7 @@ def _text_to_inputs(
 
     # Style vector from voice pack (row = num_phonemes - 1)
     pack = kpipeline.load_voice(voice_path).cpu()
-    style = pack[len(ps) - 1].detach().numpy().astype(np.float32)  # [256]
-    style = style[np.newaxis, :]  # [1, 256]
+    style = pack[len(ps) - 1].detach().numpy().astype(np.float32)  # [1, 256]
 
     # Pad to MAX_INPUT_LENGTH
     seqlen = raw_ids.shape[1]
@@ -161,18 +201,19 @@ def _expand_durations(pred_dur: np.ndarray) -> Tuple[np.ndarray, int]:
 
 def _build_vocos_features(
     asr: np.ndarray,       # [1, 512, T_acoustic] NCT
-    f0_pred: np.ndarray,   # [1, T_F0]
-    n_pred: np.ndarray,    # [1, T_F0]
+    f0_pred: np.ndarray,   # [1, T_f0_actual]
+    n_pred: np.ndarray,    # [1, T_f0_actual]
     style: np.ndarray,     # [1, 256]
 ) -> np.ndarray:
-    """Assemble conditioner input [1, 642, T_F0] NCT."""
+    """Assemble conditioner input [1, 642, T_f0_actual] NCT."""
+    T_f0 = f0_pred.shape[-1]  # derive from actual prediction length
     asr_t = torch.from_numpy(asr.astype(np.float32))    # [1, 512, T_acoustic]
-    if asr_t.shape[-1] != T_F0:
-        asr_t = F.interpolate(asr_t, size=T_F0, mode="linear", align_corners=False)
-    f0 = torch.from_numpy(f0_pred.astype(np.float32)).unsqueeze(1)   # [1,1,T_F0]
-    n  = torch.from_numpy(n_pred.astype(np.float32)).unsqueeze(1)    # [1,1,T_F0]
-    s  = torch.from_numpy(style.astype(np.float32))[:, :128].unsqueeze(-1).expand(-1, -1, T_F0)
-    return torch.cat([asr_t, f0, n, s], dim=1).numpy()  # [1, 642, T_F0]
+    if asr_t.shape[-1] != T_f0:
+        asr_t = F.interpolate(asr_t, size=T_f0, mode="linear", align_corners=False)
+    f0 = torch.from_numpy(f0_pred.astype(np.float32)).unsqueeze(1)   # [1,1,T_f0]
+    n  = torch.from_numpy(n_pred.astype(np.float32)).unsqueeze(1)    # [1,1,T_f0]
+    s  = torch.from_numpy(style.astype(np.float32))[:, :128].unsqueeze(-1).expand(-1, -1, T_f0)
+    return torch.cat([asr_t, f0, n, s], dim=1).numpy()  # [1, 642, T_f0]
 
 
 # ---------------------------------------------------------------------------
@@ -210,16 +251,16 @@ def generate(
 
     # ── S1: BERT encoder ──────────────────────────────────────────────────
     # IN:  input_ids [1,510] int32,  text_mask [1,510] float32
-    # OUT: d_en      [1,510,512] NTC float32
-    d_en = sessions["bert"].run(None, {
+    # OUT: d_en      [1,512,510] NCT float32
+    d_en = _run(sessions["bert"], {
         "input_ids": input_ids,
         "text_mask": text_mask,
-    })[0]   # [1, 510, 512] NTC
+    })[0]   # [1, 512, 510] NCT
 
     # ── S2: Duration predictor ────────────────────────────────────────────
-    # IN:  d_en NTC, style, text_mask, speed [1] int32, input_ids int32
-    # OUT: pred_dur [510], d_enc [1,h,510] NCT, t_en_static [1,512,510] NCT
-    dur_outs = sessions["duration_predictor"].run(None, {
+    # IN:  d_en [1,512,510] NCT, style [1,256], text_mask [1,510], speed [1], input_ids [1,510]
+    # OUT: pred_dur [510], d_enc [1,640,510] NCT, t_en_static [1,512,510] NCT
+    dur_outs = _run(sessions["duration_predictor"], {
         "d_en":       d_en,
         "style":      style,
         "text_mask":  text_mask,
@@ -252,26 +293,25 @@ def generate(
     asr = np.take(t_en_static, expanded_idx, axis=2)     # [1, 512, T_acoustic]
 
     # ── S4: Acoustic expand ────────────────────────────────────────────────
-    # IN:  d_enc_expanded [1, T_ACOUSTIC, 640] NTC  (transpose + zero-pad)
+    # IN:  d_enc_expanded [1, 640, T_ACOUSTIC] NCT  (zero-pad in axis=2)
     # OUT: en             [1, T_ACOUSTIC, 512] NTC
-    d_enc_exp_ntc = np.transpose(d_enc_exp, (0, 2, 1))   # → [1, T_acoustic, 640]
     if T_acoustic < T_ACOUSTIC:
-        d_enc_exp_ntc = np.pad(
-            d_enc_exp_ntc, ((0, 0), (0, T_ACOUSTIC - T_acoustic), (0, 0))
+        d_enc_exp_padded = np.pad(
+            d_enc_exp, ((0, 0), (0, 0), (0, T_ACOUSTIC - T_acoustic))
         )
+    else:
+        d_enc_exp_padded = d_enc_exp
 
-    en_ntc = sessions["acoustic_expand"].run(None, {
-        "d_enc_expanded": d_enc_exp_ntc.astype(np.float32),
+    en_ntc = _run(sessions["acoustic_expand"], {
+        "d_enc_expanded": d_enc_exp_padded.astype(np.float32),
     })[0]   # [1, T_ACOUSTIC, 512] NTC
 
-    # Transpose to NCT for F0N — send the FULL T_ACOUSTIC output (do NOT trim)
-    en_nct = np.transpose(en_ntc, (0, 2, 1))   # [1, 512, T_ACOUSTIC] NCT
-
     # ── S5: F0/N predictor ────────────────────────────────────────────────
-    # IN:  en [1, 512, T_ACOUSTIC] NCT,  style [1, 256]
+    # IN:  en [1, T_ACOUSTIC, 512] NTC,  style [1, 256]
     # OUT: F0_pred [1, T_F0],  N_pred [1, T_F0]
-    f0n_outs = sessions["f0n_predictor"].run(None, {
-        "en":    en_nct.astype(np.float32),
+    # Note: feed en_ntc directly — f0n expects NTC (do NOT transpose)
+    f0n_outs = _run(sessions["f0n_predictor"], {
+        "en":    en_ntc.astype(np.float32),
         "style": style,
     })
     f0_full = f0n_outs[0]   # [1, T_F0]
@@ -287,7 +327,7 @@ def generate(
     if T_f0_actual < T_F0:
         features_nct = np.pad(features_nct, ((0, 0), (0, 0), (0, T_F0 - T_f0_actual)))
 
-    conditioned_full = sessions["vocoder_conditioner"].run(None, {
+    conditioned_full = _run(sessions["vocoder_conditioner"], {
         "features": features_nct.astype(np.float32),
     })[0]   # [1, 192, T_F0] NCT
 
@@ -321,7 +361,7 @@ def generate(
             feed[f"block_{b}_prev"] = block_prevs[b]
         feed["istft_prev"] = istft_prev
 
-        vocos_outs = sessions["vocoder_stream_chunk"].run(None, feed)
+        vocos_outs = _run(sessions["vocoder_stream_chunk"], feed)
         # OUT order: audio, embed_prev_new, block_0_prev_new .. block_7_prev_new, istft_prev_new
         audio_chunk = vocos_outs[0]   # [1, CHUNK_FRAMES * HOP]
         embed_prev  = vocos_outs[1]
@@ -347,19 +387,11 @@ def load_sessions(model_dir: Path, precision: str) -> Dict[str, ort.InferenceSes
     model_dir:
         Directory containing the exported ONNX models.
     precision:
-        One of 'fp32', 'fp16', 'int8'.
+        One of 'fp32', 'fp16', 'int8', 'int8_mixed'.
     """
-    suffix = PRECISION_SUFFIX[precision]
-    model_names = [
-        "bert",
-        "duration_predictor",
-        "acoustic_expand",
-        "f0n_predictor",
-        "vocoder_conditioner",
-        "vocoder_stream_chunk",
-    ]
+    suffix_map = PRECISION_SUFFIX[precision]
     sessions: Dict[str, ort.InferenceSession] = {}
-    for name in model_names:
+    for name, suffix in suffix_map.items():
         path = model_dir / f"{name}{suffix}.onnx"
         if not path.exists():
             raise FileNotFoundError(
@@ -396,7 +428,7 @@ def main() -> None:
     parser.add_argument(
         "--precision",
         default="fp16",
-        choices=["fp32", "fp16", "int8"],
+        choices=["fp32", "fp16", "int8", "int8_mixed"],
         help="Model precision to use.",
     )
     parser.add_argument(

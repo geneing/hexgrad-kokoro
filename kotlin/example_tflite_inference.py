@@ -80,12 +80,14 @@ PRECISION_SUFFIX: Dict[str, Dict[str, str]] = {
         "bert", "duration_predictor", "acoustic_expand",
         "f0n_predictor", "vocoder_conditioner", "vocoder_stream_chunk",
     ]},
-    # Mixed: INT8 where available, float16 for bert and f0n_predictor
+    # Mixed: INT8 where available, float32 for bert and f0n_predictor.
+    # Note: on Android with GPU delegate, use _float16 for bert and f0n_predictor instead.
+    # float16 TFLite models require GPU/DSP delegate; they fail on the CPU backend.
     "int8": {
-        "bert":                  "_float16",
+        "bert":                  "_float32",
         "duration_predictor":    "_full_int8",
         "acoustic_expand":       "_full_int8",
-        "f0n_predictor":         "_float16",
+        "f0n_predictor":         "_float32",
         "vocoder_conditioner":   "_full_int8",
         "vocoder_stream_chunk":  "_full_int8",
     },
@@ -137,7 +139,7 @@ def _text_to_inputs(
     raw_ids = torch.IntTensor([[0, *ids, 0]])
 
     pack = kpipeline.load_voice(voice_path).cpu()
-    style = pack[len(ps) - 1].detach().numpy().astype(np.float32)[np.newaxis, :]
+    style = pack[len(ps) - 1].detach().numpy().astype(np.float32)  # [1, 256]
 
     seqlen = raw_ids.shape[1]
     text_mask = np.zeros((1, MAX_INPUT_LENGTH), dtype=np.float32)
@@ -169,19 +171,20 @@ def _expand_durations(pred_dur: np.ndarray) -> Tuple[np.ndarray, int]:
 
 def _build_vocos_features(
     asr: np.ndarray,      # [1, 512, T_acoustic] NCT
-    f0_pred: np.ndarray,  # [1, T_F0]
-    n_pred: np.ndarray,   # [1, T_F0]
+    f0_pred: np.ndarray,  # [1, T_f0_actual]
+    n_pred: np.ndarray,   # [1, T_f0_actual]
     style: np.ndarray,    # [1, 256]
 ) -> np.ndarray:
-    """Assemble NTC [1, T_F0, 642] conditioner input for TFLite (onnx2tf layout)."""
+    """Assemble NTC [1, T_f0_actual, 642] conditioner input for TFLite (onnx2tf layout)."""
+    T_f0 = f0_pred.shape[-1]  # derive from actual prediction length
     asr_t = torch.from_numpy(asr.astype(np.float32))
-    if asr_t.shape[-1] != T_F0:
-        asr_t = F.interpolate(asr_t, size=T_F0, mode="linear", align_corners=False)
+    if asr_t.shape[-1] != T_f0:
+        asr_t = F.interpolate(asr_t, size=T_f0, mode="linear", align_corners=False)
     f0 = torch.from_numpy(f0_pred.astype(np.float32)).unsqueeze(1)
     n  = torch.from_numpy(n_pred.astype(np.float32)).unsqueeze(1)
-    s  = torch.from_numpy(style.astype(np.float32))[:, :128].unsqueeze(-1).expand(-1, -1, T_F0)
-    nct = torch.cat([asr_t, f0, n, s], dim=1).numpy()   # [1, 642, T_F0] NCT
-    return np.transpose(nct, (0, 2, 1))                  # → [1, T_F0, 642] NTC
+    s  = torch.from_numpy(style.astype(np.float32))[:, :128].unsqueeze(-1).expand(-1, -1, T_f0)
+    nct = torch.cat([asr_t, f0, n, s], dim=1).numpy()   # [1, 642, T_f0] NCT
+    return np.transpose(nct, (0, 2, 1))                  # → [1, T_f0, 642] NTC
 
 
 # ---------------------------------------------------------------------------
@@ -268,10 +271,15 @@ def _run_conditioner(
     interp: litert.Interpreter,
     features_ntc: np.ndarray,   # [1, T_F0, 642] NTC
 ) -> np.ndarray:
-    """Conditioner: features NTC → conditioned [1, 192, T_F0] NCT."""
+    """Conditioner: features NTC → conditioned [1, 192, T_F0] NCT (normalised)."""
     interp.set_tensor(interp.get_input_details()[0]["index"], features_ntc.astype(np.float32))
     interp.invoke()
-    return interp.get_tensor(interp.get_output_details()[0]["index"])
+    out = interp.get_tensor(interp.get_output_details()[0]["index"])
+    # onnx2tf may output NCT [1, 192, T_F0] (float32) or NTC [1, T_F0, 192] (int8).
+    # Normalise to NCT so callers always receive [1, 192, T_F0].
+    if out.ndim == 3 and out.shape[1] != 192:
+        out = np.transpose(out, (0, 2, 1))
+    return out
 
 
 # ---------------------------------------------------------------------------

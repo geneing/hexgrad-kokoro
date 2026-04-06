@@ -44,6 +44,9 @@ dependencies = [
     "typer>=0.21.0",
     "tensorflow>=2.19.0",
     "torchao>=0.16.0",
+    "utmos>=1.1.10",
+    "pesq>=0.0.4",
+    "torchaudio==2.11.0",
 ]
 
 [project.scripts]

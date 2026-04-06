@@ -249,16 +249,15 @@ def run_onnx_pipeline_for_calibration(
         d_enc_exp = np.take(d_enc_nct, expanded_indices, axis=2)    # [1, 640, T_acoustic]
         asr = np.take(t_en_static_nct, expanded_indices, axis=2)    # [1, 512, T_acoustic]
 
-        # Transpose NCT → NTC and pad to T_ACOUSTIC
-        d_enc_exp_ntc = np.transpose(d_enc_exp, (0, 2, 1))          # [1, T_acoustic, 640]
+        # Pad NCT along axis=2 to T_ACOUSTIC (model input is [1, 640, T_ACOUSTIC] NCT)
         if T_acoustic < T_ACOUSTIC:
             pad = T_ACOUSTIC - T_acoustic
-            d_enc_exp_ntc = np.pad(d_enc_exp_ntc, ((0, 0), (0, pad), (0, 0)))
+            d_enc_exp = np.pad(d_enc_exp, ((0, 0), (0, 0), (0, pad)))
 
         # ── Stage 4: Acoustic expand ───────────────────────────────────────
-        acexp_inputs = {"d_enc_expanded": d_enc_exp_ntc.astype(np.float32)}
+        acexp_inputs = {"d_enc_expanded": d_enc_exp.astype(np.float32)}
         acexp_outs = sessions["acoustic_expand"].run(None, acexp_inputs)
-        en_ntc = acexp_outs[0]  # [1, T_ACOUSTIC, 512] NTC (padded)
+        en_ntc = acexp_outs[0]  # [1, T_ACOUSTIC, 512] NTC
 
         # ── Stage 5: F0/N predictor ────────────────────────────────────────
         f0n_inputs = {
@@ -299,6 +298,7 @@ def run_onnx_pipeline_for_calibration(
         state_shapes = {
             "embed_prev": (1, 192, KERN),
             **{f"block_{i}_prev": (1, 384, KERN) for i in range(8)},
+            "istft_prev": (1, WIN_LEN - HOP),
         }
         chunk_inputs: Dict[str, np.ndarray] = {"conditioned_chunk": chunk}
         for sname, sshape in state_shapes.items():
@@ -393,6 +393,59 @@ class KokoroCalibrationReader(CalibrationDataReader):
 
 
 # ---------------------------------------------------------------------------
+# Node exclusion helpers — protect sensitive operations from INT8 quantization
+# ---------------------------------------------------------------------------
+
+def _nodes_to_exclude(model_name: str, src: Path) -> List[str]:
+    """Return nodes that should NOT be quantized for a given model.
+
+    Strategy per model:
+    - bert: exclude Softmax (attention) + LayerNorm (narrow/shifted range)
+    - duration_predictor: exclude LSTM (extremely sensitive to quantization)
+    - acoustic_expand: nothing — BiLSTM quantizes losslessly
+    - f0n_predictor: nothing — ConvNet quantizes well
+    - vocoder_conditioner: skip entirely (model is too small; all nodes excluded)
+    - vocoder_stream_chunk: exclude IDFT+OLA section (audio generation is fp32-sensitive)
+    """
+    excludes: List[str] = []
+    try:
+        m = onnx.load(str(src))
+        if model_name == "bert":
+            for n in m.graph.node:
+                if n.op_type in ("Softmax", "LayerNormalization"):
+                    if n.name:
+                        excludes.append(n.name)
+        elif model_name == "duration_predictor":
+            for n in m.graph.node:
+                if n.op_type in ("LSTM", "GRU", "RNN"):
+                    if n.name:
+                        excludes.append(n.name)
+        elif model_name == "vocoder_conditioner":
+            # Tiny model (1.1 MB fp32) — INT8 completely breaks it; skip all
+            for n in m.graph.node:
+                if n.name:
+                    excludes.append(n.name)
+        elif model_name == "vocoder_stream_chunk":
+            # Exclude the entire IDFT+OLA section (from final projection forward).
+            # The Einsum IDFT with cos/sin basis and the OLA accumulation are very
+            # sensitive: any INT8 rounding in the spectral amplitudes causes loud
+            # artefacts. The ConvNeXt blocks above are stable and can stay INT8.
+            # Also exclude LayerNormalization nodes (narrow normalized range).
+            idft_start = "node_MatMul_146"   # final 384→1202 projection
+            in_idft = False
+            for n in m.graph.node:
+                if n.name == idft_start:
+                    in_idft = True
+                if in_idft and n.name:
+                    excludes.append(n.name)
+                elif n.op_type == "LayerNormalization" and n.name:
+                    excludes.append(n.name)
+    except Exception as e:
+        warnings.warn(f"Could not compute node exclusions for {model_name}: {e}")
+    return excludes
+
+
+# ---------------------------------------------------------------------------
 # Method 1: ONNX Static INT8 Quantization (QDQ format for NNAPI)
 # ---------------------------------------------------------------------------
 
@@ -403,11 +456,17 @@ def quantize_onnx_static(
     quant_format: QuantFormat = QuantFormat.QDQ,
     activation_type: QuantType = QuantType.QInt8,
     weight_type: QuantType = QuantType.QInt8,
+    force: bool = False,
 ) -> Dict[str, Path]:
     """Apply onnxruntime static INT8 quantization with calibration data.
 
     Uses QDQ (Quantize-Dequantize) format which is required for ONNX Runtime
     NNAPI execution provider on Android.
+
+    Improvements over naive quantization:
+    - Entropy calibration (better dynamic range estimation than MinMax)
+    - Per-model node exclusions: LSTM ops (duration_predictor), Softmax+LayerNorm
+      (bert), IDFT/OLA section (vocoder_stream_chunk), all nodes (vocoder_conditioner)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs: Dict[str, Path] = {}
@@ -420,12 +479,19 @@ def quantize_onnx_static(
         if not samples:
             print(f"  [skip] {name}: no calibration data")
             continue
-        if dst.exists():
-            print(f"  [skip] {dst.name} already exists")
+        if dst.exists() and not force:
+            size_mb = dst.stat().st_size / 1e6
+            print(f"  [skip] {dst.name} already exists ({size_mb:.1f} MB)")
             outputs[name] = dst
             continue
 
-        print(f"  Static INT8 (QDQ): {name} ({len(samples)} samples)...", end=" ", flush=True)
+        exclude = _nodes_to_exclude(name, src)
+        if exclude:
+            print(f"  Static INT8: {name} ({len(samples)} samples, "
+                  f"{len(exclude)} nodes excluded)...", end=" ", flush=True)
+        else:
+            print(f"  Static INT8: {name} ({len(samples)} samples)...", end=" ", flush=True)
+
         t0 = time.perf_counter()
         try:
             reader = KokoroCalibrationReader(samples)
@@ -438,7 +504,8 @@ def quantize_onnx_static(
                 weight_type=weight_type,
                 per_channel=True,
                 reduce_range=False,
-                calibrate_method=CalibrationMethod.MinMax,
+                calibrate_method=CalibrationMethod.Entropy,   # better than MinMax
+                nodes_to_exclude=exclude if exclude else None,
                 extra_options={
                     "WeightSymmetric": True,
                     "ActivationSymmetric": False,
@@ -464,7 +531,8 @@ def quantize_onnx_static(
                     weight_type=weight_type,
                     per_channel=True,
                     reduce_range=False,
-                    calibrate_method=CalibrationMethod.MinMax,
+                    calibrate_method=CalibrationMethod.Entropy,
+                    nodes_to_exclude=exclude if exclude else None,
                 )
                 size_mb = dst.stat().st_size / 1e6
                 elapsed = time.perf_counter() - t0
