@@ -74,21 +74,24 @@ class CustomSTFT(nn.Module):
         )
 
         # Precompute inverse DFT
-        # Real iFFT formula => scale = 1/n_fft, doubling for bins 1..freq_bins-2 if n_fft even, etc.
-        # For simplicity, we won't do the "DC/nyquist not doubled" approach here. 
-        # If you want perfect real iSTFT, you can add that logic. 
-        # This version just yields good approximate reconstruction with Hann + typical overlap.
+        # Real iFFT formula => scale = 1/n_fft with doubled non-edge onesided bins.
         inv_scale = 1.0 / self.n_fft
         n = np.arange(self.n_fft)
         angle_t = 2 * np.pi * np.outer(n, k) / self.n_fft  # shape (n_fft, freq_bins)
         idft_cos = np.cos(angle_t).T  # => (freq_bins, n_fft)
         idft_sin = np.sin(angle_t).T  # => (freq_bins, n_fft)
 
+        scale_factors = np.ones((self.freq_bins, 1), dtype=np.float32)
+        if self.n_fft % 2 == 0:
+            scale_factors[1:-1] *= 2.0
+        else:
+            scale_factors[1:] *= 2.0
+
         # Multiply by window again for typical overlap-add
         # We also incorporate the scale factor 1/n_fft
         inv_window = window_tensor.numpy() * inv_scale
-        backward_real = idft_cos * inv_window  # (freq_bins, n_fft)
-        backward_imag = idft_sin * inv_window
+        backward_real = idft_cos * inv_window * scale_factors  # (freq_bins, n_fft)
+        backward_imag = idft_sin * inv_window * scale_factors
 
         # We'll implement iSTFT as real+imag conv_transpose with stride=hop.
         self.register_buffer(
@@ -96,6 +99,9 @@ class CustomSTFT(nn.Module):
         )
         self.register_buffer(
             "weight_backward_imag", torch.from_numpy(backward_imag).float().unsqueeze(1)
+        )
+        self.register_buffer(
+            "weight_window_envelope", (window_tensor.pow(2)).view(1, 1, -1)
         )
         
 
@@ -173,6 +179,14 @@ class CustomSTFT(nn.Module):
         )
         # sum => (B, 1, time)
         waveform = real_rec - imag_rec  # typical real iFFT has minus for imaginary part
+        window_envelope = F.conv_transpose1d(
+            torch.ones_like(real_part[:, :1, :]),
+            self.weight_window_envelope,
+            bias=None,
+            stride=self.hop_length,
+            padding=0,
+        )
+        waveform = waveform / torch.clamp(window_envelope, min=1e-8)
 
         # If we used "center=True" in forward, we should remove pad
         if self.center:

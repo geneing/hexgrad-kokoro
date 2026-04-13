@@ -1,6 +1,7 @@
 # ADAPTED from https://github.com/yl4579/StyleTTS2/blob/main/Modules/istftnet.py
 from .custom_stft import CustomSTFT, TorchSTFT
 from torch.nn.utils.parametrizations import weight_norm
+from contextlib import contextmanager
 import math
 import torch
 import torch.nn as nn
@@ -17,6 +18,63 @@ def init_weights(m, mean=0.0, std=0.01):
 
 def get_padding(kernel_size, dilation=1):
     return int((kernel_size*dilation - dilation)/2)
+
+
+def repeat_upsample_1d(x, scale_factor):
+    return torch.repeat_interleave(x, repeats=scale_factor, dim=2)
+
+
+def cumsum_per_harmonic(x, dim):
+    if dim != 1:
+        return torch.cumsum(x, dim=dim)
+    channels = [torch.cumsum(x[:, :, i : i + 1], dim=dim) for i in range(x.shape[2])]
+    return torch.cat(channels, dim=2)
+
+
+def linear_resample_1d(x, output_size):
+    input_size = x.shape[-1]
+    positions = ((torch.arange(output_size, device=x.device, dtype=torch.float32) + 0.5) * input_size / output_size) - 0.5
+    left = torch.floor(positions).to(torch.int64).clamp(0, input_size - 1)
+    right = torch.ceil(positions).to(torch.int64).clamp(0, input_size - 1)
+    right_weight = (positions - torch.floor(positions)).to(x.dtype).view(1, 1, output_size)
+    left_weight = 1 - right_weight
+    left_values = torch.index_select(x, -1, left)
+    right_values = torch.index_select(x, -1, right)
+    return left_values * left_weight + right_values * right_weight
+
+
+def exportable_depthwise_conv_transpose1d(x, module):
+    weight = module.weight
+    diagonal = torch.eye(weight.shape[0], device=weight.device, dtype=weight.dtype).unsqueeze(-1)
+    dense_weight = diagonal * weight.squeeze(1).unsqueeze(1)
+    return F.conv_transpose1d(
+        x,
+        dense_weight,
+        bias=module.bias,
+        stride=module.stride,
+        padding=module.padding,
+        output_padding=module.output_padding,
+        dilation=module.dilation,
+        groups=1,
+    )
+
+
+_FORCE_EXPORT_COMPATIBLE = False
+
+
+def use_export_compatible_ops():
+    return _FORCE_EXPORT_COMPATIBLE or torch.onnx.is_in_onnx_export()
+
+
+@contextmanager
+def export_compatible_ops(enabled=True):
+    global _FORCE_EXPORT_COMPATIBLE
+    previous = _FORCE_EXPORT_COMPATIBLE
+    _FORCE_EXPORT_COMPATIBLE = enabled
+    try:
+        yield
+    finally:
+        _FORCE_EXPORT_COMPATIBLE = previous
 
 
 class FixedInstanceNorm1d(nn.Module):
@@ -182,24 +240,45 @@ class SineGen(nn.Module):
         
         # initial phase noise (no noise for fundamental component)
         rand_ini = torch.rand(f0_values.shape[0], f0_values.shape[2], device=f0_values.device)
-        rand_ini[:, 0] = 0
-        rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
+        rand_ini = torch.cat(
+            [
+                torch.zeros(f0_values.shape[0], 1, device=f0_values.device),
+                rand_ini[:, 1:],
+            ],
+            dim=1,
+        )
+        rad_values = torch.cat(
+            [
+                (rad_values[:, 0, :] + rand_ini).unsqueeze(1),
+                rad_values[:, 1:, :],
+            ],
+            dim=1,
+        )
         # instantanouse phase sine[t] = sin(2*pi \sum_i=1 ^{t} rad)
         
         if not self.flag_for_pulse:
             base_len = f0_values.shape[1]
             down_len = base_len // self.upsample_scale
-            rad_values = F.interpolate(
-                rad_values.transpose(1, 2),
-                size=down_len,
-                mode="linear",
-            ).transpose(1, 2)
-            phase = torch.cumsum(rad_values, dim=1) * 2 * torch.pi
-            phase = F.interpolate(
-                (phase.transpose(1, 2) * self.upsample_scale),
-                size=base_len,
-                mode="linear",
-            ).transpose(1, 2)
+            if use_export_compatible_ops():
+                rad_values = linear_resample_1d(rad_values.transpose(1, 2), down_len).transpose(1, 2)
+            else:
+                rad_values = F.interpolate(
+                    rad_values.transpose(1, 2),
+                    size=down_len,
+                    mode="linear",
+                ).transpose(1, 2)
+            phase = cumsum_per_harmonic(rad_values, dim=1) * 2 * torch.pi
+            if use_export_compatible_ops():
+                phase = linear_resample_1d(
+                    phase.transpose(1, 2) * self.upsample_scale,
+                    base_len,
+                ).transpose(1, 2)
+            else:
+                phase = F.interpolate(
+                    (phase.transpose(1, 2) * self.upsample_scale),
+                    size=base_len,
+                    mode="linear",
+                ).transpose(1, 2)
             # print(f"torch: Phase shape: {phase.shape}")
             # print(f"torch: {phase[0,0:10,0]=}")
             sines = torch.sin(phase)
@@ -215,7 +294,7 @@ class SineGen(nn.Module):
             uv_1[:, -1, :] = 1
             u_loc = (uv < 1) * (uv_1 > 0)
             # get the instantanouse phase
-            tmp_cumsum = torch.cumsum(rad_values, dim=1)
+            tmp_cumsum = cumsum_per_harmonic(rad_values, dim=1)
             # different batch needs to be processed differently
             for idx in range(f0_values.shape[0]):
                 temp_sum = tmp_cumsum[idx, u_loc[idx, :, 0], :]
@@ -226,7 +305,7 @@ class SineGen(nn.Module):
                 tmp_cumsum[idx, u_loc[idx, :, 0], :] = temp_sum
             # rad_values - tmp_cumsum: remove the accumulation of i.phase
             # within the previous voiced segment.
-            i_phase = torch.cumsum(rad_values - tmp_cumsum, dim=1)
+            i_phase = cumsum_per_harmonic(rad_values - tmp_cumsum, dim=1)
             # get the sines
             sines = torch.cos(i_phase * 2 * torch.pi)
         return sines
@@ -317,6 +396,7 @@ class Generator(nn.Module):
                     upsample_scale=math.prod(upsample_rates) * gen_istft_hop_size,
                     harmonic_num=8, voiced_threshod=10)
         self.f0_upsamp = nn.Upsample(scale_factor=math.prod(upsample_rates) * gen_istft_hop_size)
+        self.f0_upsample_factor = math.prod(upsample_rates) * gen_istft_hop_size
         self.noise_convs = nn.ModuleList()
         self.noise_res = nn.ModuleList()
         self.ups = nn.ModuleList()
@@ -347,21 +427,20 @@ class Generator(nn.Module):
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
-        # self.stft = (
-        #     CustomSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
-        #     if disable_complex
-        #     else TorchSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
-        # )
-        
         self.stft = TorchSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
+        self.export_stft = CustomSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
 
     def forward(self, x, s, f0):
         with torch.no_grad():
 
-            f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
+            if use_export_compatible_ops():
+                f0 = repeat_upsample_1d(f0[:, None], self.f0_upsample_factor).transpose(1, 2)  # bs,n,t
+            else:
+                f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
             har_source, noi_source, uv = self.m_source(f0)
             har_source = har_source.transpose(1, 2).squeeze(1)
-            har_spec, har_phase = self.stft.transform(har_source)
+            stft = self.export_stft if use_export_compatible_ops() else self.stft
+            har_spec, har_phase = stft.transform(har_source)
             har = torch.cat([har_spec, har_phase], dim=1)
             
         for i in range(self.num_upsamples):
@@ -386,7 +465,8 @@ class Generator(nn.Module):
         x = self.conv_post(x)
         spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :])
         phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
-        return self.stft.inverse(spec, phase)
+        stft = self.export_stft if use_export_compatible_ops() else self.stft
+        return stft.inverse(spec, phase)
 
 
 class UpSample1d(nn.Module):
@@ -398,7 +478,8 @@ class UpSample1d(nn.Module):
         if self.layer_type == 'none':
             return x
         else:
-            return F.interpolate(x, scale_factor=2, mode='nearest')
+            batch, channels, length = x.shape
+            return x.unsqueeze(-1).expand(batch, channels, length, 2).reshape(batch, channels, length * 2)
 
 
 class AdainResBlk1d(nn.Module):
@@ -432,7 +513,12 @@ class AdainResBlk1d(nn.Module):
     def _residual(self, x, s):
         x = self.norm1(x, s)
         x = self.actv(x)
-        x = self.pool(x)
+        if self.upsample_type == 'none':
+            x = self.pool(x)
+        elif use_export_compatible_ops():
+            x = exportable_depthwise_conv_transpose1d(x, self.pool)
+        else:
+            x = self.pool(x)
         x = self.conv1(self.dropout(x))
         x = self.norm2(x, s)
         x = self.actv(x)

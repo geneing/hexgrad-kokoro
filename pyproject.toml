@@ -37,16 +37,16 @@ dependencies = [
     "onnx==1.19.1",
     "ai-edge-litert>=2.1.0",
     "sng4onnx>=1.0.4",
-    "olive-ai[gpu]>=0.10.1",
     "scipy>=1.15.3",
-    "ai-edge-torch>=0.7.1",
     "matplotlib>=3.10.8",
-    "tensorflow>=2.20.0",
     "spacy>=3.8.11",
     "typer>=0.21.0",
     "litert-torch>=0.8.0",
-    "tensorflow[gpu]>=2.19.0",
+    "tensorflow>=2.19.0",
     "torchao>=0.16.0",
+    "onnxscript==0.6.2",
+    "iree-base-compiler[onnx]>=3.11.0",
+    "iree-base-runtime>=3.11.0",
 ]
 
 [project.scripts]
@@ -59,3 +59,7 @@ only-packages = true
 [project.urls]
 Homepage = "https://github.com/hexgrad/kokoro"
 Repository = "https://github.com/hexgrad/kokoro"
+
+[tool.uv]
+concurrent-downloads = 4
+
