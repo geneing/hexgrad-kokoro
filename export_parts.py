@@ -1,7 +1,6 @@
 import argparse
 import os
 from pydoc import text
-from matplotlib import style
 from regex import F
 import torch
 import onnx
@@ -13,7 +12,7 @@ from kokoro import KModel, KPipeline
 from kokoro.model import KModelForONNX
 import matplotlib
 
-import ai_edge_torch
+# import ai_edge_torch
 
 ##########################################################################
 OPSET_VERSION = 19
@@ -225,8 +224,6 @@ def export_text_encoder(model, input, output_dir):
     return audio, asr, F0_pred, N_pred
 
 def export_onnx(model, output_dir):
-    onnx_file = output_dir + "/" + "kokoro.onnx"
-
     # input_ids = torch.randint(1, 100, (502,)).numpy()
     # input_ids = torch.LongTensor([[0, *input_ids, 0]])
     # style = torch.randn(1, 256)
@@ -256,11 +253,7 @@ def export_onnx(model, output_dir):
     plt.plot(audio)
     plt.savefig(os.path.join(output_dir, 'onnx_test.png'))
     plt.close()
-    print('export kokoro.onnx ok!')
-
-    onnx_model = onnx.load(onnx_file)
-    onnx.checker.check_model(onnx_model)
-    print('onnx check ok!')
+    print('export split ONNX parts ok!')
 
 
 

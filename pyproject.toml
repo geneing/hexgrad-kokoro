@@ -47,6 +47,7 @@ dependencies = [
     "utmos>=1.1.10",
     "pesq>=0.0.4",
     "torchaudio==2.11.0",
+    "onnxscript>=0.6.2",
 ]
 
 [project.scripts]
@@ -58,6 +59,11 @@ only-packages = true
 
 [tool.uv]
 environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'" ]
+
+[tool.uv.workspace]
+members = [
+    "iree/iree",
+]
 
 [project.urls]
 Homepage = "https://github.com/hexgrad/kokoro"

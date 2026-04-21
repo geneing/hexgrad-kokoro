@@ -1,0 +1,10 @@
+[project]
+name = "iree"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12.8, <3.13"
+dependencies = [
+    "iree-base-compiler[onnx]>=3.11.0",
+    "iree-base-runtime>=3.11.0",
+]
