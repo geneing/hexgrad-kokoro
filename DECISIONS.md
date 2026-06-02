@@ -53,3 +53,12 @@ then `uv add "torch==2.12.0"`.
 
 **Alternatives considered:** CPU-only torch wheel — rejected, CUDA needed
 for model conversion performance.
+
+---
+<!-- Template:
+### [YYYY-MM-DD hh:mm:ss] Short description [git hash if applicable]
+**Decision:** ...
+**Rationale:** ...
+**Alternative solutions:**
+**Resolution:** ...
+-->

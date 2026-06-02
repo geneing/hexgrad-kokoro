@@ -6,18 +6,32 @@
 - [x] Output directories created: `outputs/`, `test_output/`
 
 ## In Progress
-- [ ] **Step 3a — ProsodyPredictor duration head export** (`examples/export_predictor_duration.py`)
-- [ ] **Step 3b — F0Ntrain export** (`examples/export_predictor_f0n.py`)
+_None — paused at Step 4 AOT._
 
 ## Next Steps
-- [ ] Step 3a — ProsodyPredictor duration head export
-- [ ] Step 3b — F0Ntrain export
-- [ ] Step 4 — Decoder export (requires weight_norm removal)
+- [ ] Step 4 — Decoder AOT (INTERNAL compiler crash; try `minimal` sharding or split subgraphs; see PROBLEMS.md)
 - [ ] Step 5 — Multi-signature assembly (kokoro_multisig.tflite)
 - [ ] Quantization: fp16 AOT, int8 PT2E
-- [ ] AOT compile for Tensor G5 (litert_npu/)
 
 ## Completed
+- [x] **Step 4 — Decoder TFLite export** (`examples/export_decoder.py`) — `outputs/c46f2e1/kokoro_decoder_multisig_fp32.tflite`
+  - 3 signatures: decoder_short (T=200→120k samples), decoder_medium (T=800→480k), decoder_long (T=2000→1.2M)
+  - Parity tests PASSED: finite outputs, rms_ratio 1.01–4.19 across all buckets
+  - WAVs in `test_output/c46f2e1/decoder/`
+  - Patches: PoolEquiv (ConvTranspose1d op=1), SineGen noise→zeros_like, CustomSTFT.transform torch.where, disable_complex=True
+  - **AOT: BLOCKED** — G5 compiler crashes with `error type: INTERNAL` after 36 min for `extensive` sharding. `medium`/`high` are invalid values. `minimal` started but was paused. See PROBLEMS.md.
+
+- [x] **Step 3b — F0Ntrain export** (`examples/export_predictor_f0n.py`) — `outputs/c46f2e1/kokoro_predictor_f0n_multisig_fp32.tflite`
+  - 2 signatures: predictor_f0n (T_aligned=200), predictor_f0n_long (T_aligned=800)
+  - All parity tests PASSED (max_abs_diff < 2e-3)
+  - ~9.6 GMACs; **AOT skipped** — LSTM (shared) + ConvTranspose1d output_padding unsupported by litert_torch
+  - Export fix: `ConvTranspose1d(output_padding=1)` replaced with `PoolEquiv` (zero-interleave + flipped-weight Conv1d)
+
+- [x] **Step 3a — ProsodyPredictor duration head export** (`examples/export_predictor_dur.py`) — `outputs/c46f2e1/kokoro_predictor_dur_multisig_fp32.tflite`
+  - 3 signatures: predictor_dur_short (32), predictor_dur_medium (128), predictor_dur_long (256)
+  - All parity tests PASSED (max_abs_diff < 2e-3)
+  - ~6.4 GMACs; **AOT skipped** — LSTM layers (DurationEncoder + predictor.lstm) cause >20 min compile times on Tensor G5 plugin; runs on CPU/GPU fallback
+
 - [x] **Step 2 — TextEncoder export** (`examples/export_text_encoder.py`) — `outputs/5c9f727/kokoro_text_encoder_multisig_fp32.tflite`
   - 3 signatures: text_encoder_short (32), text_encoder_medium (128), text_encoder_long (256)
   - Exact parity tests PASSED (max_abs_diff < 1e-5 for full-bucket inputs)
@@ -29,12 +43,6 @@
   - 4 signatures: bert_short (32), bert_medium (128), bert_long (256), bert_max (510)
   - All 8 parity tests PASSED (max_abs_diff < 1e-4)
   - ~63 GMACs per forward pass
-- [ ] Step 3a — ProsodyPredictor duration head export
-- [ ] Step 3b — F0Ntrain export
-- [ ] Step 4 — Decoder export (requires weight_norm removal)
-- [ ] Step 5 — Multi-signature assembly (kokoro_multisig.tflite)
-- [ ] Quantization: fp16 AOT, int8 PT2E
-- [ ] AOT compile for Tensor G5 (litert_npu/)
 
 ## Forks / Open Questions
 - TextEncoder LSTM: mask-based rewrite vs fixed-length wrapper — TBD after Step 1

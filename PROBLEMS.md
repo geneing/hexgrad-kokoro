@@ -1,7 +1,28 @@
 # Problems
 
 ## Open
-_None yet._
+
+### [2026-06-02] Decoder AOT compile crashes with `error type: INTERNAL` on Google Tensor G5
+
+**Symptom:** `aot_compile(decoder_multisig_fp32.tflite, sharding_intensity="extensive")` crashes after ~36 min. The `compiler_worker` subprocess exits with a stack trace and `Compilation has failed with error type: INTERNAL`.
+
+**Details:**
+- 1811 ops × 3 subgraphs (decoder_short/medium/long), ALL ops selected for NPU (no CPU fallback)
+- Heap showed very large allocation before crash — likely OOM in the compiler subprocess
+- `"medium"` and `"high"` are invalid sharding values; only `"minimal"` and `"extensive"` are valid
+- `keep_going=True` with `"high"` or `"medium"` fails immediately (invalid flag)
+- `keep_going=True, sharding="minimal"` was started but paused before result
+
+**Attempted solutions:**
+1. `keep_going=False, sharding="extensive"` — INTERNAL crash after 36 min
+2. `keep_going=True, sharding="high"` — invalid flag value (fails immediately)
+3. `keep_going=True, sharding="medium"` — invalid flag value (fails immediately)
+4. `keep_going=True, sharding="minimal"` — started, paused before result
+
+**Next to try:**
+- Let `sharding="minimal"` compile run to completion
+- If that also crashes: split multi-sig into 3 single-sig TFLite files and compile decoder_short alone
+- File a bug at https://github.com/google-ai-edge/LiteRT/issues
 
 ## Resolved
 
@@ -43,7 +64,7 @@ System NCCL upgrade (via apt `libnccl2>=2.29.7`) would unblock torch 2.12.0.
 
 ---
 <!-- Template:
-### [YYYY-MM-DD] Short description
+### [YYYY-MM-DD hh:mm:ss] Short description [git hash if applicable]
 **Symptom:** ...
 **Root cause:** ...
 **Attempted solutions:**
