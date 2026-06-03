@@ -566,27 +566,24 @@ os.environ["GOOGLE_TENSOR_SDK_BETA"] = "litert_npu/litert_plugin_compiler.tar.gz
 
 ### Preferred command-line AOT workflow
 
-Prefer a command-line wrapper for AOT compilation so long compiler runs are
-repeatable, logged, and easy to resume from shell history or CI. The installed
-SDK in this environment does not expose an `ai_edge_litert.aot` CLI module, so
-use a small repo script or module that wraps `ai_edge_litert.aot.aot_compile`.
-Suggested invocation shape:
+Prefer the `litert-torch` command-line interface for AOT compilation so long
+compiler runs are repeatable, logged, and easy to resume from shell history or
+CI. Use it through `uv` so the managed environment and pinned dependencies are
+used:
 
 ```bash
-uv run python tools/aot_compile_google_tensor.py \
-  --input outputs/<git_hash>/kokoro_multisig_fp32.tflite \
-  --out-dir outputs/<git_hash>/aot \
-  --model-name kokoro \
-  --soc tensor_g5 \
-  --truncation half \
-  --int64-to-int32 \
-  --sharding extensive \
-  --keep-going false
+uv run litert-torch export_hf \
+  --model <model-or-local-export-config> \
+  --output_dir outputs/<git_hash>/aot \
+  --aot_backend GOOGLE \
+  --aot_soc_model Tensor_G5 \
+  --aot_compilation_config_dict='{"google_tensor_truncation_type":"half","google_tensor_int64_to_int32":true,"google_tensor_sharding_intensity":"extensive"}'
 ```
 
-The wrapper should write the compiler report to the output directory, export the
-fallback and Tensor G5 `.tflite` files, and return a non-zero exit code on
-compiler failure.
+For Kokoro, keep the custom Python export scripts for the sub-module TFLite
+conversion work. Use the CLI AOT path once the final multi-signature model is
+available, or mirror the same `litert-torch` AOT flags if a direct compile-only
+subcommand is added upstream.
 
 ### Python API reference
 

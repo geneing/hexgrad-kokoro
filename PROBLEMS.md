@@ -21,9 +21,26 @@
 
 **Next to try:**
 - Defer decoder AOT experiments until Step 5 produces the final multi-signature `.tflite`
-- Compile the final model through a command-line wrapper around `ai_edge_litert.aot.aot_compile` so flags, logs, and output paths are reproducible
+- Compile the final model through `uv run litert-torch` so flags, logs, and output paths are reproducible
 - If final-model AOT also crashes: retry `sharding="minimal"`, then split decoder signatures into single-sig TFLite files and compile `decoder_short` alone
 - File a bug at https://github.com/google-ai-edge/LiteRT/issues
+
+### [2026-06-02] `uv run litert-torch --help` fails on missing `transformers.AttentionInterface`
+
+**Symptom:** `uv run litert-torch --help` imports `litert_torch.generative.export_hf`
+before printing help, then fails with `AttributeError: module transformers has no
+attribute AttentionInterface`.
+
+**Root cause:** The installed `transformers` version is older than the
+`litert-torch` CLI expects for its generative `export_hf` attention registration.
+
+**Attempted solutions:**
+1. Ran with `UV_CACHE_DIR=/tmp/uv-cache` to avoid the sandbox read-only uv cache;
+   the command then reached Python import and exposed the dependency mismatch.
+
+**Next to try:**
+- Upgrade or pin `transformers` to a version exposing `AttentionInterface`, then
+  rerun `uv run litert-torch --help` and record the exact AOT CLI syntax.
 
 ## Resolved
 

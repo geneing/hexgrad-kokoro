@@ -10,11 +10,11 @@ _None — next work is Step 5 multi-signature assembly._
 
 ## Next Steps
 - [ ] Step 5 — Multi-signature assembly (kokoro_multisig.tflite)
-- [ ] Post-conversion AOT: compile final `kokoro_multisig.tflite` for Tensor G5 using a command-line wrapper around `ai_edge_litert.aot.aot_compile`
+- [ ] Post-conversion AOT: compile final `kokoro_multisig.tflite` for Tensor G5 using the `uv run litert-torch` CLI where possible
 - [ ] Quantization: fp16 AOT, int8 PT2E
 
 ## Completed
-- [x] **2026-06-02 19:08:31 PDT (git 70e9313) — AOT scheduling doc update**: AOT is now documented as a post-conversion phase after final multi-signature TFLite assembly, with command-line wrapper preferred for Tensor G5 compiler runs.
+- [x] **2026-06-02 19:08:31 PDT (git 70e9313) — AOT scheduling doc update**: AOT is now documented as a post-conversion phase after final multi-signature TFLite assembly, with `uv run litert-torch` preferred for Tensor G5 compiler runs.
 
 - [x] **2026-06-02 19:00:35 PDT (git 7cf44fb) — Directory cleanup**: moved LiteRT export scripts from `examples/export_*.py` to `export/export_*.py`; `examples/export.py` remains the ONNX reference.
 

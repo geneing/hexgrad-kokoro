@@ -48,14 +48,15 @@ TFLite parity tests, and final multi-signature assembly are complete.
   ship, not intermediate per-step `.tflite` files.
 - Separating export/parity from AOT makes failures easier to classify:
   conversion bugs are handled before compiler/delegate bugs.
-- A command-line wrapper around `ai_edge_litert.aot.aot_compile` gives
-  repeatable arguments, logs, output paths, and CI-friendly exit codes.
+- The `uv run litert-torch` CLI gives repeatable arguments, logs, output paths,
+  and CI-friendly exit codes when the installed dependency set is compatible.
 
 **Alternatives considered:**
 - AOT after every sub-module export: rejected because it wastes compiler time
   and already hit long Tensor G5 compiler failures on decoder-only artifacts.
-- Notebook-only AOT: useful for exploration, but rejected as the default
-  workflow because long compiler runs need reproducible CLI invocations.
+- Notebook-only or ad hoc Python API AOT: useful for exploration, but rejected
+  as the default workflow because long compiler runs need reproducible CLI
+  invocations.
 
 ---
 

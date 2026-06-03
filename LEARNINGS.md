@@ -46,7 +46,10 @@
 - AOT should run after all fp32 TFLite conversion/parity steps are complete and
   the final multi-signature model exists. Per-step AOT burns a lot of compiler
   time on intermediate files and can distract from export/parity issues.
-- The installed LiteRT packages expose `litert-benchmark` and `litert-torch`
-  console scripts, but no direct `ai_edge_litert.aot` command-line entry point.
-  Use a small repo CLI wrapper around `ai_edge_litert.aot.aot_compile` for
-  repeatable Tensor G5 compilation runs.
+- Prefer the `uv run litert-torch` CLI for repeatable Tensor G5 AOT compiler
+  runs. The Google Tensor backend ID is `GOOGLE`; the Pixel 10 SoC value is
+  `Tensor_G5`.
+- Current local CLI smoke check fails before help output because
+  `litert_torch.generative.export_hf.core.attention` expects
+  `transformers.AttentionInterface`, which is missing from the installed
+  `transformers` version. Fix the dependency mismatch before relying on the CLI.
