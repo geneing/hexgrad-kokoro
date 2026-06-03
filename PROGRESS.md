@@ -14,6 +14,12 @@ _None — next work is Step 5 multi-signature assembly._
 - [ ] Quantization: fp16 AOT, int8 PT2E
 
 ## Completed
+- [x] **2026-06-02 19:31:06 PDT (git 0f09bf6) — Stable baseline corpus and debug tensors**: promoted the accepted baseline WAVs to `test_output/baseline/wavs/` and saved PyTorch submodule reference tensors under `test_output/baseline/tensors/line_XX/chunk_YY/`.
+  - Baseline docs: `test_output/baseline/README.md`
+  - Metadata: `test_output/baseline/metadata.json`
+  - Tensor format: NumPy `.npz`; files are `inputs.npz`, `bert.npz`, `text_encoder.npz`, `predictor_dur.npz`, `predictor_f0n.npz`, `decoder.npz`
+  - Numeric parity should use `.npz` tensors. WAVs are the subjective audio baseline copied from `test_output/c92a93d/baseline_tts/`.
+
 - [x] **2026-06-02 19:20:16 PDT (git c92a93d) — Baseline PyTorch TTS WAVs**: generated three `af_heart` baseline WAV files from `export/test.txt` using the local Kokoro checkpoint.
   - Outputs: `test_output/c92a93d/baseline_tts/baseline_line_01_af_heart.wav`, `baseline_line_02_af_heart.wav`, `baseline_line_03_af_heart.wav`
   - Manifest: `test_output/c92a93d/baseline_tts/manifest.tsv`

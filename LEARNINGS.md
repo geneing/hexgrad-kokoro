@@ -17,6 +17,10 @@
   full HuggingFace output object). The BertWrapper must call
   `self.bert_encoder(out)` not `self.bert_encoder(out.last_hidden_state)`.
 - `ref_s` is 256-dim; first 128 → decoder style, last 128 → predictor style.
+- Decoder waveform generation is stochastic in the unmodified PyTorch model:
+  `SineGen` uses `torch.rand` for initial phase noise and `torch.randn_like` for
+  additive source noise. Use saved `.npz` tensors for exact numeric TFLite
+  parity; use accepted WAVs for subjective audio quality baseline.
 
 ## litert_torch
 - `litert_torch.convert` requires all inputs to be positional tensors — no
