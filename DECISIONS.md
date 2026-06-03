@@ -60,6 +60,30 @@ TFLite parity tests, and final multi-signature assembly are complete.
 
 ---
 
+## [2026-06-02] Add exact baseline signatures for LSTM-containing modules
+
+**Decision:** Add exact `export/test.txt` baseline chunk signatures for
+TextEncoder, PredictorDur, and PredictorF0N in separate baseline-compatible
+TFLite files under the current git hash.
+
+**Rationale:**
+- Direct LSTM exports only match the original packed PyTorch reference when
+  `T_actual == T_signature`.
+- Baseline parity showed significant discrepancies when `T=37` and `T=103`
+  chunks were padded into `T=128` signatures.
+- The longest baseline line has `T=447`, which exceeded the previous
+  TextEncoder/PredictorDur max bucket (`256`), and `T_aligned=1048`, which
+  exceeded the previous F0N max bucket (`800`).
+
+**Alternatives considered:**
+- Keep padded direct-LSTM signatures and accept approximate output: rejected for
+  parity because differences were large and cascaded into duration/F0/N.
+- Rewrite LSTMs manually with mask-aware backward recurrence: still the better
+  general runtime fix, but higher risk and not needed to validate the current
+  baseline corpus.
+
+---
+
 ## [2026-06-02] torch==2.6.0 (downgraded from 2.12.0)
 
 **Decision:** Pin to `torch==2.6.0+cu124`.

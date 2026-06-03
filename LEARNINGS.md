@@ -35,12 +35,25 @@
 - When T_actual < T_bucket: backward LSTM direction is contaminated — it starts
   from the last zero-padded position rather than from T_actual-1. Diffs ~1.0,
   far outside any reasonable atol.
+- Baseline-driven parity against `export/test.txt` confirmed the issue is not
+  limited to synthetic tests. The real baseline chunks (`T=37`, `T=103`) failed
+  TextEncoder and PredictorDur badly when routed through padded `T=128`
+  signatures. Exact-length signatures restored parity.
 - Deployment constraint: always call text_encoder with T_actual == T_bucket.
   Pick the smallest bucket that fits, then pad input_ids AND fill the padding
   region with a known-neutral token (e.g., repeat last token) for best quality.
 - Correct fix (not yet implemented): split bidirectional LSTM into forward +
   backward passes, flip input for backward using a mask-aware `torch.flip`
   with T_actual as a tensor input (requires dynamic shape support).
+
+## Baseline parity harness
+- Use `export/parity_baseline_tflite.py` to compare exported TFLite submodules
+  against promoted PyTorch `.npz` tensors in `test_output/baseline/tensors`.
+- The harness prefers current-hash baseline-compatible exports when present and
+  falls back to the historical per-step exports for BERT/decoder.
+- Decoder element-wise audio parity is still not the acceptance criterion
+  because the exported decoder patches stochastic source generation. The
+  baseline harness checks finite output and RMS ratio for decoder audio.
 
 ## Weight-norm (new parametrizations API)
 - `from torch.nn.utils.parametrizations import weight_norm` (new API, used in

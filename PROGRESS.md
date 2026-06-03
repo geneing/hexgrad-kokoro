@@ -14,6 +14,20 @@ _None — next work is Step 5 multi-signature assembly._
 - [ ] Quantization: fp16 AOT, int8 PT2E
 
 ## Completed
+- [x] **2026-06-02 21:18:55 PDT (git 03301cf) — Baseline-driven TFLite parity rerun and LSTM bucket fix**: added a parity harness for `test_output/baseline` tensors and re-ran all exported submodules against `export/test.txt` baseline chunks.
+  - Added `export/parity_baseline_tflite.py`; summary: `test_output/03301cf/baseline_parity/summary.tsv`
+  - Initial rerun: BERT passed, decoder passed waveform-level checks, but TextEncoder/PredictorDur/PredictorF0N failed on padded real chunks and line 3 exceeded existing LSTM/F0N buckets.
+  - Added `export/export_baseline_buckets.py` and exported exact baseline signatures:
+    - `outputs/03301cf/kokoro_text_encoder_baseline_fp32.tflite` (`T=32,37,103,128,256,447`)
+    - `outputs/03301cf/kokoro_predictor_dur_baseline_fp32.tflite` (`T=32,37,103,128,256,447`)
+    - `outputs/03301cf/kokoro_predictor_f0n_baseline_fp32.tflite` (`T_aligned=104,200,257,800,1048`)
+  - Final parity PASSED for all baseline chunks:
+    - BERT max diff <= `5.7e-05`
+    - TextEncoder max diff <= `3.8e-06`
+    - PredictorDur logits max diff <= `5.8e-05`
+    - PredictorF0N F0 max diff <= `1.9e-04`
+    - Decoder waveform-level checks passed with RMS ratios `1.44-1.77`
+
 - [x] **2026-06-02 19:31:06 PDT (git 0f09bf6) — Stable baseline corpus and debug tensors**: promoted the accepted baseline WAVs to `test_output/baseline/wavs/` and saved PyTorch submodule reference tensors under `test_output/baseline/tensors/line_XX/chunk_YY/`.
   - Baseline docs: `test_output/baseline/README.md`
   - Metadata: `test_output/baseline/metadata.json`

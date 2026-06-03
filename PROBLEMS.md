@@ -44,6 +44,35 @@ attribute AttentionInterface`.
 
 ## Resolved
 
+### [2026-06-02 21:18:55 PDT] Baseline parity failed for padded LSTM signatures (git 03301cf)
+
+**Symptom:** `export/parity_baseline_tflite.py` initially reported large
+baseline discrepancies for real `export/test.txt` chunks:
+- TextEncoder max diff ~`1.5`
+- PredictorDur logits max diff ~`22`
+- PredictorF0N F0 max diff ~`160`
+- Line 3 skipped TextEncoder/PredictorDur/F0N because existing buckets were too
+  small (`T=447`, `T_aligned=1048`)
+
+**Root cause:** Existing LSTM-containing exports use direct LSTM calls instead
+of `pack_padded_sequence`. For bidirectional LSTMs, padded signatures change the
+backward recurrent state because the backward pass starts at the padded tail.
+
+**Attempted solutions:**
+1. Re-ran the historical exported TFLite files against
+   `test_output/baseline/tensors`; confirmed BERT passed and decoder waveform
+   checks passed, while LSTM-containing modules failed on padded chunks.
+2. Added exact baseline signatures for the real token/aligned lengths in
+   `export/test.txt`.
+
+**Resolution:** Exported baseline-compatible fp32 TFLite files:
+- `outputs/03301cf/kokoro_text_encoder_baseline_fp32.tflite`
+- `outputs/03301cf/kokoro_predictor_dur_baseline_fp32.tflite`
+- `outputs/03301cf/kokoro_predictor_f0n_baseline_fp32.tflite`
+
+Final baseline parity passed for all chunks; see
+`test_output/03301cf/baseline_parity/summary.tsv`.
+
 ### [2026-06-02 19:20:16 PDT] Baseline TTS failed because `.venv` had no `pip`
 
 **Symptom:** `uv run python export/generate_baseline_tts.py` exited with
