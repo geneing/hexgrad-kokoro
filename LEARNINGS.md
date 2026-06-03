@@ -39,8 +39,9 @@
 
 ## AOT compilation (Google Tensor G5)
 - `ai-edge-litert-sdk-google-tensor==2.1.5` must be installed with
-  `GOOGLE_TENSOR_SDK_BETA=<path-to-tar.gz>` set at install time, not just at
-  runtime. The SDK plugin is unpacked into site-packages during build.
+  `GOOGLE_TENSOR_SDK_BETA=/rhome/eingerman/Projects/DeepLearning/TTS/Kokoro/litert_npu/litert_plugin_compiler.tar.gz`
+  set at install time, not just at runtime. The SDK plugin is unpacked into
+  site-packages during build.
 - All Kokoro sub-modules tested so far achieve 100% NPU offload (no CPU
   fallback). BERT: 677 ops/subgraph × 4; TextEncoder: 1097/4169/8265 ops.
 - AOT should run after all fp32 TFLite conversion/parity steps are complete and

@@ -557,7 +557,7 @@ litert_npu/
 
 ```python
 import os
-os.environ["GOOGLE_TENSOR_SDK_BETA"] = "litert_npu/litert_plugin_compiler.tar.gz"
+os.environ["GOOGLE_TENSOR_SDK_BETA"] = "/rhome/eingerman/Projects/DeepLearning/TTS/Kokoro/litert_npu/litert_plugin_compiler.tar.gz"
 
 # In the notebook or a setup cell:
 # !pip install ai-edge-litert-sdk-google-tensor==2.1.5
@@ -572,7 +572,8 @@ CI. Use it through `uv` so the managed environment and pinned dependencies are
 used:
 
 ```bash
-uv run litert-torch export_hf \
+GOOGLE_TENSOR_SDK_BETA=/rhome/eingerman/Projects/DeepLearning/TTS/Kokoro/litert_npu/litert_plugin_compiler.tar.gz \
+  uv run litert-torch export_hf \
   --model <model-or-local-export-config> \
   --output_dir outputs/<git_hash>/aot \
   --aot_backend GOOGLE \
