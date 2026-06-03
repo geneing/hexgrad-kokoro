@@ -14,6 +14,12 @@ _None — next work is Step 5 multi-signature assembly._
 - [ ] Quantization: fp16 AOT, int8 PT2E
 
 ## Completed
+- [x] **2026-06-02 21:28:11 PDT (git 969e73d) — TFLite decoder WAVs for baseline inspection**: wrote subjective inspection WAV files from the final TFLite decoder parity tensors.
+  - `test_output/03301cf/baseline_parity/wavs/line_01_chunk_01_decoder_short_audio_tflite.wav`
+  - `test_output/03301cf/baseline_parity/wavs/line_02_chunk_01_decoder_medium_audio_tflite.wav`
+  - `test_output/03301cf/baseline_parity/wavs/line_03_chunk_01_decoder_long_audio_tflite.wav`
+  - Compare against accepted PyTorch baseline WAVs in `test_output/baseline/wavs/`.
+
 - [x] **2026-06-02 21:18:55 PDT (git 03301cf) — Baseline-driven TFLite parity rerun and LSTM bucket fix**: added a parity harness for `test_output/baseline` tensors and re-ran all exported submodules against `export/test.txt` baseline chunks.
   - Added `export/parity_baseline_tflite.py`; summary: `test_output/03301cf/baseline_parity/summary.tsv`
   - Initial rerun: BERT passed, decoder passed waveform-level checks, but TextEncoder/PredictorDur/PredictorF0N failed on padded real chunks and line 3 exceeded existing LSTM/F0N buckets.
