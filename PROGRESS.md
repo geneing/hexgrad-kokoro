@@ -6,19 +6,32 @@
 - [x] Output directories created: `outputs/`, `test_output/`
 
 ## In Progress
-_None — hybrid compact-LSTM TFLite pipeline is exported and parity-tested._
+_None — hybrid package assembly and Tensor G5 AOT compile attempts are complete._
 
 ## Next Steps
 - [ ] Investigate whether TF/Keras 3.14 / TF 2.21 can be made to emit
   `UNIDIRECTIONAL_SEQUENCE_LSTM` instead of `WHILE`, or whether an older
   `tf_keras` path / custom MLIR lowering is required.
-- [ ] Package the hybrid compact-LSTM pipeline into fewer TFLite artifacts, or
-  define an Android orchestration layer that invokes the split models in order.
-- [ ] Step 5 — Multi-signature assembly (kokoro_multisig.tflite)
-- [ ] Post-conversion AOT: compile final `kokoro_multisig.tflite` for Tensor G5 using the `uv run litert-torch` CLI where possible
+- [ ] Define the Android orchestration layer for `outputs/a072f53/hybrid_package/manifest.json`.
+- [ ] Investigate decoder Tensor G5 AOT failure; try smaller decoder signature files (`decoder_short` only), then file a LiteRT bug if minimal sharding still fails.
 - [ ] Quantization: fp16 AOT, int8 PT2E
 
 ## Completed
+- [x] **2026-06-02 23:34:00 PDT (git a072f53) — Hybrid package assembly and Tensor G5 AOT**: added `export/package_hybrid_aot.py`, assembled the accepted split-model hybrid pipeline, and ran Tensor G5 AOT compilation.
+  - Final package manifest: `outputs/a072f53/hybrid_package/manifest.json`
+  - FP32 package artifacts: `outputs/a072f53/hybrid_package/fp32/`
+  - Tensor G5 AOT outputs:
+    - `outputs/a072f53/hybrid_package/aot/bert/bert_Google_Tensor_G5.tflite`
+    - `outputs/a072f53/hybrid_package/aot/text_frontend/text_frontend_Google_Tensor_G5.tflite`
+    - `outputs/a072f53/hybrid_package/aot/text_post/text_post_Google_Tensor_G5.tflite`
+    - `outputs/a072f53/hybrid_package/aot/duration_ada_0/duration_ada_0_Google_Tensor_G5.tflite`
+    - `outputs/a072f53/hybrid_package/aot/duration_ada_1/duration_ada_1_Google_Tensor_G5.tflite`
+    - `outputs/a072f53/hybrid_package/aot/duration_ada_2/duration_ada_2_Google_Tensor_G5.tflite`
+    - `outputs/a072f53/hybrid_package/aot/duration_proj/duration_proj_Google_Tensor_G5.tflite`
+    - `outputs/a072f53/hybrid_package/aot/f0n_heads/f0n_heads_Google_Tensor_G5.tflite`
+  - LSTM artifacts are compact recurrent `WHILE` TFLite models and are intentionally kept as CPU/GPU fallback.
+  - Decoder AOT was attempted with `google_tensor_sharding_intensity="minimal"` and failed after ~13 minutes with `apply_plugin failed to apply plugin`; no `decoder_Google_Tensor_G5.tflite` was produced.
+
 - [x] **2026-06-02 22:06:40 PDT (git 11e3dd2) — End-to-end hybrid compact-LSTM TFLite export with WAVs**: added `export/export_hybrid_fused_lstm_pipeline.py`, exported a split TFLite pipeline where non-recurrent blocks use litert-torch and all Kokoro LSTM calls use TensorFlow/Keras recurrent TFLite submodels.
   - TFLite artifacts: `outputs/11e3dd2/hybrid_fused_lstm/`
   - Parity summary: `test_output/11e3dd2/hybrid_fused_lstm/summary.tsv`

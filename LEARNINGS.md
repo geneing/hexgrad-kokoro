@@ -105,3 +105,11 @@
   `litert_torch.generative.export_hf.core.attention` expects
   `transformers.AttentionInterface`, which is missing from the installed
   `transformers` version. Fix the dependency mismatch before relying on the CLI.
+- Hybrid package AOT with the Python API succeeds for BERT and non-recurrent
+  hybrid components under `outputs/a072f53/hybrid_package/aot/`.
+- TensorFlow/Keras recurrent `WHILE` LSTM models are intentionally not compiled
+  for Tensor G5; keep them in fallback runtime until a fused sequence-LSTM or
+  custom lowering path exists.
+- Decoder Tensor G5 AOT still fails even with `google_tensor_sharding_intensity`
+  set to `"minimal"`; next useful experiment is a single-signature
+  `decoder_short` compile rather than the full 3-signature decoder.

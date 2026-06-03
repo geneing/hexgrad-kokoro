@@ -114,6 +114,31 @@ subgraphs, not `UNIDIRECTIONAL_SEQUENCE_LSTM` fused sequence-LSTM ops.
 
 ---
 
+## [2026-06-02] Treat the hybrid package manifest as final assembly
+
+**Decision:** Use `outputs/a072f53/hybrid_package/manifest.json` as the final
+multi-component assembly for the accepted hybrid path, instead of forcing all
+pieces into one physical multi-signature `.tflite`.
+
+**Rationale:**
+- The accepted hybrid path mixes converter outputs: litert-torch flatbuffers for
+  non-recurrent modules and TensorFlow/Keras flatbuffers for compact recurrent
+  LSTM subgraphs.
+- The runtime needs to invoke CPU alignment and choose exact recurrent buckets
+  between model calls, so a manifest-driven package maps more directly to the
+  real Android orchestration.
+- Tensor G5 AOT compilation is per component: BERT and non-recurrent hybrid
+  pieces compile for NPU, recurrent `WHILE` models remain fallback, and decoder
+  currently fails the Tensor G5 plugin.
+
+**Alternatives considered:**
+- Force a single cross-converter flatbuffer: deferred because it is packaging
+  work with high risk and no parity benefit.
+- Revert to litert-torch unrolled LSTM multisignature assembly: rejected after
+  the hybrid audio review because it reintroduces the LSTM graph-size problem.
+
+---
+
 ## [2026-06-02] torch==2.6.0 (downgraded from 2.12.0)
 
 **Decision:** Pin to `torch==2.6.0+cu124`.

@@ -49,12 +49,16 @@ FlatBuffer op list contains two recurrent `WHILE` subgraphs instead of
 2. `keep_going=True, sharding="high"` — invalid flag value (fails immediately)
 3. `keep_going=True, sharding="medium"` — invalid flag value (fails immediately)
 4. `keep_going=True, sharding="minimal"` — started, paused before result
+5. **2026-06-02 23:34 PDT (git a072f53)** — hybrid package decoder AOT with
+   `keep_going=True`, `google_tensor_sharding_intensity="minimal"` ran for
+   ~13 minutes and returned `apply_plugin failed to apply plugin`; no
+   `decoder_Google_Tensor_G5.tflite` was exported.
 
 **Next to try:**
-- Defer decoder AOT experiments until Step 5 produces the final multi-signature `.tflite`
-- Compile the final model through `uv run litert-torch` so flags, logs, and output paths are reproducible
-- If final-model AOT also crashes: retry `sharding="minimal"`, then split decoder signatures into single-sig TFLite files and compile `decoder_short` alone
-- File a bug at https://github.com/google-ai-edge/LiteRT/issues
+- Split decoder signatures into single-sig TFLite files and compile
+  `decoder_short` alone.
+- If `decoder_short` also fails, file a bug at https://github.com/google-ai-edge/LiteRT/issues
+  with `outputs/a072f53/hybrid_package/aot/decoder/compilation_report.txt`.
 
 ### [2026-06-02] `uv run litert-torch --help` fails on missing `transformers.AttentionInterface`
 
