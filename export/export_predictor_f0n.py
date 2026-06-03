@@ -40,7 +40,7 @@ Export compatibility notes:
   - Output shape: [1, T_aligned*2] due to the upsample block in F0/N heads.
 
 Run with:
-  uv run python examples/export_predictor_f0n.py
+  uv run python export/export_predictor_f0n.py
 """
 
 import copy

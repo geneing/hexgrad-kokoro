@@ -39,7 +39,7 @@ Parity note:
     - WAV files saved for subjective evaluation
 
 Run with:
-  uv run python examples/export_decoder.py
+  uv run python export/export_decoder.py
 """
 
 import copy

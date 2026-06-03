@@ -12,7 +12,7 @@ Parity tests saved to:
   test_output/<git_hash>/text_encoder/<sig>_T<len>_tflite.npy
 
 Run with:
-  uv run python examples/export_text_encoder.py
+  uv run python export/export_text_encoder.py
 
 Design decisions for export compatibility:
   1. Two tensor inputs: input_ids [1,T] (long) and mask [1,T] (bool).

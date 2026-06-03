@@ -44,7 +44,7 @@ Export compatibility changes vs original:
     direction contaminated (same limitation as TextEncoder, Step 2).
 
 Run with:
-  uv run python examples/export_predictor_dur.py
+  uv run python export/export_predictor_dur.py
 """
 
 import copy

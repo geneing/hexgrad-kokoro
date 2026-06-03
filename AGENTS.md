@@ -20,6 +20,12 @@ kokoro/          # Python package – model, pipeline, modules
   pipeline.py    # KPipeline – G2P, voice management
 examples/
   export.py      # Existing ONNX export reference
+export/          # LiteRT export scripts for individual Kokoro sub-modules
+  export_bert.py
+  export_text_encoder.py
+  export_predictor_dur.py
+  export_predictor_f0n.py
+  export_decoder.py
 litert-torch/    # Checked-out litert-torch repo (reference & local dev)
   docs/pytorch_converter/README.md   # Conversion API walkthrough
   litert_torch/  # Library source

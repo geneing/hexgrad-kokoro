@@ -13,7 +13,7 @@ Parity tests saved to:
   test_output/<git_hash>/bert/<sig>_tflite.npy - TFLite output
 
 Run with:
-  uv run python examples/export_bert.py
+  uv run python export/export_bert.py
 
 AOT compilation requires:
   pip install ai-edge-litert-sdk-google-tensor==2.1.5
