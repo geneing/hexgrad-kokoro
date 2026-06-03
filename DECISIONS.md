@@ -38,6 +38,27 @@ long/max) rather than attempting dynamic shapes.
 
 ---
 
+## [2026-06-02] Run AOT after final TFLite assembly
+
+**Decision:** Defer Tensor G5 AOT compilation until all fp32 sub-module exports,
+TFLite parity tests, and final multi-signature assembly are complete.
+
+**Rationale:**
+- AOT compilation is slow and should validate the artifact that will actually
+  ship, not intermediate per-step `.tflite` files.
+- Separating export/parity from AOT makes failures easier to classify:
+  conversion bugs are handled before compiler/delegate bugs.
+- A command-line wrapper around `ai_edge_litert.aot.aot_compile` gives
+  repeatable arguments, logs, output paths, and CI-friendly exit codes.
+
+**Alternatives considered:**
+- AOT after every sub-module export: rejected because it wastes compiler time
+  and already hit long Tensor G5 compiler failures on decoder-only artifacts.
+- Notebook-only AOT: useful for exploration, but rejected as the default
+  workflow because long compiler runs need reproducible CLI invocations.
+
+---
+
 ## [2026-06-02] torch==2.6.0 (downgraded from 2.12.0)
 
 **Decision:** Pin to `torch==2.6.0+cu124`.

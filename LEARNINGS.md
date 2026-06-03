@@ -43,3 +43,10 @@
   runtime. The SDK plugin is unpacked into site-packages during build.
 - All Kokoro sub-modules tested so far achieve 100% NPU offload (no CPU
   fallback). BERT: 677 ops/subgraph × 4; TextEncoder: 1097/4169/8265 ops.
+- AOT should run after all fp32 TFLite conversion/parity steps are complete and
+  the final multi-signature model exists. Per-step AOT burns a lot of compiler
+  time on intermediate files and can distract from export/parity issues.
+- The installed LiteRT packages expose `litert-benchmark` and `litert-torch`
+  console scripts, but no direct `ai_edge_litert.aot` command-line entry point.
+  Use a small repo CLI wrapper around `ai_edge_litert.aot.aot_compile` for
+  repeatable Tensor G5 compilation runs.

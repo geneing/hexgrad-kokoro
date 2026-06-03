@@ -327,17 +327,21 @@ keeps the `.tflite` file size close to a single-signature model.
 ## Testing: PyTorch vs TFLite Parity
 
 Every sub-module — and key intermediate tensors within each — must be verified
-before moving to the next export step. Use multiple phoneme sequence lengths to
-catch shape-dependent bugs.
+before moving to the next export step. Use the lines of text from export/test.txt to
+test and catch shape-dependent bugs.
 
-AOT compile on NPU for Tensor G5 for tflite model after each step as part of testing.
+Do **not** AOT compile after each individual TFLite export step. First complete
+and parity-test all fp32 `.tflite` exports, then assemble the final
+multi-signature `.tflite`, and only then run Tensor G5 AOT compilation as a
+separate packaging/performance phase. This avoids spending compiler time on
+intermediate artifacts that may be replaced during later export steps.
 
-**Exception — skip AOT for LSTM-containing modules:** Modules that include LSTM
-layers (Step 3a `predictor_dur`, Step 3b `predictor_f0n`) must **not** be AOT
-compiled for Tensor G5. The Tensor G5 plugin takes >20 minutes per LSTM-containing
-subgraph and does not produce useful NPU kernels for recurrent ops. These modules
-run on CPU/GPU fallback at inference time. AOT is still applied to BERT (Step 1),
-TextEncoder (Step 2), and Decoder (Step 4).
+**AOT exception — LSTM-containing signatures:** Modules that include LSTM layers
+(Step 3a `predictor_dur`, Step 3b `predictor_f0n`) should not be targeted for
+standalone Tensor G5 AOT experiments. The Tensor G5 plugin takes >20 minutes per
+LSTM-containing subgraph and does not produce useful NPU kernels for recurrent
+ops. These signatures can remain in the final multi-signature `.tflite` and run
+through CPU/GPU fallback as needed.
 
 ### Test corpus
 
@@ -535,6 +539,10 @@ Quantize the `decoder` first (most compute-intensive), then `predictor`, then
 The Pixel 10 uses a **Google Tensor G5** SoC. AOT-compiled models run directly
 on the EdgeTPU/NPU without JIT overhead.
 
+Run AOT only after Step 5 has produced the final fp32 multi-signature model
+(`kokoro_multisig.tflite`) and all TFLite parity tests pass. Treat AOT as a
+post-conversion packaging step, not as sub-module export validation.
+
 ### NPU plugin
 
 The Google Tensor SDK plugin and a reference notebook live in `litert_npu/`:
@@ -556,7 +564,31 @@ os.environ["GOOGLE_TENSOR_SDK_BETA"] = "litert_npu/litert_plugin_compiler.tar.gz
 # !pip install ai-edge-litert-nightly==2.2.0.dev20260518
 ```
 
-### AOT compile a `.tflite` to Tensor G5
+### Preferred command-line AOT workflow
+
+Prefer a command-line wrapper for AOT compilation so long compiler runs are
+repeatable, logged, and easy to resume from shell history or CI. The installed
+SDK in this environment does not expose an `ai_edge_litert.aot` CLI module, so
+use a small repo script or module that wraps `ai_edge_litert.aot.aot_compile`.
+Suggested invocation shape:
+
+```bash
+uv run python tools/aot_compile_google_tensor.py \
+  --input outputs/<git_hash>/kokoro_multisig_fp32.tflite \
+  --out-dir outputs/<git_hash>/aot \
+  --model-name kokoro \
+  --soc tensor_g5 \
+  --truncation half \
+  --int64-to-int32 \
+  --sharding extensive \
+  --keep-going false
+```
+
+The wrapper should write the compiler report to the output directory, export the
+fallback and Tensor G5 `.tflite` files, and return a non-zero exit code on
+compiler failure.
+
+### Python API reference
 
 ```python
 from ai_edge_litert.aot import aot_compile as aot_lib
@@ -638,7 +670,8 @@ Dependencies are managed with **uv**. Key packages:
 ```bash
 uv sync          # install all deps from lock file
 uv add <pkg>     # add new dependency
-uv run python examples/export.py   # run scripts in the managed venv
+uv run python examples/export.py       # ONNX export reference
+uv run python export/export_bert.py    # LiteRT export scripts
 ```
 
 The `litert-torch` repo is checked out at `litert-torch/` for local reference

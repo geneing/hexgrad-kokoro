@@ -20,8 +20,9 @@
 4. `keep_going=True, sharding="minimal"` — started, paused before result
 
 **Next to try:**
-- Let `sharding="minimal"` compile run to completion
-- If that also crashes: split multi-sig into 3 single-sig TFLite files and compile decoder_short alone
+- Defer decoder AOT experiments until Step 5 produces the final multi-signature `.tflite`
+- Compile the final model through a command-line wrapper around `ai_edge_litert.aot.aot_compile` so flags, logs, and output paths are reproducible
+- If final-model AOT also crashes: retry `sharding="minimal"`, then split decoder signatures into single-sig TFLite files and compile `decoder_short` alone
 - File a bug at https://github.com/google-ai-edge/LiteRT/issues
 
 ## Resolved
