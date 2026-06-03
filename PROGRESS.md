@@ -6,14 +6,46 @@
 - [x] Output directories created: `outputs/`, `test_output/`
 
 ## In Progress
-_None — next work is Step 5 multi-signature assembly._
+_None — hybrid compact-LSTM TFLite pipeline is exported and parity-tested._
 
 ## Next Steps
+- [ ] Investigate whether TF/Keras 3.14 / TF 2.21 can be made to emit
+  `UNIDIRECTIONAL_SEQUENCE_LSTM` instead of `WHILE`, or whether an older
+  `tf_keras` path / custom MLIR lowering is required.
+- [ ] Package the hybrid compact-LSTM pipeline into fewer TFLite artifacts, or
+  define an Android orchestration layer that invokes the split models in order.
 - [ ] Step 5 — Multi-signature assembly (kokoro_multisig.tflite)
 - [ ] Post-conversion AOT: compile final `kokoro_multisig.tflite` for Tensor G5 using the `uv run litert-torch` CLI where possible
 - [ ] Quantization: fp16 AOT, int8 PT2E
 
 ## Completed
+- [x] **2026-06-02 22:06:40 PDT (git 11e3dd2) — End-to-end hybrid compact-LSTM TFLite export with WAVs**: added `export/export_hybrid_fused_lstm_pipeline.py`, exported a split TFLite pipeline where non-recurrent blocks use litert-torch and all Kokoro LSTM calls use TensorFlow/Keras recurrent TFLite submodels.
+  - TFLite artifacts: `outputs/11e3dd2/hybrid_fused_lstm/`
+  - Parity summary: `test_output/11e3dd2/hybrid_fused_lstm/summary.tsv`
+  - Review WAVs:
+    - `test_output/11e3dd2/hybrid_fused_lstm/wavs/line_01_chunk_01_hybrid_fused_lstm_tflite.wav`
+    - `test_output/11e3dd2/hybrid_fused_lstm/wavs/line_02_chunk_01_hybrid_fused_lstm_tflite.wav`
+    - `test_output/11e3dd2/hybrid_fused_lstm/wavs/line_03_chunk_01_hybrid_fused_lstm_tflite.wav`
+  - Baseline parity passed for all three `export/test.txt` chunks:
+    - BERT max diff <= `5.7e-05`
+    - TextEncoder max diff <= `3.9e-06`
+    - PredictorDur logits max diff <= `3.4e-04`
+    - PredictorF0N F0 max diff <= `1.9e-03`
+    - Decoder waveform checks passed with RMS ratios `1.44-1.77`
+  - Important caveat: the Keras recurrent exports are compact `WHILE` recurrent subgraphs, not TFLite `UNIDIRECTIONAL_SEQUENCE_LSTM` fused ops.
+  - Implementation detail: `DurationEncoder` has three LSTM/AdaLayerNorm pairs in this checkpoint; the hybrid exporter now discovers and exports the full stack dynamically.
+
+- [x] **2026-06-02 21:44:20 PDT (git 11e3dd2) — TensorFlow/Keras compact LSTM bridge prototype**: added `export/export_fused_lstm_tf.py` to export bare Kokoro `nn.LSTM` layers through Keras and TFLite without static unrolling.
+  - Added project dependency `tensorflow>=2.19`; resolved locally to `tensorflow==2.21.0`, `keras==3.14.1`.
+  - Exported five T=32 bidirectional LSTM prototypes:
+    - `outputs/11e3dd2/fused_lstm/kokoro_fused_lstm_text_encoder_T32_fp32.tflite` (6.1 MB)
+    - `outputs/11e3dd2/fused_lstm/kokoro_fused_lstm_predictor_duration_encoder_0_T32_fp32.tflite` (7.1 MB)
+    - `outputs/11e3dd2/fused_lstm/kokoro_fused_lstm_predictor_duration_encoder_1_T32_fp32.tflite` (7.1 MB)
+    - `outputs/11e3dd2/fused_lstm/kokoro_fused_lstm_predictor_predictor_lstm_T32_fp32.tflite` (7.1 MB)
+    - `outputs/11e3dd2/fused_lstm/kokoro_fused_lstm_predictor_shared_f0n_T32_fp32.tflite` (7.1 MB)
+  - PyTorch vs Keras and PyTorch vs TFLite parity passed for all five targets (`max_abs_diff <= 1e-6`).
+  - Current TF/Keras converter emitted compact recurrent `WHILE` subgraphs (`RESHAPE, REVERSE_V2, WHILE, ...`) rather than `UNIDIRECTIONAL_SEQUENCE_LSTM`; this avoids unrolled graph explosion but is not yet the fused sequence-LSTM op target.
+
 - [x] **2026-06-02 21:28:11 PDT (git 969e73d) — TFLite decoder WAVs for baseline inspection**: wrote subjective inspection WAV files from the final TFLite decoder parity tensors.
   - `test_output/03301cf/baseline_parity/wavs/line_01_chunk_01_decoder_short_audio_tflite.wav`
   - `test_output/03301cf/baseline_parity/wavs/line_02_chunk_01_decoder_medium_audio_tflite.wav`

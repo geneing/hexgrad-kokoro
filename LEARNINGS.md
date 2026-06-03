@@ -28,6 +28,34 @@
 - Multi-signature `.tflite` shares weights when the same `nn.Module` instance
   is reused across signatures.
 
+## TensorFlow / Keras LSTM bridge
+- PyTorch `nn.LSTM` weights can be copied directly into `tf.keras.layers.LSTM`
+  for Kokoro's LSTMs:
+  - `weight_ih_l0.T` → Keras `kernel`
+  - `weight_hh_l0.T` → Keras `recurrent_kernel`
+  - `bias_ih_l0 + bias_hh_l0` → Keras `bias`
+  - gate order matches (`input, forget, cell, output`)
+- For bidirectional LSTM, copy the PyTorch `_reverse` weights into the Keras
+  backward layer with `go_backwards=True`; Keras aligns the backward sequence
+  output back to original timestep order when using `Bidirectional(...,
+  merge_mode="concat")`.
+- `tensorflow==2.21.0` / `keras==3.14.1` converts these wrappers to compact
+  recurrent `WHILE` subgraphs, not static unrolled trees. This is already a
+  useful alternative to litert-torch's unrolled ATen graph for compile size.
+- The current TF/Keras converter did not emit `UNIDIRECTIONAL_SEQUENCE_LSTM`
+  for the tested Keras 3 wrappers. Treat fused sequence-LSTM lowering as a
+  separate optimization/investigation from the compact `WHILE` bridge.
+- Force TensorFlow conversion to CPU in local scripts with
+  `CUDA_VISIBLE_DEVICES=-1`; the local NVIDIA driver is too old for the
+  TensorFlow CUDA runtime.
+- The checkpoint's `DurationEncoder` has three LSTM/AdaLayerNorm pairs, not two.
+  Split exporters should discover `predictor.text_encoder.lstms` dynamically
+  instead of assuming fixed indices.
+- When splitting `DurationEncoder`, preserve the original channel-first
+  `[B, C, T]` boundary around `AdaLayerNorm`. The exported split path uses:
+  LSTM `[B,T,640] -> [B,T,512]`, transpose to `[B,512,T]`, Ada+style concat
+  `[B,640,T]`, transpose back to `[B,T,640]` for the next recurrent model.
+
 ## Bidirectional LSTM with padding (TextEncoder / DurationEncoder)
 - `pack_padded_sequence` / `pad_packed_sequence` are NOT torch.export-friendly;
   replace with direct `self.lstm(x)` call.

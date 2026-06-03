@@ -2,6 +2,37 @@
 
 ## Open
 
+### [2026-06-02 21:44:20 PDT] Keras LSTM bridge emits compact `WHILE`, not fused sequence LSTM (git 11e3dd2)
+
+**Symptom:** `export/export_fused_lstm_tf.py` successfully converts Kokoro bare
+bidirectional `nn.LSTM` layers through Keras/TFLite with parity, but the
+FlatBuffer op list contains two recurrent `WHILE` subgraphs instead of
+`UNIDIRECTIONAL_SEQUENCE_LSTM` or `BIDIRECTIONAL_SEQUENCE_LSTM`.
+
+**Details:**
+- Tested with `tensorflow==2.21.0` and `keras==3.14.1`.
+- All five Kokoro bare LSTM targets passed PyTorch vs Keras and PyTorch vs
+  TFLite parity at `T=32` with `max_abs_diff <= 1e-6`.
+- Op pattern is compact and not statically unrolled:
+  `RESHAPE, REVERSE_V2, WHILE, RESHAPE, REVERSE_V2, WHILE, RESHAPE, CONCATENATION`.
+- This likely fixes graph-size and conversion-time blow-up, but may not get
+  the same delegate/AOT behavior as a true TFLite fused sequence LSTM op.
+
+**Attempted solutions:**
+1. Built `tf.keras.layers.Bidirectional(tf.keras.layers.LSTM(..., unroll=False))`
+   wrappers and copied PyTorch weights gate-for-gate.
+2. Converted with builtin-only `tf.lite.TFLiteConverter.from_keras_model`.
+3. Verified op list with the TFLite interpreter.
+
+**Next to try:**
+- Check whether an older `tf_keras` / TensorFlow converter path still emits
+  `UNIDIRECTIONAL_SEQUENCE_LSTM` for this structure.
+- Try direct SavedModel signatures from `tf.compat.v1.keras.layers.LSTM` or a
+  converter-compatible composite function.
+- If fused ops are required, implement a custom lowering from PyTorch/Keras LSTM
+  weights to TFLite sequence LSTM via MLIR/FlatBuffer generation or upstream
+  `litert-torch` lowering.
+
 ### [2026-06-02] Decoder AOT compile crashes with `error type: INTERNAL` on Google Tensor G5
 
 **Symptom:** `aot_compile(decoder_multisig_fp32.tflite, sharding_intensity="extensive")` crashes after ~36 min. The `compiler_worker` subprocess exits with a stack trace and `Compilation has failed with error type: INTERNAL`.
@@ -43,6 +74,27 @@ attribute AttentionInterface`.
   rerun `uv run litert-torch --help` and record the exact AOT CLI syntax.
 
 ## Resolved
+
+### [2026-06-02 22:06:40 PDT] Hybrid compact-LSTM split pipeline initially predicted wrong alignment length (git 11e3dd2)
+
+**Symptom:** First end-to-end run of `export/export_hybrid_fused_lstm_pipeline.py`
+failed before F0/N with `KeyError: 61`; the hybrid duration path predicted
+`aligned_len=61` for line 1, while the baseline expected `104`.
+
+**Root cause:** The first split implementation exported only two
+`DurationEncoder` LSTM/AdaLayerNorm pairs, but this checkpoint has three pairs.
+The duration split also needed to preserve the original channel-first
+`[B, C, T]` layout at the AdaLayerNorm boundary.
+
+**Attempted solutions:**
+1. Verified standalone Keras/TFLite LSTM parity against direct PyTorch LSTM.
+2. Compared split duration intermediates against `PredictorDurWrapper`.
+3. Changed Ada split wrappers to use channel-first tensors.
+4. Made the exporter discover every `DurationEncoder` LSTM/Ada pair dynamically.
+
+**Resolution:** Re-ran the full hybrid compact-LSTM TFLite pipeline. All three
+baseline chunks passed parity, and WAVs were written under
+`test_output/11e3dd2/hybrid_fused_lstm/wavs/`.
 
 ### [2026-06-02 21:18:55 PDT] Baseline parity failed for padded LSTM signatures (git 03301cf)
 

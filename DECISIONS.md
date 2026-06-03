@@ -84,6 +84,36 @@ TFLite files under the current git hash.
 
 ---
 
+## [2026-06-02] Use split TFLite artifacts for the compact-LSTM experiment
+
+**Decision:** Export the compact-LSTM experiment as a Python-orchestrated split
+TFLite pipeline rather than trying to merge litert-torch and TensorFlow-converted
+LSTM flatbuffers into one multi-signature model immediately.
+
+**Rationale:**
+- litert-torch still lowers PyTorch LSTM calls into large unrolled graphs.
+- TensorFlow/Keras conversion successfully preserves recurrence as compact
+  TFLite `WHILE` subgraphs with parity, but those flatbuffers are produced by a
+  different converter path.
+- Proving end-to-end parity and generating review WAVs is higher value than
+  solving cross-converter flatbuffer packaging first.
+- The split pipeline exposes clean Android orchestration boundaries:
+  non-recurrent litert-torch models, recurrent LSTM models, CPU alignment, then
+  decoder.
+
+**Alternatives considered:**
+- Single litert-torch export: rejected for this experiment because it reintroduces
+  unrolled LSTM graphs.
+- Single TensorFlow/Keras reimplementation of all Kokoro modules: higher risk
+  and more code than needed to validate the LSTM export path.
+- Manual FlatBuffer/MLIR merge: deferred until the split pipeline proves useful
+  and the desired recurrent op form is settled.
+
+**Caveat:** Current TensorFlow/Keras recurrent exports emit compact `WHILE`
+subgraphs, not `UNIDIRECTIONAL_SEQUENCE_LSTM` fused sequence-LSTM ops.
+
+---
+
 ## [2026-06-02] torch==2.6.0 (downgraded from 2.12.0)
 
 **Decision:** Pin to `torch==2.6.0+cu124`.
