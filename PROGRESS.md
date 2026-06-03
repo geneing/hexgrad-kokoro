@@ -14,6 +14,12 @@ _None — next work is Step 5 multi-signature assembly._
 - [ ] Quantization: fp16 AOT, int8 PT2E
 
 ## Completed
+- [x] **2026-06-02 19:20:16 PDT (git c92a93d) — Baseline PyTorch TTS WAVs**: generated three `af_heart` baseline WAV files from `export/test.txt` using the local Kokoro checkpoint.
+  - Outputs: `test_output/c92a93d/baseline_tts/baseline_line_01_af_heart.wav`, `baseline_line_02_af_heart.wav`, `baseline_line_03_af_heart.wav`
+  - Manifest: `test_output/c92a93d/baseline_tts/manifest.tsv`
+  - Added `export/generate_baseline_tts.py` for reproducible baseline generation.
+  - Added `pip>=26.1.2` because Misaki's English G2P setup invokes `python -m pip` to install/load `en-core-web-sm==3.8.0`.
+
 - [x] **2026-06-02 19:13:07 PDT (git a25fb6a) — AOT SDK environment docs**: documented the required absolute `GOOGLE_TENSOR_SDK_BETA=/rhome/eingerman/Projects/DeepLearning/TTS/Kokoro/litert_npu/litert_plugin_compiler.tar.gz` setting for Tensor G5 AOT runs.
 
 - [x] **2026-06-02 19:08:31 PDT (git 70e9313) — AOT scheduling doc update**: AOT is now documented as a post-conversion phase after final multi-signature TFLite assembly, with `uv run litert-torch` preferred for Tensor G5 compiler runs.

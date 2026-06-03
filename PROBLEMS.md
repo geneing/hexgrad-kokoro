@@ -44,6 +44,22 @@ attribute AttentionInterface`.
 
 ## Resolved
 
+### [2026-06-02 19:20:16 PDT] Baseline TTS failed because `.venv` had no `pip`
+
+**Symptom:** `uv run python export/generate_baseline_tts.py` exited with
+`No module named pip` while initializing English G2P.
+
+**Root cause:** Misaki/spaCy setup invokes `python -m pip` to install/load
+`en-core-web-sm==3.8.0` when that package is absent, but the uv environment did
+not include `pip`.
+
+**Attempted solutions:**
+1. Checked existing WAV-writing deps: `scipy` was installed, `soundfile` was not.
+2. Added `pip>=26.1.2` with `uv add pip`.
+
+**Resolution:** Rerunning baseline generation installed `en-core-web-sm==3.8.0`
+and wrote all three WAV files to `test_output/c92a93d/baseline_tts/`.
+
 ### [2026-06-02] `litert_torch` fails to import — `interpreter` missing from `ai-edge-litert-nightly 2.2.0.dev20260601`
 
 **Symptom:** `ImportError: cannot import name 'interpreter' from 'ai_edge_litert'`

@@ -5,6 +5,12 @@
   `ai-edge-quantizer-nightly`, `tensorflow`, `scipy` etc. as transitive deps —
   no need to list them all explicitly in pyproject.toml.
 - `uv add "torch==2.12.0"` correctly pins and resolves the CUDA wheel.
+- Baseline Kokoro English generation needs `pip` available inside the uv
+  environment because Misaki/spaCy setup invokes `python -m pip` to install
+  `en-core-web-sm==3.8.0` when the model package is missing.
+- `scipy.io.wavfile.write` is already available through transitive deps and is
+  sufficient for writing 24 kHz baseline WAV files; no `soundfile` dependency is
+  needed for this path.
 
 ## Model
 - `CustomAlbert.forward` already returns `last_hidden_state` directly (not the

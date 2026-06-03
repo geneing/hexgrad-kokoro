@@ -23,6 +23,7 @@ dependencies = [
     "loguru",
     "misaki[en]>=0.9.4",
     "numpy",
+    "pip>=26.1.2",
     "torch==2.11.0",
     "transformers",
 ]
