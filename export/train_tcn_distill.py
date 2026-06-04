@@ -29,7 +29,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.tensorboard import SummaryWriter
 
 from kokoro import KModel
@@ -113,12 +113,78 @@ class DistillTensorDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def length_cost(self, index: int) -> int:
+        meta = self.samples[index]
+        token_length = int(meta.get("token_length", 0))
+        aligned_length = int(meta.get("aligned_length", 0))
+        shapes = meta.get("shapes", {})
+        f0_shape = shapes.get("f0") or shapes.get("F0") or []
+        f0_length = int(f0_shape[-1]) if f0_shape else 0
+        return max(token_length, aligned_length, f0_length)
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         meta = self.samples[index]
         with np.load(self.data_dir / meta["tensor_path"]) as npz:
             item = {key: to_tensor(npz[key]) for key in npz.files}
         item["meta"] = meta
         return item
+
+
+class LengthBucketBatchSampler(Sampler[list[int]]):
+    """Groups examples with similar sequence lengths to reduce padding waste."""
+
+    def __init__(
+        self,
+        lengths: list[int],
+        batch_size: int,
+        shuffle: bool,
+        seed: int,
+        pool_multiplier: int = 100,
+        drop_last: bool = False,
+    ):
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.pool_multiplier = max(1, pool_multiplier)
+        self.drop_last = drop_last
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        indices = list(range(len(self.lengths)))
+
+        if self.shuffle:
+            rng.shuffle(indices)
+            pool_size = self.batch_size * self.pool_multiplier
+            batches = []
+            for start in range(0, len(indices), pool_size):
+                pool = indices[start:start + pool_size]
+                pool.sort(key=lambda idx: self.lengths[idx])
+                batches.extend(self._batches_from_sorted(pool))
+            rng.shuffle(batches)
+            yield from batches
+            return
+
+        indices.sort(key=lambda idx: self.lengths[idx])
+        yield from self._batches_from_sorted(indices)
+
+    def _batches_from_sorted(self, indices: list[int]):
+        for start in range(0, len(indices), self.batch_size):
+            batch = indices[start:start + self.batch_size]
+            if len(batch) < self.batch_size and self.drop_last:
+                continue
+            yield batch
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.lengths) // self.batch_size
+        return math.ceil(len(self.lengths) / self.batch_size)
 
 
 def pad_1d(values: list[torch.Tensor], pad_value: int | float | bool = 0) -> torch.Tensor:
@@ -495,6 +561,8 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--disable-length-bucketing", action="store_true")
+    parser.add_argument("--bucket-pool-multiplier", type=int, default=100)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--val-fraction", type=float, default=0.05)
     parser.add_argument("--max-samples", type=int, default=None)
@@ -558,22 +626,60 @@ def main() -> None:
 
     train_ds = DistillTensorDataset(args.data_dir, "train", args.val_fraction, args.seed, args.max_samples)
     val_ds = DistillTensorDataset(args.data_dir, "val", args.val_fraction, args.seed, args.max_samples)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        collate_fn=collate_distill,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        collate_fn=collate_distill,
-    )
+    train_sampler = None
+    val_sampler = None
+    if not args.disable_length_bucketing:
+        train_sampler = LengthBucketBatchSampler(
+            [train_ds.length_cost(idx) for idx in range(len(train_ds))],
+            batch_size=args.batch_size,
+            shuffle=True,
+            seed=args.seed,
+            pool_multiplier=args.bucket_pool_multiplier,
+        )
+        val_sampler = LengthBucketBatchSampler(
+            [val_ds.length_cost(idx) for idx in range(len(val_ds))],
+            batch_size=args.batch_size,
+            shuffle=False,
+            seed=args.seed,
+            pool_multiplier=args.bucket_pool_multiplier,
+        )
+        print(
+            "Length bucketing enabled: "
+            f"batch_size={args.batch_size} pool_multiplier={args.bucket_pool_multiplier}"
+        )
+
+    if train_sampler is not None:
+        train_loader = DataLoader(
+            train_ds,
+            batch_sampler=train_sampler,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+            collate_fn=collate_distill,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_sampler=val_sampler,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+            collate_fn=collate_distill,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+            collate_fn=collate_distill,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+            collate_fn=collate_distill,
+        )
 
     metadata = {
         "git_hash": run_hash,
@@ -596,6 +702,8 @@ def main() -> None:
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         optimizer.zero_grad(set_to_none=True)
         train_total: dict[str, float] = {}
         train_count = 0

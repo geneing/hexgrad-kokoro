@@ -18,6 +18,12 @@
 - [ ] Quantization after distilled fp32 parity: fp16 AOT, int8 PT2E.
 
 ## Completed
+- [x] **2026-06-04 08:24:55 PDT (git 61a6a14) — Length-bucketed TCN training batches**:
+  - Updated `export/train_tcn_distill.py` to form batches from examples with similar token/aligned/F0 lengths.
+  - Length bucketing is enabled by default; use `--disable-length-bucketing` to fall back to plain shuffled batches.
+  - Training batches shuffle bucket pools each epoch; validation batches are length-sorted for stable low-padding evaluation.
+  - Existing recursive CUDA-OOM batch splitting remains as a fallback for unusually long examples.
+
 - [x] **2026-06-04 00:18:43 PDT (git 0b36a45) — Distillation storage moved to external audio workspace**:
   - Default collector output now uses `/export/eingerman/audio/tcl_distil/teacher/<git_hash>`.
   - Default trainer output now uses `/export/eingerman/audio/tcl_distil/checkpoints/<git_hash>`.
