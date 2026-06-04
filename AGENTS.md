@@ -808,3 +808,10 @@ and is **not** installed as a local package (the PyPI nightly is used instead).
 Use PROGRESS.md to keep track of the immediate next steps, steps that have been completed, forks in work. Use LEARNINGS.md to document insights, tips, and general learnings that come up during the project. Use PROBLEMS.md to log any blockers or issues that arise, along with attempted solutions and outcomes, and use DECISIONS.md to record any major decisions made, along with the rationale and alternatives considered. Update these files regularly to maintain a clear and organized record of the project's progress and learnings. Use date and time stamps in md files, add git hash if appropriate. 
 
 Checkpoint commit work regularly with clear messages. Save tflite output to outputs/ with descriptive names for each export step, source git hash and quantization variant. Use test_output/ to save intermediate tensors from PyTorch and TFLite for parity testing, organized by export step and sequence length in directories labeled with git hash. Output wav files where appropriate for subjective evaluation of audio quality at each step, especially after decoder export and quantization.
+
+
+## Running training:
+
+
+
+uv run python export/train_tcn_distill.py   --data-dir /export/eingerman/audio/tcl_distil/teacher/61a6a14   --output-dir /export/eingerman/audio/tcl_distil/checkpoints/$HASH   --device cuda   --batch-size 32   --epochs 20

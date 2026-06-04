@@ -6,7 +6,7 @@ Example:
     --data-dir /export/eingerman/audio/tcl_distil/teacher/$(git rev-parse --short HEAD) \
     --output-dir /export/eingerman/audio/tcl_distil/checkpoints/$(git rev-parse --short HEAD) \
     --device cuda \
-    --batch-size 8 \
+    --batch-size 32 \
     --epochs 20
 
 Monitor:
@@ -543,6 +543,23 @@ def log_metrics(writer: SummaryWriter, prefix: str, metrics: dict[str, float], s
         writer.add_scalar(f"{prefix}/{key}", value, step)
 
 
+def format_progress(metrics: dict[str, float]) -> str:
+    keys = [
+        "loss",
+        "text",
+        "duration_encoder",
+        "duration_logits",
+        "f0n_shared",
+        "f0",
+        "n",
+    ]
+    parts = []
+    for key in keys:
+        if key in metrics:
+            parts.append(f"{key}={metrics[key]:.4f}")
+    return " ".join(parts)
+
+
 def average_metric(total: dict[str, float], metrics: dict[str, float], count: int) -> None:
     for key, value in metrics.items():
         total[key] = total.get(key, 0.0) + value * count
@@ -693,6 +710,13 @@ def main() -> None:
     }
     (output_dir / "training_manifest.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     writer.add_text("run/manifest", json.dumps(metadata, indent=2))
+    print(
+        "Training setup: "
+        f"train_samples={len(train_ds)} val_samples={len(val_ds)} "
+        f"batch_size={args.batch_size} grad_accum={args.grad_accum_steps} "
+        f"device={device} output_dir={output_dir}",
+        flush=True,
+    )
 
     start_epoch = 0
     global_step = 0
@@ -707,6 +731,8 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         train_total: dict[str, float] = {}
         train_count = 0
+        last_log_step = -1
+        epoch_start = time.monotonic()
 
         for step, batch in enumerate(train_loader, start=1):
             count, metrics = process_batch_adaptive(
@@ -733,6 +759,20 @@ def main() -> None:
             if global_step > 0 and global_step % args.log_every == 0:
                 log_metrics(writer, "train_step", metrics, global_step)
                 writer.add_scalar("runtime/effective_batch_count", count, global_step)
+                if global_step != last_log_step:
+                    elapsed = max(time.monotonic() - epoch_start, 1e-6)
+                    examples_per_sec = train_count / elapsed
+                    print(
+                        f"train epoch={epoch + 1}/{args.epochs} "
+                        f"loader_step={step}/{len(train_loader)} "
+                        f"global_step={global_step} "
+                        f"examples={train_count}/{len(train_ds)} "
+                        f"effective_batch={count} "
+                        f"examples_per_sec={examples_per_sec:.2f} "
+                        f"{format_progress(metrics)}",
+                        flush=True,
+                    )
+                    last_log_step = global_step
 
         if len(train_loader) % args.grad_accum_steps != 0:
             optimizer_step(model, optimizer, scaler, args.max_grad_norm)

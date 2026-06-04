@@ -24,8 +24,9 @@ dependencies = [
     "misaki[en]>=0.9.4",
     "numpy",
     "pip>=26.1.2",
+    "scipy>=1.15.3",
     "tensorboard>=2.20.0",
-    "torch==2.11.0",
+    "torch==2.10.0",
     "transformers",
 ]
 
