@@ -46,6 +46,32 @@
   backward passes, flip input for backward using a mask-aware `torch.flip`
   with T_actual as a tensor input (requires dynamic shape support).
 
+## TCN replacement path
+- 2026-06-03 23:15:57 PDT (git 11e3dd2 starting point): branch
+  `tcn_lstm_replacement` starts from the last baseline checkpoint before
+  hybrid conversion. Hybrid conversion commits begin at `a072f53`.
+- Non-causal Conv1d/TCN sequence mixers avoid the recurrent export problems:
+  no `pack_padded_sequence`, no `pad_packed_sequence`, no recurrent LiteRT op,
+  no bidirectional backward-state contamination from zero padding.
+- A config-driven mixer switch works cleanly:
+  `sequence_mixer.type = "lstm"` keeps the historical Kokoro architecture;
+  `sequence_mixer.type = "tcn"` builds export-facing TCN modules.
+- The existing Kokoro checkpoint can be partially loaded into a TCN model:
+  BERT, BERT projection, TextEncoder embedding/CNN, AdaLayerNorm, AdaIN heads,
+  F0/N projections, duration projection, and decoder weights are reused. New
+  TCN weights are randomly initialized and must be trained/distilled before
+  audio quality is meaningful.
+- TCN fp32 TFLite conversion is straightforward for TextEncoder,
+  PredictorDur, and PredictorF0N. Initial parity against the TCN PyTorch model
+  passed with max diffs in the `1e-04` range or lower.
+- TextEncoder TCN Tensor G5 AOT compiled quickly and fully offloaded all three
+  signatures. PredictorDur and PredictorF0N should be AOT-tested after the
+  script messaging is updated and final source-hash exports are regenerated.
+- Distillation is the right training method; LSTM weights should not be
+  directly transformed into Conv1d weights. Collect teacher tensors from the
+  frozen original LSTM model and train the TCN student on intermediate outputs
+  before any end-to-end fine-tune.
+
 ## Baseline parity harness
 - Use `export/parity_baseline_tflite.py` to compare exported TFLite submodules
   against promoted PyTorch `.npz` tensors in `test_output/baseline/tensors`.

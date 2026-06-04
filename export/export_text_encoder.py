@@ -85,7 +85,11 @@ class TextEncoderWrapper(torch.nn.Module):
         super().__init__()
         self.embedding = text_encoder.embedding
         self.cnn = text_encoder.cnn
-        self.lstm = text_encoder.lstm
+        self.sequence_mixer_type = text_encoder.sequence_mixer_type
+        if self.sequence_mixer_type == "lstm":
+            self.lstm = text_encoder.lstm
+        else:
+            self.sequence_mixer = text_encoder.sequence_mixer
 
     def forward(
         self,
@@ -104,9 +108,12 @@ class TextEncoderWrapper(torch.nn.Module):
 
         x = x.transpose(1, 2)  # [1, T, C]
 
-        # Direct LSTM call — no pack_padded_sequence (not torch.export-friendly)
-        # flatten_parameters() omitted (CPU no-op)
-        x, _ = self.lstm(x)    # [1, T, H]
+        if self.sequence_mixer_type == "lstm":
+            # Direct LSTM call — no pack_padded_sequence (not torch.export-friendly)
+            # flatten_parameters() omitted (CPU no-op)
+            x, _ = self.lstm(x)    # [1, T, H]
+        else:
+            x = self.sequence_mixer(x)
 
         x = x.transpose(-1, -2)  # [1, H, T]
         x = x.masked_fill(m, 0.0)

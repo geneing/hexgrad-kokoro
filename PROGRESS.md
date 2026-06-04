@@ -6,14 +6,38 @@
 - [x] Output directories created: `outputs/`, `test_output/`
 
 ## In Progress
-_None — next work is Step 5 multi-signature assembly._
+- [ ] **TCN distillation path** — replacing export-facing LSTM/BiLSTM mixers with non-causal Conv1d/TCN modules and training them as students from the frozen original LSTM checkpoint.
 
 ## Next Steps
-- [ ] Step 5 — Multi-signature assembly (kokoro_multisig.tflite)
-- [ ] Post-conversion AOT: compile final `kokoro_multisig.tflite` for Tensor G5 using the `uv run litert-torch` CLI where possible
-- [ ] Quantization: fp16 AOT, int8 PT2E
+- [ ] Commit the TCN model/config/export-script changes, then rerun TFLite exports so `outputs/<git_hash>/` matches the new source hash.
+- [ ] Add a teacher tensor collection script for distillation data:
+  - Load original LSTM config as teacher and TCN config as student.
+  - Run `export/test.txt` first, then a larger text corpus through `KPipeline`.
+  - Save `input_ids`, masks, style slices, `d_en`, `text_encoder_out`, `duration_encoder_out`, `predictor_duration_mixer_out`, `duration_logits`, `pred_dur`, `pred_aln_trg`, `predictor_aligned_en`, `f0n_shared_out`, `F0`, `N`, decoder inputs, and optional audio.
+  - Store cases under `test_output/<git_hash>/distill_teacher/<case>/` with a manifest containing text, phonemes, lengths, voice id, speed, style source, and teacher/student git hashes.
+- [ ] Add staged distillation training:
+  - TextEncoder TCN: masked MSE/cosine against teacher `text_encoder_out`.
+  - DurationEncoder TCN: masked MSE against teacher `duration_encoder_out`.
+  - Duration mixer/head: hidden MSE plus duration-logit MSE/KL.
+  - F0/N shared mixer: hidden MSE plus F0/N MSE.
+  - Short end-to-end fine-tune with BERT/decoder initially frozen.
+- [ ] Save distilled checkpoints to `checkpoints/tcn_distill/` with source git hash, data manifest hash, and validation summary.
+- [ ] Reexport distilled fp32 TFLite, run PyTorch-vs-TFLite parity, generate comparison WAVs, then AOT compile Tensor G5.
+- [ ] Quantization after distilled fp32 parity: fp16 AOT, int8 PT2E.
 
 ## Completed
+- [x] **2026-06-03 23:15:57 PDT (git 11e3dd2 starting point) — Pivot from hybrid conversion to TCN replacement**: created branch `tcn_lstm_replacement` from `11e3dd2`, the last baseline checkpoint before hybrid conversion (`a072f53`).
+  - Added config-driven `sequence_mixer.type` support; default historical behavior remains LSTM when the config omits the field.
+  - Updated `checkpoints/config.json` to use non-causal TCN blocks: 4 blocks, kernel size 5, dilations `[1, 2, 4, 8]`.
+  - Replaced export-facing recurrent mixers with TCN alternatives for `TextEncoder`, `DurationEncoder`, `ProsodyPredictor.run_duration_mixer`, and `ProsodyPredictor.F0Ntrain`.
+  - Partial checkpoint load reuses non-recurrent Kokoro weights and leaves new TCN weights randomly initialized pending distillation.
+  - Smoke shape check passed for TextEncoder, PredictorDur, and PredictorF0N.
+  - Initial fp32 TFLite exports from the uncommitted starting hash passed PyTorch-vs-TFLite parity:
+    - `outputs/11e3dd2/kokoro_text_encoder_multisig_fp32.tflite`; max diff <= `8e-06`; Tensor G5 AOT fully offloaded, output `kokoro_text_encoder_Google_Tensor_G5.tflite`
+    - `outputs/11e3dd2/kokoro_predictor_dur_multisig_fp32.tflite`; duration max diff <= `1.56e-04`, `d_out` max diff <= `1.3e-05`
+    - `outputs/11e3dd2/kokoro_predictor_f0n_multisig_fp32.tflite`; F0 max diff <= `2.44e-04`, N max diff <= `1.1e-05`
+  - These initial exports are structurally valid but not quality-valid because the TCN weights are not distilled yet.
+
 - [x] **2026-06-02 21:28:11 PDT (git 969e73d) — TFLite decoder WAVs for baseline inspection**: wrote subjective inspection WAV files from the final TFLite decoder parity tensors.
   - `test_output/03301cf/baseline_parity/wavs/line_01_chunk_01_decoder_short_audio_tflite.wav`
   - `test_output/03301cf/baseline_parity/wavs/line_02_chunk_01_decoder_medium_audio_tflite.wav`

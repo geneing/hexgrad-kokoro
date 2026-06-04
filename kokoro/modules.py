@@ -32,9 +32,73 @@ class LayerNorm(nn.Module):
         return x.transpose(1, -1)
 
 
-class TextEncoder(nn.Module):
-    def __init__(self, channels, kernel_size, depth, n_symbols, actv=nn.LeakyReLU(0.2)):
+class TCNBlock(nn.Module):
+    def __init__(self, channels, kernel_size=5, dilation=1, dropout=0.1):
         super().__init__()
+        padding = dilation * (kernel_size - 1) // 2
+        self.depthwise = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            dilation=dilation,
+            groups=channels,
+        )
+        self.pointwise = nn.Conv1d(channels, channels, kernel_size=1)
+        self.norm = LayerNorm(channels)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        residual = x
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        x = self.norm(x)
+        x = F.gelu(x)
+        x = self.dropout(x)
+        return x + residual
+
+
+class TCNSequenceMixer(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        output_dim,
+        num_blocks=4,
+        kernel_size=5,
+        dilations=(1, 2, 4, 8),
+        dropout=0.1,
+    ):
+        super().__init__()
+        self.input_proj = nn.Conv1d(input_dim, output_dim, kernel_size=1)
+        blocks = []
+        for idx in range(num_blocks):
+            dilation = dilations[idx % len(dilations)]
+            blocks.append(TCNBlock(output_dim, kernel_size, dilation, dropout))
+        self.blocks = nn.Sequential(*blocks)
+
+    def forward(self, x):
+        # x: [B, T, C] -> [B, T, output_dim]
+        x = x.transpose(1, 2)
+        x = self.input_proj(x)
+        x = self.blocks(x)
+        return x.transpose(1, 2)
+
+
+class TextEncoder(nn.Module):
+    def __init__(
+        self,
+        channels,
+        kernel_size,
+        depth,
+        n_symbols,
+        actv=nn.LeakyReLU(0.2),
+        sequence_mixer="lstm",
+        tcn_num_blocks=4,
+        tcn_kernel_size=5,
+        tcn_dilations=(1, 2, 4, 8),
+    ):
+        super().__init__()
+        self.sequence_mixer_type = sequence_mixer
         self.embedding = nn.Embedding(n_symbols, channels)
         padding = (kernel_size - 1) // 2
         self.cnn = nn.ModuleList()
@@ -45,7 +109,19 @@ class TextEncoder(nn.Module):
                 actv,
                 nn.Dropout(0.2),
             ))
-        self.lstm = nn.LSTM(channels, channels//2, 1, batch_first=True, bidirectional=True)
+        if sequence_mixer == "lstm":
+            self.lstm = nn.LSTM(channels, channels//2, 1, batch_first=True, bidirectional=True)
+        elif sequence_mixer == "tcn":
+            self.sequence_mixer = TCNSequenceMixer(
+                channels,
+                channels,
+                num_blocks=tcn_num_blocks,
+                kernel_size=tcn_kernel_size,
+                dilations=tcn_dilations,
+                dropout=0.2,
+            )
+        else:
+            raise ValueError(f"Unsupported text encoder sequence_mixer={sequence_mixer!r}")
 
     def forward(self, x, input_lengths, m):
         x = self.embedding(x)  # [B, T, emb]
@@ -56,15 +132,18 @@ class TextEncoder(nn.Module):
             x = c(x)
             x.masked_fill_(m, 0.0)
         x = x.transpose(1, 2)  # [B, T, chn]
-        lengths = input_lengths if input_lengths.device == torch.device('cpu') else input_lengths.to('cpu')
-        x = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
-        self.lstm.flatten_parameters()
-        x, _ = self.lstm(x)
-        x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
-        x = x.transpose(-1, -2)
-        x_pad = torch.zeros([x.shape[0], x.shape[1], m.shape[-1]], device=x.device)
-        x_pad[:, :, :x.shape[-1]] = x
-        x = x_pad
+        if self.sequence_mixer_type == "lstm":
+            lengths = input_lengths if input_lengths.device == torch.device('cpu') else input_lengths.to('cpu')
+            x = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
+            self.lstm.flatten_parameters()
+            x, _ = self.lstm(x)
+            x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
+            x = x.transpose(-1, -2)
+            x_pad = torch.zeros([x.shape[0], x.shape[1], m.shape[-1]], device=x.device)
+            x_pad[:, :, :x.shape[-1]] = x
+            x = x_pad
+        else:
+            x = self.sequence_mixer(x).transpose(-1, -2)
         x.masked_fill_(m, 0.0)
         return x
 
@@ -89,12 +168,53 @@ class AdaLayerNorm(nn.Module):
 
 
 class ProsodyPredictor(nn.Module):
-    def __init__(self, style_dim, d_hid, nlayers, max_dur=50, dropout=0.1):
+    def __init__(
+        self,
+        style_dim,
+        d_hid,
+        nlayers,
+        max_dur=50,
+        dropout=0.1,
+        sequence_mixer="lstm",
+        tcn_num_blocks=4,
+        tcn_kernel_size=5,
+        tcn_dilations=(1, 2, 4, 8),
+    ):
         super().__init__()
-        self.text_encoder = DurationEncoder(sty_dim=style_dim, d_model=d_hid,nlayers=nlayers, dropout=dropout)
-        self.lstm = nn.LSTM(d_hid + style_dim, d_hid // 2, 1, batch_first=True, bidirectional=True)
+        self.sequence_mixer_type = sequence_mixer
+        self.text_encoder = DurationEncoder(
+            sty_dim=style_dim,
+            d_model=d_hid,
+            nlayers=nlayers,
+            dropout=dropout,
+            sequence_mixer=sequence_mixer,
+            tcn_num_blocks=tcn_num_blocks,
+            tcn_kernel_size=tcn_kernel_size,
+            tcn_dilations=tcn_dilations,
+        )
+        if sequence_mixer == "lstm":
+            self.lstm = nn.LSTM(d_hid + style_dim, d_hid // 2, 1, batch_first=True, bidirectional=True)
+            self.shared = nn.LSTM(d_hid + style_dim, d_hid // 2, 1, batch_first=True, bidirectional=True)
+        elif sequence_mixer == "tcn":
+            self.duration_mixer = TCNSequenceMixer(
+                d_hid + style_dim,
+                d_hid,
+                num_blocks=tcn_num_blocks,
+                kernel_size=tcn_kernel_size,
+                dilations=tcn_dilations,
+                dropout=dropout,
+            )
+            self.shared_mixer = TCNSequenceMixer(
+                d_hid + style_dim,
+                d_hid,
+                num_blocks=tcn_num_blocks,
+                kernel_size=tcn_kernel_size,
+                dilations=tcn_dilations,
+                dropout=dropout,
+            )
+        else:
+            raise ValueError(f"Unsupported predictor sequence_mixer={sequence_mixer!r}")
         self.duration_proj = LinearNorm(d_hid, max_dur)
-        self.shared = nn.LSTM(d_hid + style_dim, d_hid // 2, 1, batch_first=True, bidirectional=True)
         self.F0 = nn.ModuleList()
         self.F0.append(AdainResBlk1d(d_hid, d_hid, style_dim, dropout_p=dropout))
         self.F0.append(AdainResBlk1d(d_hid, d_hid // 2, style_dim, upsample=True, dropout_p=dropout))
@@ -106,23 +226,40 @@ class ProsodyPredictor(nn.Module):
         self.F0_proj = nn.Conv1d(d_hid // 2, 1, 1, 1, 0)
         self.N_proj = nn.Conv1d(d_hid // 2, 1, 1, 1, 0)
 
+    def run_duration_mixer(self, d):
+        if self.sequence_mixer_type == "lstm":
+            x, _ = self.lstm(d)
+            return x
+        return self.duration_mixer(d)
+
+    def run_shared_mixer(self, x):
+        x = x.transpose(-1, -2)
+        if self.sequence_mixer_type == "lstm":
+            x, _ = self.shared(x)
+        else:
+            x = self.shared_mixer(x)
+        return x
+
     def forward(self, texts, style, text_lengths, alignment, m):
         d = self.text_encoder(texts, style, text_lengths, m)
         m = m.unsqueeze(1)
-        lengths = text_lengths if text_lengths.device == torch.device('cpu') else text_lengths.to('cpu')
-        x = nn.utils.rnn.pack_padded_sequence(d, lengths, batch_first=True, enforce_sorted=False)
-        self.lstm.flatten_parameters()
-        x, _ = self.lstm(x)
-        x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
-        x_pad = torch.zeros([x.shape[0], m.shape[-1], x.shape[-1]], device=x.device)
-        x_pad[:, :x.shape[1], :] = x
-        x = x_pad
+        if self.sequence_mixer_type == "lstm":
+            lengths = text_lengths if text_lengths.device == torch.device('cpu') else text_lengths.to('cpu')
+            x = nn.utils.rnn.pack_padded_sequence(d, lengths, batch_first=True, enforce_sorted=False)
+            self.lstm.flatten_parameters()
+            x, _ = self.lstm(x)
+            x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
+            x_pad = torch.zeros([x.shape[0], m.shape[-1], x.shape[-1]], device=x.device)
+            x_pad[:, :x.shape[1], :] = x
+            x = x_pad
+        else:
+            x = self.duration_mixer(d)
         duration = self.duration_proj(nn.functional.dropout(x, 0.5, training=False))
         en = (d.transpose(-1, -2) @ alignment)
         return duration.squeeze(-1), en
 
     def F0Ntrain(self, x, s):
-        x, _ = self.shared(x.transpose(-1, -2))
+        x = self.run_shared_mixer(x)
         F0 = x.transpose(-1, -2)
         for block in self.F0:
             F0 = block(F0, s)
@@ -135,12 +272,38 @@ class ProsodyPredictor(nn.Module):
 
 
 class DurationEncoder(nn.Module):
-    def __init__(self, sty_dim, d_model, nlayers, dropout=0.1):
+    def __init__(
+        self,
+        sty_dim,
+        d_model,
+        nlayers,
+        dropout=0.1,
+        sequence_mixer="lstm",
+        tcn_num_blocks=2,
+        tcn_kernel_size=5,
+        tcn_dilations=(1, 2, 4, 8),
+    ):
         super().__init__()
-        self.lstms = nn.ModuleList()
-        for _ in range(nlayers):
-            self.lstms.append(nn.LSTM(d_model + sty_dim, d_model // 2, num_layers=1, batch_first=True, bidirectional=True))
-            self.lstms.append(AdaLayerNorm(sty_dim, d_model))
+        self.sequence_mixer_type = sequence_mixer
+        if sequence_mixer == "lstm":
+            self.lstms = nn.ModuleList()
+            for _ in range(nlayers):
+                self.lstms.append(nn.LSTM(d_model + sty_dim, d_model // 2, num_layers=1, batch_first=True, bidirectional=True))
+                self.lstms.append(AdaLayerNorm(sty_dim, d_model))
+        elif sequence_mixer == "tcn":
+            self.tcn_layers = nn.ModuleList()
+            for _ in range(nlayers):
+                self.tcn_layers.append(TCNSequenceMixer(
+                    d_model + sty_dim,
+                    d_model,
+                    num_blocks=tcn_num_blocks,
+                    kernel_size=tcn_kernel_size,
+                    dilations=tcn_dilations,
+                    dropout=dropout,
+                ))
+                self.tcn_layers.append(AdaLayerNorm(sty_dim, d_model))
+        else:
+            raise ValueError(f"Unsupported duration encoder sequence_mixer={sequence_mixer!r}")
         self.dropout = dropout
         self.d_model = d_model
         self.sty_dim = sty_dim
@@ -153,12 +316,13 @@ class DurationEncoder(nn.Module):
         x.masked_fill_(masks.unsqueeze(-1).transpose(0, 1), 0.0)
         x = x.transpose(0, 1)
         x = x.transpose(-1, -2)
-        for block in self.lstms:
+        blocks = self.lstms if self.sequence_mixer_type == "lstm" else self.tcn_layers
+        for block in blocks:
             if isinstance(block, AdaLayerNorm):
                 x = block(x.transpose(-1, -2), style).transpose(-1, -2)
                 x = torch.cat([x, s.permute(1, 2, 0)], axis=1)
                 x.masked_fill_(masks.unsqueeze(-1).transpose(-1, -2), 0.0)
-            else:
+            elif self.sequence_mixer_type == "lstm":
                 lengths = text_lengths if text_lengths.device == torch.device('cpu') else text_lengths.to('cpu')
                 x = x.transpose(-1, -2)
                 x = nn.utils.rnn.pack_padded_sequence(
@@ -172,6 +336,10 @@ class DurationEncoder(nn.Module):
                 x_pad = torch.zeros([x.shape[0], x.shape[1], m.shape[-1]], device=x.device)
                 x_pad[:, :, :x.shape[-1]] = x
                 x = x_pad
+            else:
+                x = block(x.transpose(-1, -2))
+                x = F.dropout(x, p=self.dropout, training=False)
+                x = x.transpose(-1, -2)
 
         return x.transpose(-1, -2)
 

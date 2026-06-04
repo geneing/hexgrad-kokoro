@@ -51,13 +51,22 @@ class KModel(torch.nn.Module):
         self.bert = CustomAlbert(AlbertConfig(vocab_size=config['n_token'], **config['plbert']))
         self.bert_encoder = torch.nn.Linear(self.bert.config.hidden_size, config['hidden_dim'])
         self.context_length = self.bert.config.max_position_embeddings
+        sequence_mixer = config.get('sequence_mixer', {})
+        mixer_type = sequence_mixer.get('type', 'lstm')
+        tcn_kwargs = {
+            'tcn_num_blocks': sequence_mixer.get('num_blocks', 4),
+            'tcn_kernel_size': sequence_mixer.get('kernel_size', 5),
+            'tcn_dilations': tuple(sequence_mixer.get('dilations', [1, 2, 4, 8])),
+        }
         self.predictor = ProsodyPredictor(
             style_dim=config['style_dim'], d_hid=config['hidden_dim'],
-            nlayers=config['n_layer'], max_dur=config['max_dur'], dropout=config['dropout']
+            nlayers=config['n_layer'], max_dur=config['max_dur'], dropout=config['dropout'],
+            sequence_mixer=mixer_type, **tcn_kwargs
         )
         self.text_encoder = TextEncoder(
             channels=config['hidden_dim'], kernel_size=config['text_encoder_kernel_size'],
-            depth=config['n_layer'], n_symbols=config['n_token']
+            depth=config['n_layer'], n_symbols=config['n_token'],
+            sequence_mixer=mixer_type, **tcn_kwargs
         )
         self.decoder = Decoder(
             dim_in=config['hidden_dim'], style_dim=config['style_dim'],
@@ -103,7 +112,7 @@ class KModel(torch.nn.Module):
         d_en = self.bert_encoder(bert_dur).transpose(-1, -2)
         s = ref_s[:, 128:]
         d = self.predictor.text_encoder(d_en, s, input_lengths, text_mask)
-        x, _ = self.predictor.lstm(d)
+        x = self.predictor.run_duration_mixer(d)
         duration = self.predictor.duration_proj(x)
         duration = torch.sigmoid(duration).sum(axis=-1) / speed
         pred_dur = torch.round(duration).clamp(min=1).long().squeeze()

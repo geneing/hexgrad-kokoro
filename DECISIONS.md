@@ -1,5 +1,32 @@
 # Decisions
 
+## [2026-06-03 23:15:57 PDT] Replace export-facing LSTM/BiLSTM layers with TCN students
+
+**Decision:** Stop pursuing the hybrid conversion path and start
+`tcn_lstm_replacement` from checkpoint `11e3dd2`, the last baseline checkpoint
+before hybrid conversion (`a072f53`). Replace export-facing recurrent mixers
+with non-causal Conv1d/TCN modules and train them by distilling intermediate
+tensors from the frozen original LSTM model.
+
+**Rationale:**
+- Hybrid conversion added multiple framework boundaries and fragile packaging
+  steps.
+- TCN modules convert to common mobile-friendly Conv1d ops and avoid recurrent
+  LiteRT/Tensor G5 compiler issues.
+- Non-causal TCNs preserve bidirectional context without packed sequence logic
+  or padded backward-state contamination.
+- The existing Kokoro checkpoint can still initialize all non-recurrent weights;
+  only the new TCN mixers need distillation.
+
+**Alternatives considered:**
+- Continue hybrid conversion: rejected due to fragility and complexity.
+- Hand-roll mask-aware bidirectional recurrence: possible but keeps recurrent
+  semantics and is harder for mobile delegates.
+- Replace with Transformer/Conformer blocks: viable if TCN quality is
+  insufficient, but heavier and less direct for the first mobile path.
+
+---
+
 ## [2026-06-02] Export sub-modules separately, not as a monolithic model
 
 **Decision:** Export each of the 5 sub-modules (`bert`, `text_encoder`,

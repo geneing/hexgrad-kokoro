@@ -147,7 +147,11 @@ class PredictorF0NWrapper(torch.nn.Module):
 
     def __init__(self, predictor):
         super().__init__()
-        self.shared   = predictor.shared
+        self.sequence_mixer_type = predictor.sequence_mixer_type
+        if self.sequence_mixer_type == "lstm":
+            self.shared = predictor.shared
+        else:
+            self.shared_mixer = predictor.shared_mixer
         self.F0_blocks = predictor.F0
         self.N_blocks  = predictor.N
         self.F0_proj   = predictor.F0_proj
@@ -158,9 +162,11 @@ class PredictorF0NWrapper(torch.nn.Module):
         x: torch.FloatTensor,  # [1, 640, T_aligned]
         s: torch.FloatTensor,  # [1, 128]
     ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
-        # shared LSTM: direct call (no pack/unpad)
         # x.transpose(-1,-2) : [1, T_aligned, 640]
-        h, _ = self.shared(x.transpose(-1, -2))  # [1, T_aligned, 512]
+        if self.sequence_mixer_type == "lstm":
+            h, _ = self.shared(x.transpose(-1, -2))  # [1, T_aligned, 512]
+        else:
+            h = self.shared_mixer(x.transpose(-1, -2))
         h = h.transpose(-1, -2)                   # [1, 512, T_aligned]
 
         F0 = h

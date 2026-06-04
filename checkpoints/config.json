@@ -19,6 +19,12 @@
   "max_dur": 50,
   "multispeaker": true,
   "n_layer": 3,
+  "sequence_mixer": {
+    "type": "tcn",
+    "num_blocks": 4,
+    "kernel_size": 5,
+    "dilations": [1, 2, 4, 8]
+  },
   "n_mels": 80,
   "n_token": 178,
   "style_dim": 128,

@@ -109,6 +109,10 @@ class PredictorDurWrapper(torch.nn.Module):
 
     def __init__(self, predictor):
         super().__init__()
+        self.sequence_mixer_type = predictor.sequence_mixer_type
+        if self.sequence_mixer_type == "tcn":
+            self.predictor = predictor
+            return
         # DurationEncoder layers (alternating LSTM / AdaLayerNorm, nlayers each)
         self.dur_lstms    = predictor.text_encoder.lstms
         self.dur_dropout  = predictor.text_encoder.dropout
@@ -152,6 +156,14 @@ class PredictorDurWrapper(torch.nn.Module):
         d_en:  torch.FloatTensor,  # [1, H=512, T]
         style: torch.FloatTensor,  # [1, style_dim=128]
     ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+        if self.sequence_mixer_type == "tcn":
+            lengths = torch.ones(d_en.shape[0], dtype=torch.long, device=d_en.device) * d_en.shape[2]
+            mask = torch.zeros(d_en.shape[0], d_en.shape[2], dtype=torch.bool, device=d_en.device)
+            d = self.predictor.text_encoder(d_en, style, lengths, mask)
+            x = self.predictor.run_duration_mixer(d)
+            duration = self.predictor.duration_proj(x)
+            return duration, d
+
         d = self._duration_encoder(d_en, style)    # [1, T, 640]
         x, _ = self.lstm(d)                         # [1, T, 512]
         duration = self.duration_proj(x)            # [1, T, 50]
@@ -266,7 +278,7 @@ def main():
         # PyTorch reference — original forward with pack/unpad
         with torch.no_grad():
             d_ref    = pred_ref.text_encoder(d_en, style, lengths, mask)  # [1, T, 640]
-            x_ref, _ = pred_ref.lstm(d_ref)
+            x_ref    = pred_ref.run_duration_mixer(d_ref)
             dur_ref  = pred_ref.duration_proj(x_ref)                      # [1, T, 50]
 
         # TFLite (wrapper — direct LSTM)

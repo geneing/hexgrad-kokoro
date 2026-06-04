@@ -43,7 +43,7 @@ pyproject.toml   # uv-managed dependencies
 |---|---|---|---|---|
 | **bert** | `CustomAlbert` | BERT-style phoneme encoder (ALBERT backbone) | `input_ids [B, T]`, `attention_mask [B, T]` | `last_hidden_state [B, T, H]` |
 | **bert_encoder** | `nn.Linear` | Projects BERT hidden dim → model hidden dim | `[B, T, H_bert]` | `[B, T, H]` |
-| **text_encoder** | `TextEncoder` | CNN + BiLSTM over phoneme embeddings | `input_ids, input_lengths, mask` | `[B, H, T]` |
+| **text_encoder** | `TextEncoder` | CNN + sequence mixer over phoneme embeddings; current export branch uses non-causal TCN instead of BiLSTM | `input_ids, input_lengths, mask` | `[B, H, T]` |
 | **predictor** | `ProsodyPredictor` | Duration + F0/energy prediction | `d_en, style_s, input_lengths, mask, alignment` | `duration [B, T, max_dur]`, `F0 [B, T]`, `N [B, T]` |
 | **decoder** | `Decoder` → `Generator` → `CustomSTFT` | iSTFTNet waveform synthesis | `asr [B, H, T]`, `F0_curve`, `N`, `style_s` | `audio [T_audio]` |
 
@@ -68,6 +68,130 @@ input_ids ──► text_encoder ──► t_en ─────┤
 
 `ref_s` is a 256-dim style vector; the first 128 dims go to the `decoder`,
 the remaining 128 go to `predictor` components.
+
+---
+
+## Current Strategy — Replace LSTM/BiLSTM with Conv1d/TCN
+
+As of 2026-06-03 23:15:57 PDT, the active branch is
+`tcn_lstm_replacement`, started from git checkpoint `11e3dd2` (`Add baseline
+parity WAV outputs`). This intentionally predates the hybrid conversion work
+(`a072f53` and later), which was judged too fragile and complicated for the
+mobile path.
+
+The export-facing recurrent layers are being replaced with non-causal
+Conv1d/TCN sequence mixers:
+
+| Original recurrent block | Replacement |
+|---|---|
+| `TextEncoder.lstm` BiLSTM | `TCNSequenceMixer(512 -> 512)` |
+| `DurationEncoder.lstms` BiLSTM stack | style-conditioned TCN layers with `640 -> 512`, followed by existing `AdaLayerNorm` and style re-append |
+| `ProsodyPredictor.lstm` duration mixer | `TCNSequenceMixer(640 -> 512)` |
+| `ProsodyPredictor.shared` F0/N mixer | `TCNSequenceMixer(640 -> 512)` |
+
+Default TCN config:
+
+```json
+"sequence_mixer": {
+  "type": "tcn",
+  "num_blocks": 4,
+  "kernel_size": 5,
+  "dilations": [1, 2, 4, 8]
+}
+```
+
+The original LSTM architecture remains supported when `sequence_mixer.type` is
+absent or set to `"lstm"`. The Kokoro checkpoint can be loaded into the TCN
+model with `strict=False`; non-recurrent weights are reused and the new TCN
+weights start randomly initialized until distillation.
+
+### Distillation Plan
+
+Do not try to directly convert LSTM weights into Conv1d weights. Train the TCN
+modules as students against frozen LSTM/BiLSTM teacher tensors from the
+original checkpoint.
+
+1. Freeze a teacher model using the original LSTM config.
+2. Build a student model using `checkpoints/config.json` with
+   `sequence_mixer.type = "tcn"`.
+3. Reuse loaded checkpoint weights for BERT, embeddings, CNNs, AdaIN blocks,
+   decoder, and projection heads.
+4. Train only TCN parameters first. Keep projection heads frozen for initial
+   intermediate matching unless a head-specific loss is explicitly enabled.
+5. Unfreeze local projection heads for a short fine-tune after intermediate
+   losses converge.
+6. Run TFLite parity on the student model, then generate WAVs for subjective
+   comparison against `test_output/baseline/wavs/`.
+
+### Distillation Data Collection
+
+Collect teacher/student pairs from text, not necessarily paired audio. Use
+`export/test.txt` first, then add a larger phoneme-text corpus covering short,
+medium, long, punctuation-heavy, and prosody-varied lines.
+
+For each line/chunk:
+
+1. Run `KPipeline` G2P to produce `input_ids`.
+2. Load one or more voice style vectors; save both `ref_s[:, :128]` and
+   `ref_s[:, 128:]`.
+3. Run the frozen LSTM teacher and save:
+   - `bert_hidden`, `d_en`
+   - `text_encoder_out`
+   - `duration_encoder_out`
+   - `predictor_duration_mixer_out`
+   - `duration_logits`
+   - `pred_dur`, `pred_aln_trg`
+   - `predictor_aligned_en`
+   - `f0n_shared_out`
+   - `F0`, `N`
+   - decoder inputs and optional `audio`
+4. Save tensors under `test_output/<git_hash>/distill_teacher/<case>/` as
+   `.npz` files with a manifest containing text, phonemes, token length,
+   aligned length, voice id, style file, speed, and source git hash.
+5. Bucket by token length and aligned frame length, but keep exact actual
+   lengths in metadata for loss masking.
+
+### Retraining Steps
+
+Recommended staged training:
+
+1. `text_encoder` distillation:
+   - Input: `input_ids`, mask.
+   - Target: teacher `text_encoder_out [B, 512, T]`.
+   - Loss: masked MSE + optional cosine loss.
+2. `DurationEncoder` distillation:
+   - Input: teacher/student `d_en`, style predictor slice.
+   - Target: teacher `duration_encoder_out [B, T, 640]`.
+   - Loss: masked MSE on the full output and on the non-style 512-channel part.
+3. Duration mixer/head distillation:
+   - Input: student `duration_encoder_out`.
+   - Targets: teacher `predictor_duration_mixer_out`, `duration_logits`.
+   - Loss: MSE on mixer hidden plus MSE/KL on duration logits.
+4. F0/N shared mixer distillation:
+   - Input: teacher `predictor_aligned_en`, style predictor slice.
+   - Targets: teacher `f0n_shared_out`, `F0`, `N`.
+   - Loss: hidden MSE + F0/N MSE, with optional voiced-region weighting if a
+     voiced mask is added later.
+5. End-to-end local fine-tune:
+   - Freeze BERT and decoder first.
+   - Unfreeze TCNs and projection heads.
+   - Use duration/F0/N losses and optional decoder mel/audio reconstruction
+     against teacher outputs.
+6. Export student fp32 TFLite, run PyTorch-vs-TFLite parity, then AOT compile.
+
+Suggested loss mix:
+
+```python
+loss = (
+    1.0 * masked_mse(student_hidden, teacher_hidden, mask)
+    + 0.2 * cosine_loss(student_hidden, teacher_hidden, mask)
+    + 0.5 * masked_mse(student_logits, teacher_logits, mask)
+)
+```
+
+Training outputs should be saved to `checkpoints/tcn_distill/` with the source
+git hash, data manifest hash, and validation summary in the filename or a
+sidecar JSON.
 
 ---
 
@@ -133,12 +257,10 @@ edge_model.export("kokoro_bert.tflite")
 
 ### Step 2 — Export `text_encoder` (TextEncoder)
 
-**Challenge:** uses `nn.utils.rnn.pack_padded_sequence` / `pad_packed_sequence`
-which require CPU-side lengths. This is not `torch.export`-friendly.
-
-**Approach:** Replace the pack/unpack with a mask-based loop or use
-`torch.nn.utils.rnn` with `enforce_sorted=False` removed and lengths on CPU.
-Alternatively, unroll the LSTM manually or replace with a fixed-length LSTM call:
+Current path: use `sequence_mixer.type = "tcn"` so `TextEncoder` has only
+embedding, Conv1d CNN blocks, mask ops, and TCN Conv1d blocks. This avoids
+`pack_padded_sequence`, `pad_packed_sequence`, recurrent ops, and the padded
+BiLSTM backward-contamination issue.
 
 ```python
 class TextEncoderWrapper(torch.nn.Module):
@@ -146,10 +268,8 @@ class TextEncoderWrapper(torch.nn.Module):
         super().__init__()
         self.te = te
 
-    def forward(self, input_ids: torch.LongTensor, seq_len: int):
-        # Use fixed seq_len; mask is all-False (no padding)
-        input_lengths = torch.tensor([seq_len], dtype=torch.long)
-        mask = torch.zeros(1, seq_len, dtype=torch.bool)
+    def forward(self, input_ids: torch.LongTensor, mask: torch.BoolTensor):
+        input_lengths = torch.ones(input_ids.shape[0], dtype=torch.long) * input_ids.shape[1]
         return self.te(input_ids, input_lengths, mask)
 ```
 
@@ -157,9 +277,10 @@ class TextEncoderWrapper(torch.nn.Module):
 
 ### Step 3 — Export `predictor` (ProsodyPredictor)
 
-Split into two parts to avoid complex control flow:
+Split into two parts to avoid dynamic alignment construction. In the TCN branch,
+both parts are Conv1d-based and should be AOT candidates after fp32 parity.
 
-**3a — Duration head** (`predictor.text_encoder` + `predictor.lstm` +
+**3a — Duration head** (`predictor.text_encoder` + `predictor.run_duration_mixer` +
 `predictor.duration_proj`):
 
 ```python
@@ -336,12 +457,11 @@ multi-signature `.tflite`, and only then run Tensor G5 AOT compilation as a
 separate packaging/performance phase. This avoids spending compiler time on
 intermediate artifacts that may be replaced during later export steps.
 
-**AOT exception — LSTM-containing signatures:** Modules that include LSTM layers
-(Step 3a `predictor_dur`, Step 3b `predictor_f0n`) should not be targeted for
-standalone Tensor G5 AOT experiments. The Tensor G5 plugin takes >20 minutes per
-LSTM-containing subgraph and does not produce useful NPU kernels for recurrent
-ops. These signatures can remain in the final multi-signature `.tflite` and run
-through CPU/GPU fallback as needed.
+With `sequence_mixer.type = "tcn"`, TextEncoder, PredictorDur, and
+PredictorF0N should be considered AOT candidates after fp32 parity. Historical
+LSTM-configured exports should still skip standalone Tensor G5 AOT experiments
+because recurrent subgraphs compile slowly and do not produce useful NPU
+kernels.
 
 ### Test corpus
 
@@ -393,7 +513,7 @@ for T in TEST_LENS:
     mask         = torch.zeros(1, T, dtype=torch.bool)
 
     with torch.no_grad():
-        # CNN only (before LSTM)
+        # CNN only (before sequence mixer)
         emb = model.text_encoder.embedding(ids).transpose(1, 2)
         x = emb
         for c in model.text_encoder.cnn:
@@ -421,8 +541,8 @@ for T in TEST_LENS:
     with torch.no_grad():
         # DurationEncoder intermediate
         d     = model.predictor.text_encoder(d_en, style, input_lengths, mask)
-        # LSTM
-        x, _  = model.predictor.lstm(d)
+        # Duration sequence mixer
+        x = model.predictor.run_duration_mixer(d)
         pt_dur = model.predictor.duration_proj(x)  # [1, T, max_dur]
 
     sig = "predictor_dur_short" if T <= 32 else "predictor_dur_med"
@@ -525,7 +645,7 @@ Quantize the `decoder` first (most compute-intensive), then `predictor`, then
 
 | Issue | Location | Mitigation |
 |---|---|---|
-| `pack_padded_sequence` / `pad_packed_sequence` | `TextEncoder`, `DurationEncoder`, `ProsodyPredictor` | Replace with mask-based fixed-length LSTM or pre-sort + unroll |
+| `pack_padded_sequence` / `pad_packed_sequence` | Historical LSTM config for `TextEncoder`, `DurationEncoder`, `ProsodyPredictor` | Use `sequence_mixer.type = "tcn"` for export-facing models; keep LSTM only as teacher/reference |
 | `torch.repeat_interleave` with dynamic count | `KModel.forward_with_tokens` (alignment) | Keep on CPU; pass alignment tensor as input to decoder |
 | In-place index assignment `pred_aln_trg[idx, :]= 1` | `KModel.forward_with_tokens` | Keep on CPU pre-processing |
 | `weight_norm` parametrizations | `Generator`, `TextEncoder`, conv layers | Remove before export with `remove_weight_norm` |
