@@ -11,10 +11,9 @@ Produces:
     Signatures: predictor_dur_short (T=32), predictor_dur_medium (T=128),
                 predictor_dur_long (T=256)
 
-Note: AOT NPU compilation is intentionally skipped for this module.
-  The duration head contains LSTM layers (DurationEncoder + predictor.lstm)
-  which take excessive time (>20 min) to compile on the Tensor G5 plugin.
-  This module will run on CPU/GPU fallback at inference time.
+Note: with `sequence_mixer.type = "tcn"`, this module is Conv1d-based and is
+  eligible for Tensor G5 AOT after fp32 parity. Historical LSTM configs should
+  still skip standalone AOT because recurrent subgraphs compile slowly.
 
 Wrapper inputs:
   d_en  [1, H=512, T]   — BERT + bert_encoder output (same T as phoneme seq)
@@ -36,12 +35,12 @@ On-device pipeline after this step:
   7. (NPU) run decoder(asr, F0_pred, N_pred, ref_s[:,:128]) (Step 4)
 
 Export compatibility changes vs original:
-  - pack_padded_sequence / pad_packed_sequence → direct LSTM calls
+  - pack_padded_sequence / pad_packed_sequence → TCN sequence mixers
   - masked_fill_  → masked_fill  (out-of-place; required by torch.export)
   - flatten_parameters() omitted (CPU no-op)
   - isinstance(block, AdaLayerNorm) evaluated statically during trace (fine)
-  - Full-bucket inputs only: exact parity. Padded inputs: bidir LSTM backward
-    direction contaminated (same limitation as TextEncoder, Step 2).
+  - TCN branch supports padded buckets without bidirectional recurrent-state
+    contamination.
 
 Run with:
   uv run python export/export_predictor_dur.py
@@ -304,7 +303,10 @@ def main():
         print("\nSome parity tests FAILED — check test_output/ for tensors.")
         raise SystemExit(1)
 
-    print("\nNote: AOT NPU compilation skipped — LSTM-containing modules are not compiled for Tensor G5.")
+    if wrapper.sequence_mixer_type == "tcn":
+        print("\nNote: TCN duration export is AOT-eligible; this script only produced fp32 TFLite/parity outputs.")
+    else:
+        print("\nNote: AOT NPU compilation skipped — LSTM-containing modules are not compiled for Tensor G5.")
 
 
 if __name__ == "__main__":

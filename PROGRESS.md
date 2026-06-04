@@ -9,7 +9,6 @@
 - [ ] **TCN distillation path** — replacing export-facing LSTM/BiLSTM mixers with non-causal Conv1d/TCN modules and training them as students from the frozen original LSTM checkpoint.
 
 ## Next Steps
-- [ ] Commit the TCN model/config/export-script changes, then rerun TFLite exports so `outputs/<git_hash>/` matches the new source hash.
 - [ ] Add a teacher tensor collection script for distillation data:
   - Load original LSTM config as teacher and TCN config as student.
   - Run `export/test.txt` first, then a larger text corpus through `KPipeline`.
@@ -26,6 +25,14 @@
 - [ ] Quantization after distilled fp32 parity: fp16 AOT, int8 PT2E.
 
 ## Completed
+- [x] **2026-06-03 23:28:00 PDT (git 3879584) — TCN source-hash fp32 exports regenerated**:
+  - `outputs/3879584/kokoro_text_encoder_multisig_fp32.tflite`; parity max diff <= `9e-06`.
+  - `outputs/3879584/kokoro_text_encoder_Google_Tensor_G5.tflite`; Tensor G5 AOT fully offloaded all three signatures.
+  - `outputs/3879584/kokoro_predictor_dur_multisig_fp32.tflite`; duration max diff <= `1.83e-04`, `d_out` max diff <= `1.2e-05`.
+  - `outputs/3879584/kokoro_predictor_f0n_multisig_fp32.tflite`; F0 max diff <= `2.59e-04`, N max diff <= `9e-06`.
+  - Parity tensors saved under `test_output/3879584/`.
+  - These are structural export/parity artifacts only; audio quality still requires TCN distillation.
+
 - [x] **2026-06-03 23:15:57 PDT (git 11e3dd2 starting point) — Pivot from hybrid conversion to TCN replacement**: created branch `tcn_lstm_replacement` from `11e3dd2`, the last baseline checkpoint before hybrid conversion (`a072f53`).
   - Added config-driven `sequence_mixer.type` support; default historical behavior remains LSTM when the config omits the field.
   - Updated `checkpoints/config.json` to use non-causal TCN blocks: 4 blocks, kernel size 5, dilations `[1, 2, 4, 8]`.

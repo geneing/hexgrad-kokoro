@@ -10,9 +10,10 @@ Produces:
   outputs/<git_hash>/kokoro_predictor_f0n_multisig_fp32.tflite
     Signatures: predictor_f0n (T_aligned=200), predictor_f0n_long (T_aligned=800)
 
-Note: AOT NPU compilation is intentionally skipped for this module.
-  The F0Ntrain path contains the shared LSTM which takes excessive time
-  to compile on the Tensor G5 plugin. This module runs on CPU/GPU fallback.
+Note: with `sequence_mixer.type = "tcn"`, the shared sequence mixer is
+  Conv1d-based and is eligible for Tensor G5 AOT after fp32 parity.
+  Historical LSTM configs should still skip standalone AOT because recurrent
+  subgraphs compile slowly.
 
 Wrapper inputs:
   x  [1, 640, T_aligned]  — en from CPU: d.transpose(-1,-2) @ pred_aln_trg
@@ -33,7 +34,7 @@ On-device pipeline after this step:
   7. (NPU) decoder(asr, F0, N, ref_s[:,:128])             (Step 4)
 
 Export compatibility notes:
-  - shared LSTM uses direct call (no pack/unpad) — already export-compatible.
+  - TCN branch uses Conv1d sequence mixing instead of recurrent ops.
   - AdainResBlk1d uses weight_norm parametrizations on conv layers.
     torch.export handles these correctly (they are constant-folded).
   - F.interpolate(scale_factor=2, mode='nearest') in UpSample1d is supported.
@@ -284,7 +285,10 @@ def main():
         print("\nSome parity tests FAILED — check test_output/ for tensors.")
         raise SystemExit(1)
 
-    print("\nNote: AOT NPU compilation skipped — LSTM-containing modules are not compiled for Tensor G5.")
+    if wrapper.sequence_mixer_type == "tcn":
+        print("\nNote: TCN F0N export is AOT-eligible; this script only produced fp32 TFLite/parity outputs.")
+    else:
+        print("\nNote: AOT NPU compilation skipped — LSTM-containing modules are not compiled for Tensor G5.")
 
 
 if __name__ == "__main__":
