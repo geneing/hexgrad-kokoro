@@ -3,14 +3,14 @@ Train Kokoro TCN sequence mixers from frozen LSTM-teacher tensors.
 
 Example:
   uv run python export/train_tcn_distill.py \
-    --data-dir test_output/5b97fd3/distill_teacher \
-    --output-dir checkpoints/tcn_distill/5b97fd3 \
+    --data-dir /export/eingerman/audio/tcl_distil/teacher/$(git rev-parse --short HEAD) \
+    --output-dir /export/eingerman/audio/tcl_distil/checkpoints/$(git rev-parse --short HEAD) \
     --device cuda \
     --batch-size 8 \
     --epochs 20
 
 Monitor:
-  uv run tensorboard --logdir checkpoints/tcn_distill
+  uv run tensorboard --logdir /export/eingerman/audio/tcl_distil/checkpoints
 """
 
 from __future__ import annotations
@@ -33,6 +33,9 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 
 from kokoro import KModel
+
+
+DEFAULT_DISTILL_ROOT = Path("/export/eingerman/audio/tcl_distil")
 
 
 def git_hash() -> str:
@@ -521,7 +524,7 @@ def main() -> None:
 
     run_hash = git_hash()
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    output_dir = args.output_dir or Path("checkpoints/tcn_distill") / f"{run_hash}_{timestamp}"
+    output_dir = args.output_dir or DEFAULT_DISTILL_ROOT / "checkpoints" / f"{run_hash}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
 

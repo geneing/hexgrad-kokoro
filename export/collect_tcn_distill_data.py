@@ -1,16 +1,17 @@
 """
 Collect frozen LSTM-teacher tensors for TCN distillation.
 
-Local LJSpeech usage:
+Local LJSpeech + LibriTTS usage:
   uv run python export/collect_tcn_distill_data.py \
-    --ljspeech-root /path/to/LJSpeech-1.1 \
-    --output-dir test_output/$(git rev-parse --short HEAD)/distill_teacher \
+    --ljspeech-root /export/eingerman/audio/LJSpeech-1.1 \
+    --libritts-root /export/eingerman/audio/LibriTTS/LibriTTS \
+    --output-dir /export/eingerman/audio/tcl_distil/teacher/$(git rev-parse --short HEAD) \
     --voices af_heart,af_bella,af_sarah,am_michael,am_puck \
     --limit 1000 \
     --device cuda
 
 The output dataset is text/phoneme driven. Audio files from LJSpeech are not
-used; the LJSpeech text provides coverage and the Kokoro voice packs provide
+used; LJSpeech/LibriTTS text provides coverage and Kokoro voice packs provide
 style vectors.
 """
 
@@ -38,6 +39,10 @@ DEFAULT_VOICES = (
     "am_puck",
     "am_fenrir",
 )
+
+DEFAULT_LJSPEECH_ROOT = Path("/export/eingerman/audio/LJSpeech-1.1")
+DEFAULT_LIBRITTS_ROOT = Path("/export/eingerman/audio/LibriTTS/LibriTTS")
+DEFAULT_DISTILL_ROOT = Path("/export/eingerman/audio/tcl_distil")
 
 
 def git_hash() -> str:
@@ -77,9 +82,43 @@ def read_ljspeech_metadata(root: Path, limit: int | None) -> list[dict]:
             text = parts[2] if len(parts) >= 3 and parts[2].strip() else parts[1]
             text = text.strip()
             if text:
-                rows.append({"id": utt_id, "text": text})
+                rows.append({"id": f"ljspeech_{utt_id}", "source": "ljspeech", "text": text})
             if limit is not None and len(rows) >= limit:
                 break
+    return rows
+
+
+def read_libritts_metadata(root: Path, limit: int | None) -> list[dict]:
+    if not root.is_dir():
+        raise FileNotFoundError(f"LibriTTS root not found: {root}")
+
+    rows = []
+    seen_ids = set()
+
+    for trans_path in sorted(root.rglob("*.trans.tsv")):
+        with trans_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 2:
+                    continue
+                utt_id = parts[0].strip()
+                text = parts[-1].strip()
+                if utt_id and text and utt_id not in seen_ids:
+                    rows.append({"id": f"libritts_{utt_id}", "source": "libritts", "text": text})
+                    seen_ids.add(utt_id)
+                if limit is not None and len(rows) >= limit:
+                    return rows
+
+    # Some LibriTTS layouts expose per-utterance normalized text files instead.
+    for text_path in sorted(root.rglob("*.normalized.txt")):
+        utt_id = text_path.stem.removesuffix(".normalized")
+        text = text_path.read_text(encoding="utf-8").strip()
+        if utt_id and text and utt_id not in seen_ids:
+            rows.append({"id": f"libritts_{utt_id}", "source": "libritts", "text": text})
+            seen_ids.add(utt_id)
+        if limit is not None and len(rows) >= limit:
+            return rows
+
     return rows
 
 
@@ -88,9 +127,25 @@ def read_text_file(path: Path, limit: int | None) -> list[dict]:
     for idx, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         text = line.strip()
         if text:
-            rows.append({"id": f"text_{idx:06d}", "text": text})
+            rows.append({"id": f"text_{idx:06d}", "source": "text_file", "text": text})
         if limit is not None and len(rows) >= limit:
             break
+    return rows
+
+
+def load_source_rows(
+    ljspeech_root: Path | None,
+    libritts_root: Path | None,
+    text_file: Path | None,
+    limit_per_source: int | None,
+) -> list[dict]:
+    rows = []
+    if ljspeech_root is not None:
+        rows.extend(read_ljspeech_metadata(ljspeech_root, limit_per_source))
+    if libritts_root is not None:
+        rows.extend(read_libritts_metadata(libritts_root, limit_per_source))
+    if text_file is not None:
+        rows.extend(read_text_file(text_file, limit_per_source))
     return rows
 
 
@@ -237,14 +292,14 @@ def iter_cases(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Collect Kokoro LSTM-teacher tensors for TCN distillation.")
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--ljspeech-root", type=Path, help="Path to LJSpeech-1.1 containing metadata.csv.")
-    source.add_argument("--text-file", type=Path, help="Fallback plain text file, one utterance per line.")
+    parser.add_argument("--ljspeech-root", type=Path, default=DEFAULT_LJSPEECH_ROOT, help="Path to LJSpeech-1.1 containing metadata.csv.")
+    parser.add_argument("--libritts-root", type=Path, default=DEFAULT_LIBRITTS_ROOT, help="Path to LibriTTS root containing *.trans.tsv or *.normalized.txt files.")
+    parser.add_argument("--text-file", type=Path, default=None, help="Optional plain text file, one utterance per line.")
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--config", type=Path, default=Path("checkpoints/config.json"))
     parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints/kokoro-v1_0.pth"))
     parser.add_argument("--voices", default=",".join(DEFAULT_VOICES))
-    parser.add_argument("--limit", type=int, default=None, help="Number of LJSpeech/text rows to use before voice expansion.")
+    parser.add_argument("--limit", type=int, default=None, help="Number of rows per source before voice expansion.")
     parser.add_argument("--max-cases", type=int, default=None, help="Hard cap after voice/chunk expansion.")
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -253,12 +308,12 @@ def main() -> None:
     args = parser.parse_args()
 
     run_hash = git_hash()
-    output_dir = args.output_dir or Path("test_output") / run_hash / "distill_teacher"
+    output_dir = args.output_dir or DEFAULT_DISTILL_ROOT / "teacher" / run_hash
     tensor_dir = output_dir / "tensors"
     output_dir.mkdir(parents=True, exist_ok=True)
     tensor_dir.mkdir(parents=True, exist_ok=True)
 
-    rows = read_ljspeech_metadata(args.ljspeech_root, args.limit) if args.ljspeech_root else read_text_file(args.text_file, args.limit)
+    rows = load_source_rows(args.ljspeech_root, args.libritts_root, args.text_file, args.limit)
     voices = voice_list(args.voices)
     if not rows:
         raise RuntimeError("No text rows found for collection.")
@@ -287,7 +342,11 @@ def main() -> None:
 
     manifest = {
         "git_hash": run_hash,
-        "source": str(args.ljspeech_root or args.text_file),
+        "sources": {
+            "ljspeech_root": str(args.ljspeech_root) if args.ljspeech_root else None,
+            "libritts_root": str(args.libritts_root) if args.libritts_root else None,
+            "text_file": str(args.text_file) if args.text_file else None,
+        },
         "config": str(args.config),
         "checkpoint": str(args.checkpoint),
         "sequence_mixer": "lstm_teacher",
@@ -335,6 +394,7 @@ def main() -> None:
             sample = {
                 "case": case_name,
                 "source_id": row["id"],
+                "source": row.get("source", "unknown"),
                 "voice": voice,
                 "chunk_index": chunk_idx,
                 "text": row["text"],

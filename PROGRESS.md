@@ -9,22 +9,29 @@
 - [ ] **TCN distillation path** — replacing export-facing LSTM/BiLSTM mixers with non-causal Conv1d/TCN modules and training them as students from the frozen original LSTM checkpoint.
 
 ## Next Steps
-- [ ] Run full teacher tensor collection on local LJSpeech:
-  - `uv run python export/collect_tcn_distill_data.py --ljspeech-root /path/to/LJSpeech-1.1 --output-dir test_output/<git_hash>/distill_teacher --voices af_heart,af_bella,af_sarah,af_nicole,af_aoede,am_michael,am_puck,am_fenrir --device cuda`
+- [ ] Run full teacher tensor collection on local LJSpeech + LibriTTS:
+  - `uv run python export/collect_tcn_distill_data.py --ljspeech-root /export/eingerman/audio/LJSpeech-1.1 --libritts-root /export/eingerman/audio/LibriTTS/LibriTTS --output-dir /export/eingerman/audio/tcl_distil/teacher/<git_hash> --voices af_heart,af_bella,af_sarah,af_nicole,af_aoede,am_michael,am_puck,am_fenrir --device cuda`
 - [ ] Run full TCN distillation training:
-  - `uv run python export/train_tcn_distill.py --data-dir test_output/<git_hash>/distill_teacher --output-dir checkpoints/tcn_distill/<git_hash> --device cuda --batch-size 8 --epochs 20`
-  - Monitor with `uv run tensorboard --logdir checkpoints/tcn_distill`.
+  - `uv run python export/train_tcn_distill.py --data-dir /export/eingerman/audio/tcl_distil/teacher/<git_hash> --output-dir /export/eingerman/audio/tcl_distil/checkpoints/<git_hash> --device cuda --batch-size 8 --epochs 20`
+  - Monitor with `uv run tensorboard --logdir /export/eingerman/audio/tcl_distil/checkpoints`.
 - [ ] Reexport distilled fp32 TFLite, run PyTorch-vs-TFLite parity, generate comparison WAVs, then AOT compile Tensor G5.
 - [ ] Quantization after distilled fp32 parity: fp16 AOT, int8 PT2E.
 
 ## Completed
+- [x] **2026-06-04 00:18:43 PDT (git 0b36a45) — Distillation storage moved to external audio workspace**:
+  - Default collector output now uses `/export/eingerman/audio/tcl_distil/teacher/<git_hash>`.
+  - Default trainer output now uses `/export/eingerman/audio/tcl_distil/checkpoints/<git_hash>`.
+  - Full collection examples now use `/export/eingerman/audio/LJSpeech-1.1/` and `/export/eingerman/audio/LibriTTS/LibriTTS/`.
+  - Smoke collection passed with output `/export/eingerman/audio/tcl_distil/teacher/smoke_realpaths`.
+
 - [x] **2026-06-03 23:37:10 PDT (git 5b97fd3) — Distillation data and training scripts added**:
-  - Added `export/collect_tcn_distill_data.py` for local LJSpeech `metadata.csv` or plain-text input, multiple Kokoro voices, frozen LSTM teacher forward passes, compressed `.npz` tensor saving, and JSON/JSONL manifests.
+  - Added `export/collect_tcn_distill_data.py` for local LJSpeech `metadata.csv`, LibriTTS transcript files, or plain-text input, multiple Kokoro voices, frozen LSTM teacher forward passes, compressed `.npz` tensor saving, and JSON/JSONL manifests.
   - Collector saves `input_ids`, masks, style slices, `d_en`, `text_encoder`, `duration_encoded`, `duration_mixer`, `duration_logits`, `pred_dur`, `pred_aln_trg`, `predictor_aligned_en`, `f0n_shared`, `F0`, `N`, `asr`, and optional decoder audio.
   - Added `export/train_tcn_distill.py` for TCN student training with TensorBoard, AMP, checkpoint/resume, validation split, gradient accumulation, loss weighting, and recursive CUDA-OOM batch splitting.
+  - Default distillation storage is `/export/eingerman/audio/tcl_distil/`.
   - Added `tensorboard` to uv dependencies.
   - Smoke collection passed on `export/test.txt` with `af_heart`.
-  - Smoke training passed on two collected cases for one CPU epoch; output `checkpoints/tcn_distill/smoke`.
+  - Smoke training passed on two collected cases for one CPU epoch; future smoke outputs should use `/export/eingerman/audio/tcl_distil/checkpoints/smoke`.
 
 - [x] **2026-06-03 23:28:00 PDT (git 3879584) — TCN source-hash fp32 exports regenerated**:
   - `outputs/3879584/kokoro_text_encoder_multisig_fp32.tflite`; parity max diff <= `9e-06`.

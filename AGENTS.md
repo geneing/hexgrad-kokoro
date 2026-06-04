@@ -125,9 +125,18 @@ original checkpoint.
 
 ### Distillation Data Collection
 
-Collect teacher/student pairs from text, not necessarily paired audio. Use
-`export/test.txt` first, then add a larger phoneme-text corpus covering short,
-medium, long, punctuation-heavy, and prosody-varied lines.
+Collect teacher/student pairs from text, not necessarily paired audio. Use the
+local text corpora:
+
+| Corpus | Local path |
+|---|---|
+| LJSpeech | `/export/eingerman/audio/LJSpeech-1.1/` |
+| LibriTTS | `/export/eingerman/audio/LibriTTS/LibriTTS/` |
+| Distillation data/output | `/export/eingerman/audio/tcl_distil/` |
+
+Use `export/test.txt` only for smoke tests. Full collection should use the
+local LJSpeech and LibriTTS roots above, covering short, medium, long,
+punctuation-heavy, and prosody-varied lines.
 
 For each line/chunk:
 
@@ -145,8 +154,8 @@ For each line/chunk:
    - `f0n_shared_out`
    - `F0`, `N`
    - decoder inputs and optional `audio`
-4. Save tensors under `test_output/<git_hash>/distill_teacher/<case>/` as
-   `.npz` files with a manifest containing text, phonemes, token length,
+4. Save tensors under `/export/eingerman/audio/tcl_distil/teacher/<git_hash>/`
+   as `.npz` files with a manifest containing text, phonemes, token length,
    aligned length, voice id, style file, speed, and source git hash.
 5. Bucket by token length and aligned frame length, but keep exact actual
    lengths in metadata for loss masking.
@@ -189,9 +198,10 @@ loss = (
 )
 ```
 
-Training outputs should be saved to `checkpoints/tcn_distill/` with the source
-git hash, data manifest hash, and validation summary in the filename or a
-sidecar JSON.
+Training outputs should be saved to
+`/export/eingerman/audio/tcl_distil/checkpoints/<git_hash>/` with the source git
+hash, data manifest hash, and validation summary in the filename or a sidecar
+JSON.
 
 ---
 

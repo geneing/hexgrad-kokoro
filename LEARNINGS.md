@@ -71,9 +71,14 @@
   directly transformed into Conv1d weights. Collect teacher tensors from the
   frozen original LSTM model and train the TCN student on intermediate outputs
   before any end-to-end fine-tune.
-- LJSpeech is useful here as a text corpus rather than as paired audio. The
-  collector uses `metadata.csv` text, Kokoro G2P chunking, and multiple Kokoro
-  voice packs to generate teacher tensor targets.
+- LJSpeech and LibriTTS are useful here as text corpora rather than paired
+  audio. Use `/export/eingerman/audio/LJSpeech-1.1/` and
+  `/export/eingerman/audio/LibriTTS/LibriTTS/`; the collector reads LJSpeech
+  `metadata.csv` and LibriTTS transcript text, then uses Kokoro G2P chunking
+  and multiple Kokoro voice packs to generate teacher tensor targets.
+- Store distillation datasets, checkpoints, and TensorBoard runs under
+  `/export/eingerman/audio/tcl_distil/` so large generated artifacts stay out of
+  the repo workspace.
 - Save `f0n_shared` separately during collection. It lets the student train the
   shared F0/N sequence mixer directly instead of only learning through the
   heavier F0/N heads.
