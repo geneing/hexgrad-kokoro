@@ -71,6 +71,17 @@
   directly transformed into Conv1d weights. Collect teacher tensors from the
   frozen original LSTM model and train the TCN student on intermediate outputs
   before any end-to-end fine-tune.
+- LJSpeech is useful here as a text corpus rather than as paired audio. The
+  collector uses `metadata.csv` text, Kokoro G2P chunking, and multiple Kokoro
+  voice packs to generate teacher tensor targets.
+- Save `f0n_shared` separately during collection. It lets the student train the
+  shared F0/N sequence mixer directly instead of only learning through the
+  heavier F0/N heads.
+- Training variable-length TTS tensors benefits from two safeguards: bucket-ish
+  padding inside each DataLoader batch, and recursive batch splitting on CUDA
+  OOM for unusually long examples.
+- `torch.utils.tensorboard.SummaryWriter` requires the `tensorboard` package;
+  it is now a direct uv dependency.
 
 ## Baseline parity harness
 - Use `export/parity_baseline_tflite.py` to compare exported TFLite submodules

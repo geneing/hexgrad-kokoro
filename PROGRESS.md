@@ -9,22 +9,23 @@
 - [ ] **TCN distillation path** — replacing export-facing LSTM/BiLSTM mixers with non-causal Conv1d/TCN modules and training them as students from the frozen original LSTM checkpoint.
 
 ## Next Steps
-- [ ] Add a teacher tensor collection script for distillation data:
-  - Load original LSTM config as teacher and TCN config as student.
-  - Run `export/test.txt` first, then a larger text corpus through `KPipeline`.
-  - Save `input_ids`, masks, style slices, `d_en`, `text_encoder_out`, `duration_encoder_out`, `predictor_duration_mixer_out`, `duration_logits`, `pred_dur`, `pred_aln_trg`, `predictor_aligned_en`, `f0n_shared_out`, `F0`, `N`, decoder inputs, and optional audio.
-  - Store cases under `test_output/<git_hash>/distill_teacher/<case>/` with a manifest containing text, phonemes, lengths, voice id, speed, style source, and teacher/student git hashes.
-- [ ] Add staged distillation training:
-  - TextEncoder TCN: masked MSE/cosine against teacher `text_encoder_out`.
-  - DurationEncoder TCN: masked MSE against teacher `duration_encoder_out`.
-  - Duration mixer/head: hidden MSE plus duration-logit MSE/KL.
-  - F0/N shared mixer: hidden MSE plus F0/N MSE.
-  - Short end-to-end fine-tune with BERT/decoder initially frozen.
-- [ ] Save distilled checkpoints to `checkpoints/tcn_distill/` with source git hash, data manifest hash, and validation summary.
+- [ ] Run full teacher tensor collection on local LJSpeech:
+  - `uv run python export/collect_tcn_distill_data.py --ljspeech-root /path/to/LJSpeech-1.1 --output-dir test_output/<git_hash>/distill_teacher --voices af_heart,af_bella,af_sarah,af_nicole,af_aoede,am_michael,am_puck,am_fenrir --device cuda`
+- [ ] Run full TCN distillation training:
+  - `uv run python export/train_tcn_distill.py --data-dir test_output/<git_hash>/distill_teacher --output-dir checkpoints/tcn_distill/<git_hash> --device cuda --batch-size 8 --epochs 20`
+  - Monitor with `uv run tensorboard --logdir checkpoints/tcn_distill`.
 - [ ] Reexport distilled fp32 TFLite, run PyTorch-vs-TFLite parity, generate comparison WAVs, then AOT compile Tensor G5.
 - [ ] Quantization after distilled fp32 parity: fp16 AOT, int8 PT2E.
 
 ## Completed
+- [x] **2026-06-03 23:37:10 PDT (git 5b97fd3) — Distillation data and training scripts added**:
+  - Added `export/collect_tcn_distill_data.py` for local LJSpeech `metadata.csv` or plain-text input, multiple Kokoro voices, frozen LSTM teacher forward passes, compressed `.npz` tensor saving, and JSON/JSONL manifests.
+  - Collector saves `input_ids`, masks, style slices, `d_en`, `text_encoder`, `duration_encoded`, `duration_mixer`, `duration_logits`, `pred_dur`, `pred_aln_trg`, `predictor_aligned_en`, `f0n_shared`, `F0`, `N`, `asr`, and optional decoder audio.
+  - Added `export/train_tcn_distill.py` for TCN student training with TensorBoard, AMP, checkpoint/resume, validation split, gradient accumulation, loss weighting, and recursive CUDA-OOM batch splitting.
+  - Added `tensorboard` to uv dependencies.
+  - Smoke collection passed on `export/test.txt` with `af_heart`.
+  - Smoke training passed on two collected cases for one CPU epoch; output `checkpoints/tcn_distill/smoke`.
+
 - [x] **2026-06-03 23:28:00 PDT (git 3879584) — TCN source-hash fp32 exports regenerated**:
   - `outputs/3879584/kokoro_text_encoder_multisig_fp32.tflite`; parity max diff <= `9e-06`.
   - `outputs/3879584/kokoro_text_encoder_Google_Tensor_G5.tflite`; Tensor G5 AOT fully offloaded all three signatures.
