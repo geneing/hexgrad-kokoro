@@ -50,6 +50,10 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
+test_output/
+outputs/
+checkpoints/
+litert-torch/
 
 # Translations
 *.mo
