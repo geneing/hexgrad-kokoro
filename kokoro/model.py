@@ -100,6 +100,7 @@ class KModel(torch.nn.Module):
             with open(config, 'r', encoding='utf-8') as r:
                 config = json.load(r)
                 logger.debug(f"Loaded config: {config}")
+                
         self.vocab = config['vocab']
         self.bert = CustomAlbert(AlbertConfig(vocab_size=config['n_token'], **config['plbert']))
         self.bert_encoder = torch.nn.Linear(self.bert.config.hidden_size, config['hidden_dim'])
@@ -113,7 +114,7 @@ class KModel(torch.nn.Module):
             channels=config['hidden_dim'], kernel_size=config['text_encoder_kernel_size'],
             depth=config['n_layer'], n_symbols=config['n_token']
         )
-        self.decoder_type = str(config.get('decoder_type', config.get('decoder', 'pt_vocos'))).lower()
+        self.decoder_type = str(config.get('decoder_type', config.get('decoder', 'istft'))).lower()
         vocos_cfg = config.get('vocos', config.get('vocos_decoder', {}))
         if self.decoder_type == 'istft':
             self.decoder = Decoder(

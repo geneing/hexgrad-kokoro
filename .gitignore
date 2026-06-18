@@ -173,3 +173,6 @@ runs/
 inputs/
 outputs/
 inputs
+checkpoints/
+test_output/
+.kilo/
