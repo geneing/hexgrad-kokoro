@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
+import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Sequence
+from typing import Callable, Dict, Iterable, List, Sequence
 
 import numpy as np
 import torch
@@ -15,6 +15,15 @@ import torchaudio
 from loguru import logger
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
+
+try:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except ImportError:  # pragma: no cover - optional runtime dependency
+    plt = None
 
 from kokoro.styletts2_losses import StyleTTS2MultiResolutionGroupDelayLoss, StyleTTS2MultiResolutionSTFTLoss
 from vocos.discriminators import MultiPeriodDiscriminator, MultiResolutionDiscriminator
@@ -177,7 +186,12 @@ class SliceCollator:
             wav_end = wav_start + target_frames * self.hop_length
             features.append(feat)
             audio.append(self._pad_1d(wav[wav_start:wav_end], target_frames * self.hop_length))
-        return {"features": torch.stack(features), "audio": torch.stack(audio)}
+        return {
+            "features": torch.stack(features),
+            "audio": torch.stack(audio),
+            "target_frames": torch.tensor(target_frames, dtype=torch.long),
+            "wav_paths": [str(r["wav_path"]) for r in rows],
+        }
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -192,10 +206,16 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--control-layers", type=int, default=2)
     parser.add_argument("--frame-cap", type=int, default=520)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--min-batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=200000)
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--val-every", type=int, default=1000)
+    parser.add_argument("--val-steps", type=int, default=4)
+    parser.add_argument("--sample-every", type=int, default=2000)
+    parser.add_argument("--mel-plot-every", type=int, default=2000)
+    parser.add_argument("--sample-count", type=int, default=2)
     parser.add_argument("--pretrain-steps", type=int, default=5000)
     parser.add_argument("--gen-lr", type=float, default=3e-4)
     parser.add_argument("--disc-lr", type=float, default=2e-4)
@@ -250,6 +270,103 @@ def align_audio(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.T
     return a[..., :n], b[..., :n]
 
 
+def maybe_oom(exc: RuntimeError) -> bool:
+    msg = str(exc).lower()
+    return "out of memory" in msg or "cuda error: out of memory" in msg or "cublas_status_alloc_failed" in msg
+
+
+def slice_batch(batch: Dict[str, object], batch_size: int) -> Dict[str, object]:
+    sliced: Dict[str, object] = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] >= batch_size:
+            sliced[key] = value[:batch_size]
+        elif isinstance(value, list):
+            sliced[key] = value[:batch_size]
+        else:
+            sliced[key] = value
+    return sliced
+
+
+def grad_norm(parameters: Iterable[torch.nn.Parameter]) -> float:
+    norms = []
+    for param in parameters:
+        if param.grad is not None:
+            norms.append(param.grad.detach().float().norm(2))
+    if not norms:
+        return 0.0
+    return float(torch.norm(torch.stack(norms), 2).item())
+
+
+def set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
+    for param in module.parameters():
+        param.requires_grad_(requires_grad)
+
+
+def audio_metrics(fake: torch.Tensor, real: torch.Tensor) -> Dict[str, float]:
+    diff = fake - real
+    l1 = torch.mean(torch.abs(diff))
+    mse = torch.mean(diff.square())
+    rmse = torch.sqrt(mse.clamp_min(1e-12))
+    signal = torch.mean(real.square()).clamp_min(1e-12)
+    snr = 10.0 * torch.log10(signal / mse.clamp_min(1e-12))
+    return {
+        "l1": float(l1.item()),
+        "mse": float(mse.item()),
+        "rmse": float(rmse.item()),
+        "snr_db": float(snr.item()),
+        "real_peak": float(real.detach().abs().max().item()),
+        "fake_peak": float(fake.detach().abs().max().item()),
+        "real_rms": float(torch.sqrt(torch.mean(real.detach().square()).clamp_min(1e-12)).item()),
+        "fake_rms": float(torch.sqrt(torch.mean(fake.detach().square()).clamp_min(1e-12)).item()),
+    }
+
+
+def mel_figure(
+    mel_transform: torchaudio.transforms.MelSpectrogram,
+    real_wav: torch.Tensor,
+    fake_wav: torch.Tensor,
+):
+    if plt is None:
+        return None
+    with torch.no_grad():
+        real_mel = torch.log(mel_transform(real_wav.detach().float().cpu()).clamp_min(1e-5)).numpy()
+        fake_mel = torch.log(mel_transform(fake_wav.detach().float().cpu()).clamp_min(1e-5)).numpy()
+        diff_mel = np.abs(fake_mel - real_mel)
+    fig, axes = plt.subplots(3, 1, figsize=(12, 8), constrained_layout=True)
+    for ax, data, title in zip(
+        axes,
+        (real_mel, fake_mel, diff_mel),
+        ("baseline log-mel", "generated log-mel", "absolute log-mel error"),
+    ):
+        im = ax.imshow(data, origin="lower", aspect="auto", interpolation="nearest")
+        ax.set_title(title)
+        ax.set_ylabel("mel")
+        fig.colorbar(im, ax=ax, fraction=0.02, pad=0.01)
+    axes[-1].set_xlabel("frame")
+    return fig
+
+
+def log_samples(
+    writer: SummaryWriter,
+    mel_transform: torchaudio.transforms.MelSpectrogram,
+    tag: str,
+    real: torch.Tensor,
+    fake: torch.Tensor,
+    step: int,
+    sample_rate: int,
+    sample_count: int,
+    include_mels: bool,
+) -> None:
+    n = min(max(1, int(sample_count)), real.shape[0], fake.shape[0])
+    for i in range(n):
+        writer.add_audio(f"{tag}/sample_{i}/baseline", real[i].detach().cpu(), step, sample_rate)
+        writer.add_audio(f"{tag}/sample_{i}/generated", fake[i].detach().cpu(), step, sample_rate)
+        if include_mels:
+            fig = mel_figure(mel_transform, real[i], fake[i])
+            if fig is not None:
+                writer.add_figure(f"{tag}/sample_{i}/mel", fig, step, close=True)
+
+
 def resolve_device(name: str) -> torch.device:
     if name == "cpu":
         return torch.device("cpu")
@@ -278,17 +395,25 @@ def train_decoder(
     if not train_items or not val_items:
         raise RuntimeError(f"Need non-empty train and val sets, got train={len(train_items)} val={len(val_items)}")
 
-    train_loader = DataLoader(
-        PairedKokoroDataset(train_items, args.sample_rate),
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        collate_fn=SliceCollator(args.frame_cap, args.hop_length, train=True),
-        drop_last=True,
-    )
+    train_dataset = PairedKokoroDataset(train_items, args.sample_rate)
+    val_dataset = PairedKokoroDataset(val_items, args.sample_rate)
+
+    def make_train_loader(batch_size: int) -> DataLoader:
+        return DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+            collate_fn=SliceCollator(args.frame_cap, args.hop_length, train=True),
+            drop_last=batch_size > 1,
+        )
+
+    current_batch_size = max(1, int(args.batch_size))
+    min_batch_size = max(1, int(args.min_batch_size))
+    train_loader = make_train_loader(current_batch_size)
     val_loader = DataLoader(
-        PairedKokoroDataset(val_items, args.sample_rate),
+        val_dataset,
         batch_size=max(1, args.batch_size // 2),
         shuffle=False,
         num_workers=max(0, args.num_workers // 2),
@@ -313,12 +438,26 @@ def train_decoder(
     group_delay = StyleTTS2MultiResolutionGroupDelayLoss().to(device)
 
     out_dir = args.output_dir.resolve()
+    tb_dir = out_dir / "tensorboard"
     ckpt_dir = out_dir / "checkpoints"
+    out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "config.json").write_text(
         json.dumps({"backend": backend_name, "backend_config": backend_config, "args": vars(args)}, indent=2, default=str),
         encoding="utf-8",
     )
+    writer = SummaryWriter(log_dir=str(tb_dir))
+    writer.add_text("run/config", json.dumps({"backend": backend_name, "backend_config": backend_config, "args": vars(args)}, indent=2, default=str), 0)
+    mel_transform = torchaudio.transforms.MelSpectrogram(
+        sample_rate=args.sample_rate,
+        n_fft=args.n_fft,
+        hop_length=args.hop_length,
+        n_mels=80,
+        center=True,
+        power=1.0,
+    )
+    if plt is None:
+        logger.warning("matplotlib is not installed; TensorBoard mel plot logging is disabled.")
 
     step = 0
     if args.resume:
@@ -330,63 +469,197 @@ def train_decoder(
         disc_opt.load_state_dict(ckpt["disc_opt"])
         step = int(ckpt.get("step", 0))
 
+    logger.info(f"Training {backend_name} on device={device}; tensorboard={tb_dir}")
     generator.train()
-    while step < args.max_steps:
-        for batch in train_loader:
-            if step >= args.max_steps:
-                break
-            features = batch["features"].to(device, non_blocking=True)
-            real = batch["audio"].to(device, non_blocking=True)
-            fake = generator(features)
-            fake, real = align_audio(fake, real)
+    last_log = time.time()
+    throughput_step = step
+    throughput_time = time.time()
+    try:
+        while step < args.max_steps:
+            rebuild_loader = False
+            for batch in train_loader:
+                if step >= args.max_steps:
+                    break
+                batch_local: Dict[str, object] = dict(batch)
+                retried = 0
+                iter_start = time.perf_counter()
+                while True:
+                    try:
+                        features = batch_local["features"].to(device, non_blocking=True)  # type: ignore[union-attr]
+                        real = batch_local["audio"].to(device, non_blocking=True)  # type: ignore[union-attr]
+                        fake = generator(features)
+                        fake, real = align_audio(fake, real)
 
-            adv = step >= args.pretrain_steps
-            if adv:
-                disc_opt.zero_grad(set_to_none=True)
-                real_mp, fake_mp, _, _ = mpd(real, fake.detach())
-                real_mrd, fake_mrd, _, _ = mrd(real, fake.detach())
-                d_mp, _, _ = disc_loss_fn(real_mp, fake_mp)
-                d_mrd, _, _ = disc_loss_fn(real_mrd, fake_mrd)
-                d_loss = d_mp + args.mrd_loss_coeff * d_mrd
-                d_loss.backward()
-                disc_opt.step()
-            else:
-                d_loss = torch.zeros((), device=device)
+                        adv = step >= args.pretrain_steps
+                        if adv:
+                            disc_opt.zero_grad(set_to_none=True)
+                            real_mp, fake_mp, _, _ = mpd(real, fake.detach())
+                            real_mrd, fake_mrd, _, _ = mrd(real, fake.detach())
+                            d_mp, _, _ = disc_loss_fn(real_mp, fake_mp)
+                            d_mrd, _, _ = disc_loss_fn(real_mrd, fake_mrd)
+                            d_loss = d_mp + args.mrd_loss_coeff * d_mrd
+                            d_loss.backward()
+                            d_grad_norm = grad_norm(list(mpd.parameters()) + list(mrd.parameters()))
+                            disc_opt.step()
+                        else:
+                            d_mp = torch.zeros((), device=device)
+                            d_mrd = torch.zeros((), device=device)
+                            d_loss = torch.zeros((), device=device)
+                            d_grad_norm = 0.0
 
-            gen_opt.zero_grad(set_to_none=True)
-            stft_loss = mrstft(fake, real)
-            gd_loss = group_delay(fake, real)
-            g_adv = torch.zeros((), device=device)
-            g_fm = torch.zeros((), device=device)
-            if adv:
-                _, fake_mp, fmap_real_mp, fmap_fake_mp = mpd(real, fake)
-                _, fake_mrd, fmap_real_mrd, fmap_fake_mrd = mrd(real, fake)
-                g_mp, _ = gen_loss_fn(fake_mp)
-                g_mrd, _ = gen_loss_fn(fake_mrd)
-                g_adv = g_mp + args.mrd_loss_coeff * g_mrd
-                g_fm = fm_loss_fn(fmap_real_mp, fmap_fake_mp) + args.mrd_loss_coeff * fm_loss_fn(fmap_real_mrd, fmap_fake_mrd)
-            g_loss = (
-                args.mrstft_loss_coeff * stft_loss
-                + args.group_delay_loss_coeff * gd_loss
-                + args.gan_loss_coeff * g_adv
-                + args.fm_loss_coeff * g_fm
-            )
-            g_loss.backward()
-            gen_opt.step()
-            step += 1
+                        gen_opt.zero_grad(set_to_none=True)
+                        stft_loss = mrstft(fake, real)
+                        gd_loss = group_delay(fake, real)
+                        g_adv = torch.zeros((), device=device)
+                        g_fm = torch.zeros((), device=device)
+                        if adv:
+                            set_requires_grad(mpd, False)
+                            set_requires_grad(mrd, False)
+                            try:
+                                _, fake_mp, fmap_real_mp, fmap_fake_mp = mpd(real, fake)
+                                _, fake_mrd, fmap_real_mrd, fmap_fake_mrd = mrd(real, fake)
+                                g_mp, _ = gen_loss_fn(fake_mp)
+                                g_mrd, _ = gen_loss_fn(fake_mrd)
+                                g_adv = g_mp + args.mrd_loss_coeff * g_mrd
+                                g_fm = fm_loss_fn(fmap_real_mp, fmap_fake_mp) + args.mrd_loss_coeff * fm_loss_fn(
+                                    fmap_real_mrd, fmap_fake_mrd
+                                )
+                            finally:
+                                set_requires_grad(mpd, True)
+                                set_requires_grad(mrd, True)
+                        g_mrstft_weighted = args.mrstft_loss_coeff * stft_loss
+                        g_gd_weighted = args.group_delay_loss_coeff * gd_loss
+                        g_adv_weighted = args.gan_loss_coeff * g_adv
+                        g_fm_weighted = args.fm_loss_coeff * g_fm
+                        g_loss = g_mrstft_weighted + g_gd_weighted + g_adv_weighted + g_fm_weighted
+                        g_loss.backward()
+                        g_grad_norm = grad_norm(generator.parameters())
+                        gen_opt.step()
+                        step += 1
 
-            if step % max(1, args.log_every) == 0:
-                logger.info(
-                    f"{backend_name} step={step} gen={float(g_loss.item()):.4f} disc={float(d_loss.item()):.4f} "
-                    f"mrstft={float(stft_loss.item()):.4f} gd={float(gd_loss.item()):.4f}"
-                )
+                        metrics = audio_metrics(fake.detach(), real.detach())
+                        running = {
+                            "gen_total": float(g_loss.item()),
+                            "gen_mrstft_raw": float(stft_loss.item()),
+                            "gen_group_delay_raw": float(gd_loss.item()),
+                            "gen_gan_raw": float(g_adv.item()),
+                            "gen_feat_match_raw": float(g_fm.item()),
+                            "gen_mrstft_weighted": float(g_mrstft_weighted.item()),
+                            "gen_group_delay_weighted": float(g_gd_weighted.item()),
+                            "gen_gan_weighted": float(g_adv_weighted.item()),
+                            "gen_feat_match_weighted": float(g_fm_weighted.item()),
+                            "disc_total": float(d_loss.item()),
+                            "disc_mp_raw": float(d_mp.item()),
+                            "disc_mrd_raw": float(d_mrd.item()),
+                            "disc_grad_norm": d_grad_norm,
+                            "gen_grad_norm": g_grad_norm,
+                            "batch_size_effective": float(features.shape[0]),
+                            "batch_size_configured": float(current_batch_size),
+                            "target_frames": float(batch_local["target_frames"].item()),  # type: ignore[union-attr]
+                            "adv_enabled": float(1.0 if adv else 0.0),
+                            "lr_gen": float(gen_opt.param_groups[0]["lr"]),
+                            "lr_disc": float(disc_opt.param_groups[0]["lr"]),
+                            "time_step_ms": (time.perf_counter() - iter_start) * 1000.0,
+                            **metrics,
+                        }
 
-            if step % max(1, args.save_every) == 0:
-                save_path = ckpt_dir / f"step_{step:08d}.pt"
-                save_checkpoint(save_path, step, generator, mpd, mrd, gen_opt, disc_opt, backend_name, backend_config)
-                save_checkpoint(ckpt_dir / "last.pt", step, generator, mpd, mrd, gen_opt, disc_opt, backend_name, backend_config)
+                        if step % max(1, args.log_every) == 0:
+                            now = time.time()
+                            if now > throughput_time and step > throughput_step:
+                                running["steps_per_sec"] = (step - throughput_step) / (now - throughput_time)
+                            throughput_step = step
+                            throughput_time = now
+                            for key, value in running.items():
+                                writer.add_scalar(f"train/{key}", value, step)
+                            if device.type == "cuda":
+                                writer.add_scalar("train/cuda_memory_allocated_gb", torch.cuda.memory_allocated() / (1024**3), step)
+                                writer.add_scalar(
+                                    "train/cuda_max_memory_allocated_gb",
+                                    torch.cuda.max_memory_allocated() / (1024**3),
+                                    step,
+                                )
+                                torch.cuda.reset_peak_memory_stats()
 
-        validate_once(generator, val_loader, device, mrstft, group_delay, backend_name, step)
+                        log_audio = step % max(1, args.sample_every) == 0
+                        log_mels = step % max(1, args.mel_plot_every) == 0
+                        if log_audio or log_mels:
+                            log_samples(
+                                writer=writer,
+                                mel_transform=mel_transform,
+                                tag="train",
+                                real=real,
+                                fake=fake,
+                                step=step,
+                                sample_rate=args.sample_rate,
+                                sample_count=args.sample_count,
+                                include_mels=log_mels,
+                            )
+
+                        if step % max(1, args.val_every) == 0:
+                            validate_once(
+                                generator=generator,
+                                loader=val_loader,
+                                device=device,
+                                mrstft=mrstft,
+                                group_delay=group_delay,
+                                backend_name=backend_name,
+                                step=step,
+                                writer=writer,
+                                mel_transform=mel_transform,
+                                sample_rate=args.sample_rate,
+                                max_batches=args.val_steps,
+                                sample_count=args.sample_count,
+                                log_mels=log_mels,
+                                loss_weights={
+                                    "mrstft": args.mrstft_loss_coeff,
+                                    "group_delay": args.group_delay_loss_coeff,
+                                },
+                            )
+
+                        if time.time() - last_log > 10 or step % max(1, args.log_every) == 0:
+                            logger.info(
+                                f"{backend_name} step={step} gen={running['gen_total']:.4f} "
+                                f"disc={running['disc_total']:.4f} mrstft={running['gen_mrstft_raw']:.4f} "
+                                f"gd={running['gen_group_delay_raw']:.4f} bs={features.shape[0]}"
+                            )
+                            last_log = time.time()
+
+                        if step % max(1, args.save_every) == 0:
+                            save_path = ckpt_dir / f"step_{step:08d}.pt"
+                            save_checkpoint(save_path, step, generator, mpd, mrd, gen_opt, disc_opt, backend_name, backend_config)
+                            save_checkpoint(ckpt_dir / "last.pt", step, generator, mpd, mrd, gen_opt, disc_opt, backend_name, backend_config)
+                        break
+                    except RuntimeError as exc:
+                        if device.type != "cuda" or not maybe_oom(exc):
+                            raise
+                        gen_opt.zero_grad(set_to_none=True)
+                        disc_opt.zero_grad(set_to_none=True)
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
+                        old_batch_size = current_batch_size
+                        current_batch_size = max(min_batch_size, current_batch_size // 2)
+                        writer.add_scalar("train/oom_events", 1.0, step)
+                        writer.add_scalar("train/batch_size_after_oom", float(current_batch_size), step)
+                        if current_batch_size >= old_batch_size:
+                            logger.error(
+                                f"CUDA OOM at step={step}; already at minimum batch size {current_batch_size}. Skipping batch."
+                            )
+                            break
+                        retried += 1
+                        rebuild_loader = True
+                        batch_local = slice_batch(batch_local, current_batch_size)
+                        logger.warning(
+                            f"CUDA OOM at step={step}, retry={retried}; reducing batch size "
+                            f"{old_batch_size} -> {current_batch_size} and retrying current batch"
+                        )
+                        continue
+                if rebuild_loader:
+                    break
+            if rebuild_loader and step < args.max_steps:
+                train_loader = make_train_loader(current_batch_size)
+    finally:
+        writer.flush()
+        writer.close()
 
     save_checkpoint(ckpt_dir / "final.pt", step, generator, mpd, mrd, gen_opt, disc_opt, backend_name, backend_config)
     save_checkpoint(ckpt_dir / "last.pt", step, generator, mpd, mrd, gen_opt, disc_opt, backend_name, backend_config)
@@ -401,18 +674,68 @@ def validate_once(
     group_delay: nn.Module,
     backend_name: str,
     step: int,
+    writer: SummaryWriter,
+    mel_transform: torchaudio.transforms.MelSpectrogram,
+    sample_rate: int,
+    max_batches: int,
+    sample_count: int,
+    log_mels: bool,
+    loss_weights: Dict[str, float],
 ) -> None:
     generator.eval()
-    vals = []
+    totals: list[float] = []
+    stfts: list[float] = []
+    gds: list[float] = []
+    l1s: list[float] = []
+    mses: list[float] = []
+    rmses: list[float] = []
+    snrs: list[float] = []
+    real_rms: list[float] = []
+    fake_rms: list[float] = []
     for i, batch in enumerate(loader):
-        if i >= 2:
+        if i >= max(1, int(max_batches)):
             break
         features = batch["features"].to(device, non_blocking=True)
         real = batch["audio"].to(device, non_blocking=True)
         fake, real = align_audio(generator(features), real)
-        vals.append(float((mrstft(fake, real) + group_delay(fake, real)).item()))
-    if vals:
-        logger.info(f"{backend_name} validation step={step} loss={sum(vals) / len(vals):.4f}")
+        stft_loss = mrstft(fake, real)
+        gd_loss = group_delay(fake, real)
+        metric = audio_metrics(fake, real)
+        total = loss_weights["mrstft"] * stft_loss + loss_weights["group_delay"] * gd_loss
+        totals.append(float(total.item()))
+        stfts.append(float(stft_loss.item()))
+        gds.append(float(gd_loss.item()))
+        l1s.append(metric["l1"])
+        mses.append(metric["mse"])
+        rmses.append(metric["rmse"])
+        snrs.append(metric["snr_db"])
+        real_rms.append(metric["real_rms"])
+        fake_rms.append(metric["fake_rms"])
+        if i == 0:
+            log_samples(
+                writer=writer,
+                mel_transform=mel_transform,
+                tag="val",
+                real=real,
+                fake=fake,
+                step=step,
+                sample_rate=sample_rate,
+                sample_count=sample_count,
+                include_mels=log_mels,
+            )
+    if totals:
+        writer.add_scalar("val/gen_total_estimate", sum(totals) / len(totals), step)
+        writer.add_scalar("val/gen_mrstft_raw", sum(stfts) / len(stfts), step)
+        writer.add_scalar("val/gen_group_delay_raw", sum(gds) / len(gds), step)
+        writer.add_scalar("val/gen_mrstft_weighted", loss_weights["mrstft"] * (sum(stfts) / len(stfts)), step)
+        writer.add_scalar("val/gen_group_delay_weighted", loss_weights["group_delay"] * (sum(gds) / len(gds)), step)
+        writer.add_scalar("val/l1", sum(l1s) / len(l1s), step)
+        writer.add_scalar("val/mse", sum(mses) / len(mses), step)
+        writer.add_scalar("val/rmse", sum(rmses) / len(rmses), step)
+        writer.add_scalar("val/snr_db", sum(snrs) / len(snrs), step)
+        writer.add_scalar("val/real_rms", sum(real_rms) / len(real_rms), step)
+        writer.add_scalar("val/fake_rms", sum(fake_rms) / len(fake_rms), step)
+        logger.info(f"{backend_name} validation step={step} loss={sum(totals) / len(totals):.4f}")
     generator.train()
 
 
