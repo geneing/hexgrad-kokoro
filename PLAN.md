@@ -14,31 +14,27 @@ Train Vocos and Wavehax as drop-in Kokoro decoder replacements for `istftnet.Dec
 
 ## Implementation Steps
 
-1. **Unify paired-feature decoder construction**
-   - Keep the existing Vocos paired-feature generator.
-   - Add a Wavehax paired-feature generator that consumes the same feature tensor layout: `[asr, f0, noise, style]`.
-   - Add explicit F0/noise branches before the shared conditioner because Kokoro F0 and noise are higher-rate control streams in the legacy iSTFTNet path.
+1. **Create separate third-party training entry points**
+   - Add `third_party/vocos/train_kokoro_decoder.py` for Vocos.
+   - Add `third_party/wavehax/train_kokoro_decoder.py` for Wavehax.
+   - Do not route this work through `kokoro/vocos_decoder.py`.
 
-2. **Extend training entry point**
-   - Rename the conceptual backend from Vocos-only to paired vocoder backend while preserving `kokoro.train_vocos` compatibility.
-   - Add `--decoder-backend {vocos,wavehax}`.
-   - Keep all existing losses and dynamic batching for both backends.
-   - Save backend/config metadata in checkpoints so inference can reconstruct the correct decoder.
+2. **Share only generic distillation utilities**
+   - Add `third_party/kokoro_vocoder_distill.py` for dataset loading, Kokoro feature slicing, losses, checkpointing, and the common training loop.
+   - Keep model-specific generator definitions inside each third-party train script.
 
-3. **Wire inference adapters**
-   - Add `PTWavehaxDecoder` alongside `PTVocosDecoder`.
-   - Add `decoder_type="pt_wavehax"` support in `KModel`.
-   - Reuse the same feature assembly logic and checkpoint format.
+3. **Handle F0/noise explicitly**
+   - Add separate convolutional control branches for F0 and noise before fusion with ASR and style features.
+   - Keep the training tensor layout compatible with `vocoder_data.py`: `[asr, f0, noise, style]`.
 
 4. **Checkpoint regularly**
    - Commit `PLAN.md`.
-   - Commit the shared backend/adapters.
-   - Commit training and inference wiring.
+   - Commit separate third-party train scripts and shared utility code.
    - Commit validation fixes.
 
 5. **Validate**
    - Run syntax checks for touched Python modules.
-   - Run generator smoke tests with random Kokoro-shaped features for both Vocos and Wavehax where dependencies are available.
+   - Run generator smoke tests with random Kokoro-shaped features for both third-party scripts where dependencies are available.
    - If `data/outputs` contains filelists, run a one-step CPU/GPU smoke command with `--max-steps 1`; otherwise document that dataset validation is blocked by missing local files.
 
 ## Initial Training Commands
@@ -46,21 +42,15 @@ Train Vocos and Wavehax as drop-in Kokoro decoder replacements for `istftnet.Dec
 Vocos:
 
 ```bash
-uv run python -m kokoro.train_vocos \
+uv run python third_party/vocos/train_kokoro_decoder.py \
   --data-root data/outputs \
-  --decoder-backend vocos \
-  --vocos-impl streaming \
-  --streaming-vocos-repo third_party/vocos_streaming \
-  --precision auto \
-  --tf32
+  --output-dir runs/vocos_kokoro_decoder
 ```
 
 Wavehax:
 
 ```bash
-uv run python -m kokoro.train_vocos \
+uv run python third_party/wavehax/train_kokoro_decoder.py \
   --data-root data/outputs \
-  --decoder-backend wavehax \
-  --precision auto \
-  --tf32
+  --output-dir runs/wavehax_kokoro_decoder
 ```
