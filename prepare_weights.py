@@ -57,9 +57,11 @@ from __future__ import annotations
 import argparse
 import copy
 import gc
+import importlib.util
 import logging
 import random
 import sys
+import types
 import wave
 import warnings
 from dataclasses import dataclass
@@ -74,6 +76,33 @@ THIRD_PARTY_VOCOS = ROOT / "third_party" / "vocos"
 for import_path in (ROOT, THIRD_PARTY_VOCOS):
     if str(import_path) not in sys.path:
         sys.path.insert(0, str(import_path))
+
+
+def _load_styletts2_losses_without_package_import() -> types.ModuleType:
+    module_name = "kokoro.styletts2_losses"
+    cached = sys.modules.get(module_name)
+    if isinstance(cached, types.ModuleType):
+        return cached
+
+    kokoro_pkg = sys.modules.get("kokoro")
+    if not isinstance(kokoro_pkg, types.ModuleType):
+        kokoro_pkg = types.ModuleType("kokoro")
+        kokoro_pkg.__path__ = [str(ROOT / "kokoro")]  # type: ignore[attr-defined]
+        sys.modules["kokoro"] = kokoro_pkg
+
+    spec = importlib.util.spec_from_file_location(module_name, ROOT / "kokoro" / "styletts2_losses.py")
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load {module_name}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    setattr(kokoro_pkg, "styletts2_losses", module)
+    spec.loader.exec_module(module)
+    return module
+
+
+_styletts2_losses = _load_styletts2_losses_without_package_import()
+StyleTTS2MultiResolutionGroupDelayLoss = _styletts2_losses.StyleTTS2MultiResolutionGroupDelayLoss
+StyleTTS2MultiResolutionSTFTLoss = _styletts2_losses.StyleTTS2MultiResolutionSTFTLoss
 
 logging.getLogger("torchao").setLevel(logging.ERROR)
 
@@ -97,7 +126,6 @@ from torch.utils.data import DataLoader
 from vocos.discriminators import MultiPeriodDiscriminator, MultiResolutionDiscriminator
 from vocos.loss import FeatureMatchingLoss, GeneratorLoss as VocosGeneratorLoss
 
-from kokoro.styletts2_losses import StyleTTS2MultiResolutionGroupDelayLoss, StyleTTS2MultiResolutionSTFTLoss
 from third_party.kokoro_vocoder_distill import (
     PairedKokoroDataset,
     SliceCollator,
