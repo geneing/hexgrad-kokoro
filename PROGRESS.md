@@ -11,3 +11,4 @@
 - After venv update: compile still passes; checkpoint/model smoke loaded `models/vocos/last.pt`, built `KokoroVocosGenerator`, and produced finite random-feature audio output `(1, 2400)`.
 - After venv update: `vocos_export._load_models` successfully built both fp32/fp16 export models directly from `models/vocos/last.pt`.
 - Added a direct `kokoro/styletts2_losses.py` loader in `prepare_weights.py` so export tooling does not depend on package-level `kokoro` imports while `kokoro/vocos_decoder.py` is deleted in the worktree.
+- Added optional Android ARM GPU delegate testing to `vocos_export.py`: `--android-gpu-test` pushes a selected exported LiteRT model plus an android_arm64 `benchmark_model` binary to a Pixel/Android device over `adb`, runs a one-shot GPU delegate compile/warmup, runs GPU benchmarking, optionally runs a CPU/XNNPACK baseline, and saves logs under `output-dir/android_gpu`.

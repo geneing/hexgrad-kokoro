@@ -45,6 +45,14 @@ Examples:
      --checkpoint models/vocos/last.pt \
      --output-dir output/litert_vocos_light \
      --lightweight-conversion
+
+5) Export and run Pixel/Android ARM GPU delegate benchmark
+   uv run python vocos_export.py \
+     --checkpoint models/vocos/last.pt \
+     --output-dir output/litert_vocos_pixel10 \
+     --android-gpu-test \
+     --android-benchmark-model-bin path/to/android_arm64/benchmark_model \
+     --android-model-variant fp16
 """
 
 from __future__ import annotations
@@ -53,11 +61,13 @@ import argparse
 import logging
 import os
 import random
+import shlex
 import shutil
+import subprocess
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Mapping
+from typing import Dict, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -100,6 +110,16 @@ class ArithmeticOpStats:
     @property
     def total(self) -> int:
         return int(self.float_ops + self.int_ops)
+
+
+@dataclass
+class AndroidGpuBenchmarkResult:
+    variant: str
+    model_path: Path
+    device_info_path: Path
+    gpu_compile_log_path: Path
+    gpu_benchmark_log_path: Path
+    cpu_benchmark_log_path: Path | None
 
 
 class ExportSafeISTFT(nn.Module):
@@ -274,6 +294,42 @@ def parse_args() -> argparse.Namespace:
         "--lightweight-conversion",
         action="store_true",
         help="Use lightweight LiteRT conversion path",
+    )
+    parser.add_argument(
+        "--android-gpu-test",
+        action="store_true",
+        help="After export, push a selected LiteRT model to an Android phone and test it with the GPU delegate.",
+    )
+    parser.add_argument(
+        "--android-benchmark-model-bin",
+        type=Path,
+        default=None,
+        help="Local android_arm64 TensorFlow Lite benchmark_model binary to push to the phone.",
+    )
+    parser.add_argument("--adb", type=str, default="adb", help="adb executable to use for Android GPU testing.")
+    parser.add_argument("--adb-serial", type=str, default=None, help="Optional adb device serial for Pixel/Android testing.")
+    parser.add_argument(
+        "--android-work-dir",
+        type=str,
+        default="/data/local/tmp/kokoro_vocos_litert",
+        help="Writable directory on the Android device for benchmark binary, model, logs, and GPU cache.",
+    )
+    parser.add_argument(
+        "--android-model-variant",
+        type=str,
+        choices=("fp32", "fp16", "int8"),
+        default="fp16",
+        help="Exported LiteRT model variant to test with the Android GPU delegate.",
+    )
+    parser.add_argument("--android-gpu-warmup-runs", type=int, default=1)
+    parser.add_argument("--android-gpu-runs", type=int, default=20)
+    parser.add_argument("--android-cpu-runs", type=int, default=10)
+    parser.add_argument("--android-skip-cpu-baseline", action="store_true")
+    parser.add_argument(
+        "--android-gpu-extra-flag",
+        action="append",
+        default=[],
+        help="Extra flag to pass to benchmark_model GPU runs, e.g. --android-gpu-extra-flag=--gpu_backend=cl.",
     )
     return parser.parse_args()
 
@@ -712,6 +768,175 @@ def _save_validation_wavs(
             )
 
 
+def _adb_base_cmd(args: argparse.Namespace) -> list[str]:
+    cmd = [str(args.adb)]
+    if args.adb_serial:
+        cmd.extend(["-s", str(args.adb_serial)])
+    return cmd
+
+
+def _run_logged_command(cmd: Sequence[str], log_path: Path | None = None, check: bool = True) -> str:
+    proc = subprocess.run(
+        list(cmd),
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    output = proc.stdout or ""
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("$ " + " ".join(str(part) for part in cmd) + "\n\n" + output, encoding="utf-8")
+    if check and proc.returncode != 0:
+        raise RuntimeError(
+            "Command failed with exit code {code}: {cmd}\nLog: {log}".format(
+                code=proc.returncode,
+                cmd=" ".join(str(part) for part in cmd),
+                log=log_path if log_path is not None else output[-2000:],
+            )
+        )
+    return output
+
+
+def _adb_shell(args: argparse.Namespace, shell_cmd: str, log_path: Path | None = None, check: bool = True) -> str:
+    return _run_logged_command([*_adb_base_cmd(args), "shell", shell_cmd], log_path=log_path, check=check)
+
+
+def _adb_push(args: argparse.Namespace, local_path: Path, remote_path: str) -> None:
+    _run_logged_command([*_adb_base_cmd(args), "push", str(local_path), remote_path], check=True)
+
+
+def _shell_join(parts: Sequence[str]) -> str:
+    return " ".join(shlex.quote(str(part)) for part in parts)
+
+
+def _collect_android_device_info(args: argparse.Namespace, log_path: Path) -> None:
+    info_cmd = (
+        "printf 'model='; getprop ro.product.model; "
+        "printf 'device='; getprop ro.product.device; "
+        "printf 'hardware='; getprop ro.hardware; "
+        "printf 'board_platform='; getprop ro.board.platform; "
+        "printf 'abi='; getprop ro.product.cpu.abi; "
+        "printf 'sdk='; getprop ro.build.version.sdk; "
+        "printf 'egl='; dumpsys SurfaceFlinger 2>/dev/null | grep -m 1 GLES || true"
+    )
+    _adb_shell(args, info_cmd, log_path=log_path, check=True)
+
+
+def _select_android_model(
+    exported_variants: Sequence[ExportedVariant],
+    variant_name: str,
+) -> ExportedVariant:
+    for variant in exported_variants:
+        if variant.name == variant_name:
+            return variant
+    available = ", ".join(v.name for v in exported_variants)
+    raise RuntimeError(f"Android GPU requested model variant={variant_name!r}, available variants: {available}")
+
+
+def _benchmark_flags(graph_path: str, warmup_runs: int, num_runs: int, use_gpu: bool, extra_gpu_flags: Sequence[str]) -> list[str]:
+    flags = [
+        f"--graph={graph_path}",
+        f"--warmup_runs={max(0, int(warmup_runs))}",
+        f"--num_runs={max(1, int(num_runs))}",
+    ]
+    if use_gpu:
+        flags.extend(
+            [
+                "--use_gpu=true",
+                "--gpu_precision_loss_allowed=true",
+            ]
+        )
+        flags.extend(str(flag) for flag in extra_gpu_flags)
+    else:
+        flags.extend(["--use_xnnpack=true", "--num_threads=4"])
+    return flags
+
+
+def _run_android_gpu_test(
+    args: argparse.Namespace,
+    exported_variants: Sequence[ExportedVariant],
+) -> AndroidGpuBenchmarkResult:
+    if args.android_benchmark_model_bin is None:
+        raise ValueError("--android-benchmark-model-bin is required with --android-gpu-test")
+
+    benchmark_bin = args.android_benchmark_model_bin.resolve()
+    if not benchmark_bin.exists():
+        raise FileNotFoundError(benchmark_bin)
+
+    selected = _select_android_model(exported_variants, args.android_model_variant)
+    if not selected.litert_path.exists():
+        raise FileNotFoundError(selected.litert_path)
+
+    report_dir = args.output_dir / "android_gpu"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    remote_dir = str(args.android_work_dir).rstrip("/")
+    remote_cache_dir = f"{remote_dir}/gpu_cache"
+    remote_bin = f"{remote_dir}/benchmark_model"
+    remote_model = f"{remote_dir}/{selected.litert_path.name}"
+
+    _run_logged_command([*_adb_base_cmd(args), "get-state"], log_path=report_dir / "adb_get_state.txt", check=True)
+    _adb_shell(args, _shell_join(["mkdir", "-p", remote_dir, remote_cache_dir]), check=True)
+    _adb_push(args, benchmark_bin, remote_bin)
+    _adb_push(args, selected.litert_path, remote_model)
+    _adb_shell(args, _shell_join(["chmod", "755", remote_bin]), check=True)
+
+    device_info_path = report_dir / "device_info.txt"
+    _collect_android_device_info(args, device_info_path)
+
+    compile_flags = _benchmark_flags(
+        graph_path=remote_model,
+        warmup_runs=1,
+        num_runs=1,
+        use_gpu=True,
+        extra_gpu_flags=args.android_gpu_extra_flag,
+    )
+    gpu_compile_log_path = report_dir / f"{selected.name}_gpu_compile.txt"
+    compile_output = _adb_shell(args, _shell_join([remote_bin, *compile_flags]), log_path=gpu_compile_log_path, check=True)
+    if "gpu" not in compile_output.lower():
+        logger.warning(
+            "Android GPU compile log does not mention GPU. Inspect log for delegate support: "
+            f"{gpu_compile_log_path}"
+        )
+
+    gpu_flags = _benchmark_flags(
+        graph_path=remote_model,
+        warmup_runs=args.android_gpu_warmup_runs,
+        num_runs=args.android_gpu_runs,
+        use_gpu=True,
+        extra_gpu_flags=args.android_gpu_extra_flag,
+    )
+    gpu_benchmark_log_path = report_dir / f"{selected.name}_gpu_benchmark.txt"
+    _adb_shell(args, _shell_join([remote_bin, *gpu_flags]), log_path=gpu_benchmark_log_path, check=True)
+
+    cpu_benchmark_log_path: Path | None = None
+    if not args.android_skip_cpu_baseline:
+        cpu_flags = _benchmark_flags(
+            graph_path=remote_model,
+            warmup_runs=1,
+            num_runs=args.android_cpu_runs,
+            use_gpu=False,
+            extra_gpu_flags=[],
+        )
+        cpu_benchmark_log_path = report_dir / f"{selected.name}_cpu_benchmark.txt"
+        _adb_shell(args, _shell_join([remote_bin, *cpu_flags]), log_path=cpu_benchmark_log_path, check=True)
+
+    result = AndroidGpuBenchmarkResult(
+        variant=selected.name,
+        model_path=selected.litert_path,
+        device_info_path=device_info_path,
+        gpu_compile_log_path=gpu_compile_log_path,
+        gpu_benchmark_log_path=gpu_benchmark_log_path,
+        cpu_benchmark_log_path=cpu_benchmark_log_path,
+    )
+    logger.info(
+        "Completed Android ARM GPU benchmark for "
+        f"{selected.name}: compile_log={gpu_compile_log_path}, gpu_log={gpu_benchmark_log_path}"
+    )
+    return result
+
+
 def main() -> None:
     logger.enable("vocos_export")
     args = parse_args()
@@ -827,6 +1052,14 @@ def main() -> None:
         fixed_frames=args.num_frames,
     )
     logger.info(f"Saved LiteRT validation WAVs to: {args.output_dir / 'sample_audio'}")
+
+    if args.android_gpu_test:
+        result = _run_android_gpu_test(args=args, exported_variants=exported_variants)
+        logger.info(
+            "Android GPU reports saved: "
+            f"device={result.device_info_path}, gpu_compile={result.gpu_compile_log_path}, "
+            f"gpu_benchmark={result.gpu_benchmark_log_path}, cpu_benchmark={result.cpu_benchmark_log_path}"
+        )
 
 
 if __name__ == "__main__":
