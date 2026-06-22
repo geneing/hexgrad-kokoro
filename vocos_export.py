@@ -51,7 +51,7 @@ Examples:
      --checkpoint models/vocos/last.pt \
      --output-dir output/litert_vocos_pixel10 \
      --android-gpu-test \
-     --android-benchmark-model-bin path/to/android_arm64/benchmark_model \
+     --android-benchmark-model-apk path/to/android_aarch64_benchmark_model.apk \
      --android-model-variant fp16
 """
 
@@ -68,6 +68,7 @@ import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Sequence
+import glob
 
 import numpy as np
 import torch
@@ -268,6 +269,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=4444)
     parser.add_argument("--sample-count", type=int, default=5)
     parser.add_argument("--sample-max-frames", type=int, default=480)
+    parser.add_argument(
+        "--input-feature-glob",
+        action="append",
+        default=["data/af_alloy_0000*_00.pt"],
+        help="Glob for Kokoro feature .pt files to use as model inputs before dataset/random fallbacks.",
+    )
 
     parser.add_argument("--data-root", type=Path, default=Path("data/outputs"))
     parser.add_argument("--train-filelist", type=Path, default=None)
@@ -305,6 +312,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Local android_arm64 TensorFlow Lite benchmark_model binary to push to the phone.",
+    )
+    parser.add_argument(
+        "--android-benchmark-model-apk",
+        type=Path,
+        default=None,
+        help="Local android_aarch64 TensorFlow Lite benchmark_model APK to install and run on the phone.",
     )
     parser.add_argument(
         "--adb",
@@ -369,7 +382,66 @@ def _trim_or_pad_features(features: torch.Tensor, target_frames: int) -> torch.T
     return torch.cat([features, pad], dim=-1)
 
 
+def _feature_paths_from_globs(patterns: Sequence[str]) -> list[Path]:
+    paths: list[Path] = []
+    for pattern in patterns:
+        paths.extend(Path(p) for p in glob.glob(pattern))
+    return sorted(dict.fromkeys(p.resolve() for p in paths))
+
+
+def _compose_features_from_pt(path: Path) -> torch.Tensor:
+    row = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(row, Mapping):
+        raise TypeError(f"Expected mapping in {path}, got {type(row)}")
+    asr = row["asr"].float()
+    f0 = row["f0"].float()
+    noise = row["noise"].float()
+    style = row["style"].float()
+    if not all(torch.is_tensor(x) for x in (asr, f0, noise, style)):
+        raise TypeError(f"Expected tensor asr/f0/noise/style in {path}")
+
+    total_frames = int(f0.shape[-1])
+    if asr.shape[-1] != total_frames:
+        asr = torch.nn.functional.interpolate(
+            asr.unsqueeze(0),
+            size=total_frames,
+            mode="linear",
+            align_corners=False,
+        ).squeeze(0)
+    return torch.cat(
+        [
+            asr[:, :total_frames],
+            f0[:total_frames].unsqueeze(0),
+            noise[:total_frames].unsqueeze(0),
+            style.unsqueeze(-1).expand(style.shape[0], total_frames),
+        ],
+        dim=0,
+    )
+
+
+def _collect_feature_pt_samples(args: argparse.Namespace, input_channels: int, count: int) -> list[InferenceSample]:
+    paths = _feature_paths_from_globs(args.input_feature_glob or [])
+    samples: list[InferenceSample] = []
+    for path in paths[: max(1, int(count))]:
+        try:
+            features = _compose_features_from_pt(path)
+        except Exception as exc:
+            logger.warning(f"Skipping feature input {path}: {exc}")
+            continue
+        if int(features.shape[0]) != int(input_channels):
+            logger.warning(f"Skipping feature input {path}: expected {input_channels} channels, got {features.shape[0]}")
+            continue
+        samples.append(InferenceSample(tag=path.stem, features=features))
+    if samples:
+        logger.info(f"Using {len(samples)} feature .pt sample(s) from {args.input_feature_glob}")
+    return samples
+
+
 def _collect_samples(args: argparse.Namespace, input_channels: int) -> list[InferenceSample]:
+    feature_samples = _collect_feature_pt_samples(args, input_channels=input_channels, count=args.sample_count)
+    if feature_samples:
+        return feature_samples
+
     try:
         loader = build_train_loader(args)
         return build_inference_samples(
@@ -389,14 +461,29 @@ def _collect_samples(args: argparse.Namespace, input_channels: int) -> list[Infe
     return samples
 
 
-def _collect_representative_samples(args: argparse.Namespace) -> list[InferenceSample]:
-    loader = build_train_loader(args)
-    reps = build_inference_samples(
-        dataset=loader.dataset,
-        count=max(1, args.int8_calib_samples),
-        seed=args.seed,
-        max_frames=max(args.sample_max_frames, args.num_frames),
-    )
+def _collect_representative_samples(args: argparse.Namespace, input_channels: int) -> list[InferenceSample]:
+    feature_samples = _collect_feature_pt_samples(args, input_channels=input_channels, count=args.int8_calib_samples)
+    if feature_samples:
+        return feature_samples
+
+    try:
+        loader = build_train_loader(args)
+        reps = build_inference_samples(
+            dataset=loader.dataset,
+            count=max(1, args.int8_calib_samples),
+            seed=args.seed,
+            max_frames=max(args.sample_max_frames, args.num_frames),
+        )
+    except Exception as exc:
+        logger.warning(f"Could not build representative dataset samples ({exc}); using random calibration samples")
+        rng = torch.Generator().manual_seed(args.seed)
+        reps = [
+            InferenceSample(
+                tag=f"{i+1:02d}_random_calib",
+                features=torch.randn(input_channels, args.num_frames, generator=rng),
+            )
+            for i in range(max(1, args.int8_calib_samples))
+        ]
     if not reps:
         raise RuntimeError(
             "Representative dataset sampling returned no items; cannot run full-integer int8 calibration."
@@ -839,12 +926,25 @@ def _select_android_model(
     raise RuntimeError(f"Android GPU requested model variant={variant_name!r}, available variants: {available}")
 
 
-def _benchmark_flags(graph_path: str, warmup_runs: int, num_runs: int, use_gpu: bool, extra_gpu_flags: Sequence[str]) -> list[str]:
+def _benchmark_flags(
+    graph_path: str,
+    warmup_runs: int,
+    num_runs: int,
+    use_gpu: bool,
+    extra_gpu_flags: Sequence[str],
+    input_value_file: str | None = None,
+    input_shape: str | None = None,
+) -> list[str]:
     flags = [
         f"--graph={graph_path}",
         f"--warmup_runs={max(0, int(warmup_runs))}",
         f"--num_runs={max(1, int(num_runs))}",
     ]
+    if input_value_file:
+        flags.append("--input_layer=serving_default_args_0")
+        if input_shape:
+            flags.append(f"--input_layer_shape={input_shape}")
+        flags.append(f"--input_layer_value_files=serving_default_args_0:{input_value_file}")
     if use_gpu:
         flags.extend(
             [
@@ -858,16 +958,119 @@ def _benchmark_flags(graph_path: str, warmup_runs: int, num_runs: int, use_gpu: 
     return flags
 
 
+def _run_android_benchmark_apk_once(
+    args: argparse.Namespace,
+    bench_flags: Sequence[str],
+    log_path: Path,
+) -> str:
+    activity = "org.tensorflow.lite.benchmark/.BenchmarkModelActivity"
+    bench_args = " ".join(str(flag) for flag in bench_flags)
+    _run_logged_command([*_adb_base_cmd(args), "logcat", "-c"], check=True)
+    _adb_shell(
+        args,
+        _shell_join(["am", "start", "-S", "-n", activity, "--es", "args", bench_args]),
+        check=True,
+    )
+    wait_seconds = 45
+    _adb_shell(args, f"sleep {wait_seconds}", check=True)
+    output = _run_logged_command([*_adb_base_cmd(args), "logcat", "-d"], check=True)
+    filtered = "\n".join(
+        line
+        for line in output.splitlines()
+        if any(token in line.lower() for token in ("tflite", "benchmark", "inference timings", "gpu", "delegate", "error"))
+    )
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "$ adb logcat -c\n"
+        "$ adb shell am start ...\n"
+        f"args={bench_args}\n\n"
+        + (filtered if filtered.strip() else output),
+        encoding="utf-8",
+    )
+    if "inference timings" not in output.lower():
+        logger.warning(f"Android benchmark APK log did not include inference timings; inspect {log_path}")
+    return output
+
+
+def _run_android_gpu_test_with_apk(
+    args: argparse.Namespace,
+    selected: ExportedVariant,
+    remote_model: str,
+    report_dir: Path,
+    device_info_path: Path,
+    remote_input_value_file: str | None,
+) -> AndroidGpuBenchmarkResult:
+    apk_path = args.android_benchmark_model_apk.resolve()
+    if not apk_path.exists():
+        raise FileNotFoundError(apk_path)
+
+    package_state = _adb_shell(args, "cmd package path org.tensorflow.lite.benchmark", check=False)
+    if "package:" in package_state:
+        (report_dir / "apk_install.txt").write_text(
+            "Skipped install; org.tensorflow.lite.benchmark is already installed.\n" + package_state,
+            encoding="utf-8",
+        )
+    else:
+        _run_logged_command(
+            [*_adb_base_cmd(args), "install", "-r", "-d", "-g", str(apk_path)],
+            log_path=report_dir / "apk_install.txt",
+            check=True,
+        )
+
+    compile_flags = _benchmark_flags(
+        graph_path=remote_model,
+        warmup_runs=1,
+        num_runs=1,
+        use_gpu=True,
+        extra_gpu_flags=args.android_gpu_extra_flag,
+        input_value_file=remote_input_value_file,
+        input_shape=getattr(args, "android_input_shape", None),
+    )
+    gpu_compile_log_path = report_dir / f"{selected.name}_gpu_compile_apk.txt"
+    _run_android_benchmark_apk_once(args, compile_flags, gpu_compile_log_path)
+
+    gpu_flags = _benchmark_flags(
+        graph_path=remote_model,
+        warmup_runs=args.android_gpu_warmup_runs,
+        num_runs=args.android_gpu_runs,
+        use_gpu=True,
+        extra_gpu_flags=args.android_gpu_extra_flag,
+        input_value_file=remote_input_value_file,
+        input_shape=getattr(args, "android_input_shape", None),
+    )
+    gpu_benchmark_log_path = report_dir / f"{selected.name}_gpu_benchmark_apk.txt"
+    _run_android_benchmark_apk_once(args, gpu_flags, gpu_benchmark_log_path)
+
+    cpu_benchmark_log_path: Path | None = None
+    if not args.android_skip_cpu_baseline:
+        cpu_flags = _benchmark_flags(
+            graph_path=remote_model,
+            warmup_runs=1,
+            num_runs=args.android_cpu_runs,
+            use_gpu=False,
+            extra_gpu_flags=[],
+            input_value_file=remote_input_value_file,
+            input_shape=getattr(args, "android_input_shape", None),
+        )
+        cpu_benchmark_log_path = report_dir / f"{selected.name}_cpu_benchmark_apk.txt"
+        _run_android_benchmark_apk_once(args, cpu_flags, cpu_benchmark_log_path)
+
+    return AndroidGpuBenchmarkResult(
+        variant=selected.name,
+        model_path=selected.litert_path,
+        device_info_path=device_info_path,
+        gpu_compile_log_path=gpu_compile_log_path,
+        gpu_benchmark_log_path=gpu_benchmark_log_path,
+        cpu_benchmark_log_path=cpu_benchmark_log_path,
+    )
+
+
 def _run_android_gpu_test(
     args: argparse.Namespace,
     exported_variants: Sequence[ExportedVariant],
 ) -> AndroidGpuBenchmarkResult:
-    if args.android_benchmark_model_bin is None:
-        raise ValueError("--android-benchmark-model-bin is required with --android-gpu-test")
-
-    benchmark_bin = args.android_benchmark_model_bin.resolve()
-    if not benchmark_bin.exists():
-        raise FileNotFoundError(benchmark_bin)
+    if args.android_benchmark_model_bin is None and args.android_benchmark_model_apk is None:
+        raise ValueError("--android-benchmark-model-bin or --android-benchmark-model-apk is required with --android-gpu-test")
 
     selected = _select_android_model(exported_variants, args.android_model_variant)
     if not selected.litert_path.exists():
@@ -880,15 +1083,41 @@ def _run_android_gpu_test(
     remote_cache_dir = f"{remote_dir}/gpu_cache"
     remote_bin = f"{remote_dir}/benchmark_model"
     remote_model = f"{remote_dir}/{selected.litert_path.name}"
+    remote_input_value_file = None
+    local_input_value_file = getattr(args, "android_input_value_file", None)
+    if local_input_value_file is not None:
+        remote_input_value_file = f"{remote_dir}/{Path(local_input_value_file).name}"
 
     _run_logged_command([*_adb_base_cmd(args), "get-state"], log_path=report_dir / "adb_get_state.txt", check=True)
     _adb_shell(args, _shell_join(["mkdir", "-p", remote_dir, remote_cache_dir]), check=True)
-    _adb_push(args, benchmark_bin, remote_bin)
     _adb_push(args, selected.litert_path, remote_model)
-    _adb_shell(args, _shell_join(["chmod", "755", remote_bin]), check=True)
+    if local_input_value_file is not None and remote_input_value_file is not None:
+        _adb_push(args, Path(local_input_value_file), remote_input_value_file)
 
     device_info_path = report_dir / "device_info.txt"
     _collect_android_device_info(args, device_info_path)
+
+    if args.android_benchmark_model_apk is not None:
+        result = _run_android_gpu_test_with_apk(
+            args=args,
+            selected=selected,
+            remote_model=remote_model,
+            report_dir=report_dir,
+            device_info_path=device_info_path,
+            remote_input_value_file=remote_input_value_file,
+        )
+        logger.info(
+            "Completed Android ARM GPU APK benchmark for "
+            f"{selected.name}: compile_log={result.gpu_compile_log_path}, gpu_log={result.gpu_benchmark_log_path}"
+        )
+        return result
+
+    benchmark_bin = args.android_benchmark_model_bin.resolve()
+    if not benchmark_bin.exists():
+        raise FileNotFoundError(benchmark_bin)
+
+    _adb_push(args, benchmark_bin, remote_bin)
+    _adb_shell(args, _shell_join(["chmod", "755", remote_bin]), check=True)
 
     compile_flags = _benchmark_flags(
         graph_path=remote_model,
@@ -896,6 +1125,8 @@ def _run_android_gpu_test(
         num_runs=1,
         use_gpu=True,
         extra_gpu_flags=args.android_gpu_extra_flag,
+        input_value_file=remote_input_value_file,
+        input_shape=getattr(args, "android_input_shape", None),
     )
     gpu_compile_log_path = report_dir / f"{selected.name}_gpu_compile.txt"
     compile_output = _adb_shell(args, _shell_join([remote_bin, *compile_flags]), log_path=gpu_compile_log_path, check=True)
@@ -911,6 +1142,8 @@ def _run_android_gpu_test(
         num_runs=args.android_gpu_runs,
         use_gpu=True,
         extra_gpu_flags=args.android_gpu_extra_flag,
+        input_value_file=remote_input_value_file,
+        input_shape=getattr(args, "android_input_shape", None),
     )
     gpu_benchmark_log_path = report_dir / f"{selected.name}_gpu_benchmark.txt"
     _adb_shell(args, _shell_join([remote_bin, *gpu_flags]), log_path=gpu_benchmark_log_path, check=True)
@@ -923,6 +1156,8 @@ def _run_android_gpu_test(
             num_runs=args.android_cpu_runs,
             use_gpu=False,
             extra_gpu_flags=[],
+            input_value_file=remote_input_value_file,
+            input_shape=getattr(args, "android_input_shape", None),
         )
         cpu_benchmark_log_path = report_dir / f"{selected.name}_cpu_benchmark.txt"
         _adb_shell(args, _shell_join([remote_bin, *cpu_flags]), log_path=cpu_benchmark_log_path, check=True)
@@ -940,6 +1175,20 @@ def _run_android_gpu_test(
         f"{selected.name}: compile_log={gpu_compile_log_path}, gpu_log={gpu_benchmark_log_path}"
     )
     return result
+
+
+def _write_android_input_value_file(
+    sample: InferenceSample,
+    output_dir: Path,
+    fixed_frames: int,
+) -> Path:
+    input_dir = output_dir / "android_gpu" / "inputs"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    fixed = _trim_or_pad_features(sample.features.float(), fixed_frames)
+    value_path = input_dir / f"{sample.tag}_{fixed_frames}f_float32.bin"
+    fixed.unsqueeze(0).contiguous().numpy().astype(np.float32).tofile(value_path)
+    logger.info(f"Saved Android benchmark input value file: {value_path}")
+    return value_path
 
 
 def main() -> None:
@@ -989,8 +1238,15 @@ def main() -> None:
     logger.info(f"Exported LiteRT fp16 model: {export_targets['fp16']}")
 
     samples = _collect_samples(args, input_channels=config.in_channels)
+    if args.android_gpu_test and samples:
+        args.android_input_shape = f"1,{config.in_channels},{args.num_frames}"
+        args.android_input_value_file = _write_android_input_value_file(
+            sample=samples[0],
+            output_dir=args.output_dir,
+            fixed_frames=args.num_frames,
+        )
     try:
-        representative_samples = _collect_representative_samples(args)
+        representative_samples = _collect_representative_samples(args, input_channels=config.in_channels)
     except Exception as exc:
         raise RuntimeError(
             "Failed to build representative dataset samples for full-integer int8 calibration. "
