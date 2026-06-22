@@ -205,6 +205,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--control-channels", type=int, default=32)
     parser.add_argument("--control-layers", type=int, default=2)
     parser.add_argument("--frame-cap", type=int, default=520)
+    parser.add_argument("--min-frame-cap", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--min-batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -217,9 +218,9 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--mel-plot-every", type=int, default=2000)
     parser.add_argument("--sample-count", type=int, default=2)
     parser.add_argument("--pretrain-steps", type=int, default=5000)
-    parser.add_argument("--gen-lr", type=float, default=3e-4)
-    parser.add_argument("--disc-lr", type=float, default=2e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-3)
+    parser.add_argument("--gen-lr", type=float, default=1e-4)
+    parser.add_argument("--disc-lr", type=float, default=.5e-4)
+    parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--gan-loss-coeff", type=float, default=1.0)
     parser.add_argument("--fm-loss-coeff", type=float, default=2.0)
     parser.add_argument("--mrstft-loss-coeff", type=float, default=45.0)
@@ -285,6 +286,20 @@ def slice_batch(batch: Dict[str, object], batch_size: int) -> Dict[str, object]:
         else:
             sliced[key] = value
     return sliced
+
+
+def crop_batch_frames(batch: Dict[str, object], frame_cap: int, hop_length: int) -> Dict[str, object]:
+    cropped = dict(batch)
+    features = batch.get("features")
+    audio = batch.get("audio")
+    if not isinstance(features, torch.Tensor) or not isinstance(audio, torch.Tensor):
+        return cropped
+    target_frames = min(int(frame_cap), int(features.shape[-1]))
+    target_samples = target_frames * int(hop_length)
+    cropped["features"] = features[..., :target_frames]
+    cropped["audio"] = audio[..., :target_samples]
+    cropped["target_frames"] = torch.tensor(target_frames, dtype=torch.long)
+    return cropped
 
 
 def grad_norm(parameters: Iterable[torch.nn.Parameter]) -> float:
@@ -398,28 +413,34 @@ def train_decoder(
     train_dataset = PairedKokoroDataset(train_items, args.sample_rate)
     val_dataset = PairedKokoroDataset(val_items, args.sample_rate)
 
-    def make_train_loader(batch_size: int) -> DataLoader:
+    current_frame_cap = max(1, int(args.frame_cap))
+    min_frame_cap = max(1, min(int(args.min_frame_cap), current_frame_cap))
+
+    def make_train_loader(batch_size: int, frame_cap: int) -> DataLoader:
         return DataLoader(
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
             num_workers=args.num_workers,
             pin_memory=device.type == "cuda",
-            collate_fn=SliceCollator(args.frame_cap, args.hop_length, train=True),
+            collate_fn=SliceCollator(frame_cap, args.hop_length, train=True),
             drop_last=batch_size > 1,
+        )
+
+    def make_val_loader(frame_cap: int) -> DataLoader:
+        return DataLoader(
+            val_dataset,
+            batch_size=max(1, current_batch_size // 2),
+            shuffle=False,
+            num_workers=max(0, args.num_workers // 2),
+            pin_memory=device.type == "cuda",
+            collate_fn=SliceCollator(frame_cap, args.hop_length, train=False),
         )
 
     current_batch_size = max(1, int(args.batch_size))
     min_batch_size = max(1, int(args.min_batch_size))
-    train_loader = make_train_loader(current_batch_size)
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=max(1, args.batch_size // 2),
-        shuffle=False,
-        num_workers=max(0, args.num_workers // 2),
-        pin_memory=device.type == "cuda",
-        collate_fn=SliceCollator(args.frame_cap, args.hop_length, train=False),
-    )
+    train_loader = make_train_loader(current_batch_size, current_frame_cap)
+    val_loader = make_val_loader(current_frame_cap)
 
     generator = build_generator(args).to(device)
     mpd = MultiPeriodDiscriminator().to(device)
@@ -450,7 +471,7 @@ def train_decoder(
     writer.add_text("run/config", json.dumps({"backend": backend_name, "backend_config": backend_config, "args": vars(args)}, indent=2, default=str), 0)
     mel_transform = torchaudio.transforms.MelSpectrogram(
         sample_rate=args.sample_rate,
-        n_fft=args.n_fft,
+        n_fft=max(int(args.n_fft), 1200),
         hop_length=args.hop_length,
         n_mels=80,
         center=True,
@@ -470,6 +491,10 @@ def train_decoder(
         step = int(ckpt.get("step", 0))
 
     logger.info(f"Training {backend_name} on device={device}; tensorboard={tb_dir}")
+    logger.info(
+        f"Memory budget: batch_size={current_batch_size} min_batch_size={min_batch_size} "
+        f"frame_cap={current_frame_cap} min_frame_cap={min_frame_cap}"
+    )
     generator.train()
     last_log = time.time()
     throughput_step = step
@@ -636,27 +661,37 @@ def train_decoder(
                         disc_opt.zero_grad(set_to_none=True)
                         if device.type == "cuda":
                             torch.cuda.empty_cache()
-                        old_batch_size = current_batch_size
-                        current_batch_size = max(min_batch_size, current_batch_size // 2)
                         writer.add_scalar("train/oom_events", 1.0, step)
-                        writer.add_scalar("train/batch_size_after_oom", float(current_batch_size), step)
-                        if current_batch_size >= old_batch_size:
+                        old_batch_size = current_batch_size
+                        old_frame_cap = current_frame_cap
+                        if current_batch_size > min_batch_size:
+                            current_batch_size = max(min_batch_size, current_batch_size // 2)
+                            writer.add_scalar("train/batch_size_after_oom", float(current_batch_size), step)
+                            batch_local = slice_batch(batch_local, current_batch_size)
+                            reason = f"batch size {old_batch_size} -> {current_batch_size}"
+                        elif current_frame_cap > min_frame_cap:
+                            current_frame_cap = max(min_frame_cap, int(current_frame_cap * 0.75))
+                            writer.add_scalar("train/frame_cap_after_oom", float(current_frame_cap), step)
+                            batch_local = crop_batch_frames(batch_local, current_frame_cap, args.hop_length)
+                            reason = f"frame cap {old_frame_cap} -> {current_frame_cap}"
+                        else:
                             logger.error(
-                                f"CUDA OOM at step={step}; already at minimum batch size {current_batch_size}. Skipping batch."
+                                f"CUDA OOM at step={step}; already at minimum batch size {current_batch_size} "
+                                f"and minimum frame cap {current_frame_cap}. Skipping batch."
                             )
                             break
                         retried += 1
                         rebuild_loader = True
-                        batch_local = slice_batch(batch_local, current_batch_size)
+                        val_loader = make_val_loader(current_frame_cap)
                         logger.warning(
-                            f"CUDA OOM at step={step}, retry={retried}; reducing batch size "
-                            f"{old_batch_size} -> {current_batch_size} and retrying current batch"
+                            f"CUDA OOM at step={step}, retry={retried}; reducing {reason} and retrying current batch"
                         )
                         continue
                 if rebuild_loader:
                     break
             if rebuild_loader and step < args.max_steps:
-                train_loader = make_train_loader(current_batch_size)
+                train_loader = make_train_loader(current_batch_size, current_frame_cap)
+                val_loader = make_val_loader(current_frame_cap)
     finally:
         writer.flush()
         writer.close()

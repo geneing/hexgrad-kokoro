@@ -53,6 +53,19 @@ class KokoroVocosGenerator(nn.Module):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Train third_party/vocos as a Kokoro decoder")
     add_common_args(parser)
+    parser.set_defaults(
+        batch_size=16,
+        min_batch_size=1,
+        frame_cap=240,
+        min_frame_cap=32,
+        val_steps=1,
+        sample_count=1,
+        pretrain_steps=10000,
+        gen_lr=2e-4,
+        disc_lr=1e-4,
+        gan_loss_coeff=0.1,
+        fm_loss_coeff=0.5,
+    )
     parser.add_argument("--backbone-dim", type=int, default=384)
     parser.add_argument("--backbone-intermediate-dim", type=int, default=1152)
     parser.add_argument("--backbone-layers", type=int, default=8)
