@@ -306,7 +306,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Local android_arm64 TensorFlow Lite benchmark_model binary to push to the phone.",
     )
-    parser.add_argument("--adb", type=str, default="adb", help="adb executable to use for Android GPU testing.")
+    parser.add_argument(
+        "--adb",
+        type=str,
+        default="/mnt/c/Users/genei/Downloads/platform-tools/adb.exe",
+        help="adb executable to use for Android GPU testing.",
+    )
     parser.add_argument("--adb-serial", type=str, default=None, help="Optional adb device serial for Pixel/Android testing.")
     parser.add_argument(
         "--android-work-dir",
