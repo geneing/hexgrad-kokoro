@@ -764,7 +764,7 @@ def main() -> None:
     except Exception as exc:
         raise RuntimeError(
             "Failed to build representative dataset samples for full-integer int8 calibration. "
-            "Check --data-root/--train-filelist/--manifest-root settings."
+            "Check --data-root/--train-filelist/--val-filelist settings."
         ) from exc
     logger.info(
         "Using representative dataset calibration samples from prepare_weights pipeline: "
