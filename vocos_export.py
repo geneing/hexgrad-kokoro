@@ -1,7 +1,8 @@
-"""Export streaming-Vocos inference weights to LiteRT and validate outputs.
+"""Export Kokoro Vocos inference weights to LiteRT and validate outputs.
 
-This script consumes prepared generator weights (typically produced by
-`prepare_weights.py`) and exports LiteRT variants:
+This script consumes a `third_party/vocos/train_kokoro_decoder.py` checkpoint
+or prepared generator weights (typically produced by `prepare_weights.py`) and
+exports LiteRT variants:
 - fp32
 - fp16
 - int8 (AI Edge Quantizer; full-integer static calibration preferred)
@@ -9,13 +10,9 @@ This script consumes prepared generator weights (typically produced by
 It then runs quick validation inference on sample feature tensors and writes
 WAV artifacts for qualitative sanity checking.
 
-Streaming-vocos alignment:
-- Backend defaults to streaming (`--vocos-impl streaming`).
-- Generator config is inferred from checkpoint keys via `prepare_weights`
-  helper utilities and then rebuilt with matching architecture options.
-
 Inputs:
-- `vocos.pt` (required) and `vocos_fp16.pt` (required) in `--weights-dir`
+- `--checkpoint models/vocos/last.pt` by default, or
+- `vocos.pt` and `vocos_fp16.pt` in `--weights-dir`
 
 Outputs in `--output-dir`:
 - `vocos_fp32_litert.tflite`
@@ -26,32 +23,27 @@ Outputs in `--output-dir`:
 
 Examples:
 
-1) Export all variants from streaming weights
+1) Export all variants from the trained checkpoint
    uv run python vocos_export.py \
-     --weights-dir output/saved_infer_weights \
-     --output-dir output/litert_streaming
+     --checkpoint models/vocos/last.pt \
+     --output-dir output/litert_vocos
 
-2) Explicit streaming backend controls
+2) Export all variants from prepared weights
    uv run python vocos_export.py \
      --weights-dir output/saved_infer_weights \
-     --output-dir output/litert_streaming \
-     --vocos-impl streaming \
-     --streaming-vocos-repo third_party/vocos_streaming \
-     --backbone-causal \
-     --backbone-pad-mode constant \
-     --backbone-norm weight_norm
+     --output-dir output/litert_vocos
 
 3) Export with 520-frame fixed input and extra calibration samples
    uv run python vocos_export.py \
-     --weights-dir output/saved_infer_weights \
-     --output-dir output/litert_streaming_520f \
+     --checkpoint models/vocos/last.pt \
+     --output-dir output/litert_vocos_520f \
      --num-frames 520 \
      --int8-calib-samples 64
 
 4) Lightweight conversion mode
    uv run python vocos_export.py \
-     --weights-dir output/saved_infer_weights \
-     --output-dir output/litert_streaming_light \
+     --checkpoint models/vocos/last.pt \
+     --output-dir output/litert_vocos_light \
      --lightweight-conversion
 """
 
@@ -89,6 +81,7 @@ from prepare_weights import (
     build_inference_samples,
     build_train_loader,
     infer_generator_config,
+    load_checkpoint,
 )
 from vocos.spectral_ops import ISTFT
 
@@ -225,10 +218,16 @@ def _patch_istft_for_export(model: nn.Module) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Export pre-saved Vocos inference weights to LiteRT and validate by generating WAVs")
     parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=Path("models/vocos/last.pt"),
+        help="Raw checkpoint produced by third_party/vocos/train_kokoro_decoder.py",
+    )
+    parser.add_argument(
         "--weights-dir",
         type=Path,
-        default=Path("output/saved_infer_weights"),
-        help="Directory containing vocos.pt and vocos_fp16.pt",
+        default=None,
+        help="Optional directory containing prepared vocos.pt and vocos_fp16.pt; overrides --checkpoint",
     )
     parser.add_argument(
         "--output-dir",
@@ -245,32 +244,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-rate", type=int, default=24000)
     parser.add_argument("--hop-length", type=int, default=300)
     parser.add_argument("--padding", type=str, default="same")
-    parser.add_argument(
-        "--vocos-impl",
-        type=str,
-        choices=("streaming", "auto", "legacy"),
-        default="streaming",
-        help="Generator backend expected by weights; streaming is default.",
-    )
-    parser.add_argument(
-        "--streaming-vocos-repo",
-        type=Path,
-        default=Path("third_party/vocos_streaming"),
-        help="Path to streaming-vocos repo root (contains src/components).",
-    )
-    parser.add_argument("--backbone-causal", dest="backbone_causal", action="store_true")
-    parser.add_argument("--no-backbone-causal", dest="backbone_causal", action="store_false")
-    parser.set_defaults(backbone_causal=True)
-    parser.add_argument("--backbone-pad-mode", type=str, default="constant")
-    parser.add_argument("--backbone-norm", type=str, default="weight_norm")
 
     parser.add_argument("--seed", type=int, default=4444)
     parser.add_argument("--sample-count", type=int, default=5)
     parser.add_argument("--sample-max-frames", type=int, default=480)
 
-    parser.add_argument("--data-root", type=Path, default=Path("inputs/"))
+    parser.add_argument("--data-root", type=Path, default=Path("data/outputs"))
     parser.add_argument("--train-filelist", type=Path, default=None)
-    parser.add_argument("--manifest-root", type=Path, default=None)
+    parser.add_argument("--val-filelist", type=Path, default=None)
     parser.add_argument("--max-train-items", type=int, default=4096)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -440,18 +421,31 @@ def _waveform_rms(audio: np.ndarray) -> float:
 
 
 def _load_models(args: argparse.Namespace) -> tuple[GeneratorConfig, nn.Module, nn.Module]:
-    fp32_path = args.weights_dir / "vocos.pt"
-    fp16_path = args.weights_dir / "vocos_fp16.pt"
+    if args.weights_dir is not None:
+        weights_dir = args.weights_dir.resolve()
+        fp32_path = weights_dir / "vocos.pt"
+        fp16_path = weights_dir / "vocos_fp16.pt"
 
-    for path in (fp32_path, fp16_path):
-        if not path.exists():
-            raise FileNotFoundError(path)
+        for path in (fp32_path, fp16_path):
+            if not path.exists():
+                raise FileNotFoundError(path)
 
-    fp32_state = _load_state(fp32_path)
-    config = infer_generator_config(fp32_state, args=args)
+        fp32_state = _load_state(fp32_path)
+        fp16_state = _load_state(fp16_path)
+        config = infer_generator_config(fp32_state, args=args)
+        source = str(weights_dir)
+    else:
+        checkpoint_path = args.checkpoint.resolve()
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(checkpoint_path)
+        ckpt, fp32_state = load_checkpoint(checkpoint_path)
+        config = infer_generator_config(fp32_state, args=args, ckpt=ckpt)
+        fp16_state = {k: v.half() if torch.is_tensor(v) and v.is_floating_point() else v for k, v in fp32_state.items()}
+        source = str(checkpoint_path)
+
     logger.info(
         "Using inferred export config: "
-        f"vocos_impl={config.vocos_impl}, in_channels={config.in_channels}, "
+        f"source={source}, backend=third_party/vocos, in_channels={config.in_channels}, "
         f"backbone_dim={config.backbone_dim}, layers={config.backbone_layers}, "
         f"n_fft={config.n_fft}, hop={config.hop_length}"
     )
@@ -459,7 +453,6 @@ def _load_models(args: argparse.Namespace) -> tuple[GeneratorConfig, nn.Module, 
     fp32_model = build_generator(config, fp32_state).eval()
     _patch_istft_for_export(fp32_model)
 
-    fp16_state = _load_state(fp16_path)
     fp16_as_fp32 = {k: v.float() if torch.is_tensor(v) and v.is_floating_point() else v for k, v in fp16_state.items()}
     fp16_model = build_generator(config, fp32_state).eval()
     fp16_model.load_state_dict(fp16_as_fp32, strict=True)
@@ -730,7 +723,8 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    args.weights_dir = args.weights_dir.resolve()
+    if args.weights_dir is not None:
+        args.weights_dir = args.weights_dir.resolve()
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 

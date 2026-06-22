@@ -1,11 +1,12 @@
-"""Prepare deployable Vocos weights (fp32/fp16/int8) from train_vocos checkpoints.
+"""Prepare deployable Vocos weights (fp32/fp16/int8) from Kokoro Vocos checkpoints.
 
-This utility converts a `kokoro.train_vocos` training checkpoint into inference
-artifacts and optional quantized artifacts for downstream deployment experiments.
+This utility converts a `third_party/vocos/train_kokoro_decoder.py` training
+checkpoint into inference artifacts and optional quantized artifacts for
+downstream deployment experiments.
 
 Primary responsibilities:
-1) Load a training checkpoint and extract the generator weights.
-2) Infer generator architecture from checkpoint keys (streaming or legacy).
+1) Load a training checkpoint and extract the generator weights/config.
+2) Rebuild the `KokoroVocosGenerator` architecture used by training.
 3) Save:
    - fp32 generator state: `vocos.pt`
    - fp16 generator state: `vocos_fp16.pt`
@@ -15,52 +16,37 @@ Primary responsibilities:
 5) Optionally write sample audio for side-by-side qualitative checks.
 6) Print a summary table of parameter dtypes and rough op-type estimates.
 
-Streaming Vocos support:
-- `--vocos-impl auto` (default) infers backend from checkpoint keys.
-- For streaming checkpoints, the script builds `PairedVocosGenerator` with
-  streaming settings so exported fp32/fp16/int8 artifacts match training-time
-  architecture.
-
 Typical usage:
 
-1) Default conversion from a streaming train checkpoint (auto backend detect)
+1) Default conversion from the trained third-party Vocos checkpoint
    uv run python prepare_weights.py \
-     --input output/checkpoints/last.pt \
+     --input models/vocos/last.pt \
      --output-dir output/weights
 
-2) Force streaming backend and explicit streaming repo path
+2) Faster smoke run (small data + few QAT steps)
    uv run python prepare_weights.py \
-     --input output/checkpoints/last.pt \
-     --output-dir output/weights_streaming \
-     --vocos-impl streaming \
-     --streaming-vocos-repo third_party/vocos_streaming \
-     --backbone-causal \
-     --backbone-pad-mode constant \
-     --backbone-norm weight_norm
-
-3) Faster smoke run (small data + few QAT steps)
-   uv run python prepare_weights.py \
-     --input output/checkpoints/last.pt \
+     --input models/vocos/last.pt \
      --output-dir output/weights_smoke \
      --max-train-items 256 \
      --batch-size 2 \
      --qat-steps 20 \
      --sample-count 2
 
-4) Disable adversarial losses during QAT fallback
+3) Disable adversarial losses during QAT fallback
    uv run python prepare_weights.py \
-     --input output/checkpoints/last.pt \
+     --input models/vocos/last.pt \
      --output-dir output/weights_no_adv \
      --disable-adversarial
 
-5) Save both slim and full q8 outputs
+4) Save both slim and full q8 outputs
    uv run python prepare_weights.py \
-     --input output/checkpoints/last.pt \
+     --input models/vocos/last.pt \
      --output-dir output/weights_q8_full \
      --save-full-q8
 
 Important notes:
-- This script expects checkpoints produced by `kokoro/train_vocos.py`.
+- This script expects checkpoints produced by
+  `third_party/vocos/train_kokoro_decoder.py`.
 - Quantization path uses PT2E/XNNPACK-style flow and may vary across torch/
   executorch versions.
 - Generated sample audio is for qualitative sanity checking, not MOS scoring.
@@ -73,7 +59,7 @@ import copy
 import gc
 import logging
 import random
-import re
+import sys
 import wave
 import warnings
 from dataclasses import dataclass
@@ -82,6 +68,12 @@ from typing import Dict, Iterable, Mapping, Optional
 
 import numpy as np
 import torch
+
+ROOT = Path(__file__).resolve().parent
+THIRD_PARTY_VOCOS = ROOT / "third_party" / "vocos"
+for import_path in (ROOT, THIRD_PARTY_VOCOS):
+    if str(import_path) not in sys.path:
+        sys.path.insert(0, str(import_path))
 
 logging.getLogger("torchao").setLevel(logging.ERROR)
 
@@ -106,33 +98,27 @@ from vocos.discriminators import MultiPeriodDiscriminator, MultiResolutionDiscri
 from vocos.loss import FeatureMatchingLoss, GeneratorLoss as VocosGeneratorLoss
 
 from kokoro.styletts2_losses import StyleTTS2MultiResolutionGroupDelayLoss, StyleTTS2MultiResolutionSTFTLoss
-from kokoro.train_vocos import (
-    AdaptiveBatchState,
-    MultiResolutionComplexSTFTDiscriminator,
-    PairedVocoderDataset,
-    PairedVocosGenerator,
-    SlicedPairCollator,
+from third_party.kokoro_vocoder_distill import (
+    PairedKokoroDataset,
+    SliceCollator,
     align_audio,
     build_items,
-    build_metadata_index,
     ensure_filelists,
-    load_wav_list,
     set_requires_grad,
 )
+from third_party.vocos.train_kokoro_decoder import KokoroVocosGenerator
 
 @dataclass
 class GeneratorConfig:
     in_channels: int
+    asr_channels: int
+    style_channels: int
     model_input_channels: int
+    control_channels: int
+    control_layers: int
     backbone_dim: int
     backbone_intermediate_dim: int
     backbone_layers: int
-    backbone_kernel_size: int
-    vocos_impl: str
-    backbone_causal: bool
-    backbone_pad_mode: str
-    backbone_norm: str
-    streaming_vocos_repo: Optional[Path]
     n_fft: int
     hop_length: int
     padding: str
@@ -144,7 +130,7 @@ class LossBundle:
     group_delay: StyleTTS2MultiResolutionGroupDelayLoss
     mpd: Optional[MultiPeriodDiscriminator]
     mrd: Optional[MultiResolutionDiscriminator]
-    cstft: Optional[MultiResolutionComplexSTFTDiscriminator]
+    cstft: Optional[nn.Module]
     vocos_gen_loss: Optional[VocosGeneratorLoss]
     feat_match_loss: Optional[FeatureMatchingLoss]
 
@@ -156,7 +142,7 @@ class InferenceSample:
 
 
 class QuantizableVocosCore(nn.Module):
-    def __init__(self, generator: PairedVocosGenerator):
+    def __init__(self, generator: nn.Module):
         super().__init__()
         self.convnext = generator.backbone.convnext
 
@@ -167,7 +153,7 @@ class QuantizableVocosCore(nn.Module):
 
 
 class FloatPreBlocks(nn.Module):
-    def __init__(self, generator: PairedVocosGenerator):
+    def __init__(self, generator: nn.Module):
         super().__init__()
         self.conditioner = generator.conditioner
         self.embed = generator.backbone.embed
@@ -183,7 +169,7 @@ class FloatPreBlocks(nn.Module):
 
 
 class FloatPostBlocks(nn.Module):
-    def __init__(self, generator: PairedVocosGenerator):
+    def __init__(self, generator: nn.Module):
         super().__init__()
         self.final_layer_norm = generator.backbone.final_layer_norm
         self.head = generator.head
@@ -208,13 +194,20 @@ class QuantizedVocosInference(nn.Module):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Prepare inference and int8-quantized Vocos weights from train_vocos checkpoint")
-    parser.add_argument("--input", type=Path, required=True, help="Path to checkpoint produced by kokoro/train_vocos.py")
+    parser = argparse.ArgumentParser(
+        "Prepare inference and int8-quantized Vocos weights from third_party/vocos/train_kokoro_decoder.py checkpoint"
+    )
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=Path("models/vocos/last.pt"),
+        help="Path to checkpoint produced by third_party/vocos/train_kokoro_decoder.py",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("."), help="Output directory for vocos.pt and vocos_q8.pt")
 
-    parser.add_argument("--data-root", type=Path, default=Path("inputs/"))
+    parser.add_argument("--data-root", type=Path, default=Path("data/outputs"))
     parser.add_argument("--train-filelist", type=Path, default=None)
-    parser.add_argument("--manifest-root", type=Path, default=None)
+    parser.add_argument("--val-filelist", type=Path, default=None)
     parser.add_argument("--max-train-items", type=int, default=4096)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -224,24 +217,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-rate", type=int, default=24000)
     parser.add_argument("--hop-length", type=int, default=300)
     parser.add_argument("--padding", type=str, default="same")
-    parser.add_argument(
-        "--vocos-impl",
-        type=str,
-        choices=("auto", "streaming", "legacy"),
-        default="auto",
-        help="Generator backend to build for export. 'auto' infers from checkpoint keys.",
-    )
-    parser.add_argument(
-        "--streaming-vocos-repo",
-        type=Path,
-        default=Path("third_party/vocos_streaming"),
-        help="Path to local streaming-vocos repo root (contains src/components).",
-    )
-    parser.add_argument("--backbone-causal", dest="backbone_causal", action="store_true")
-    parser.add_argument("--no-backbone-causal", dest="backbone_causal", action="store_false")
-    parser.set_defaults(backbone_causal=True)
-    parser.add_argument("--backbone-pad-mode", type=str, default="constant")
-    parser.add_argument("--backbone-norm", type=str, default="weight_norm")
     parser.add_argument("--sample-count", type=int, default=5)
     parser.add_argument("--sample-max-frames", type=int, default=480)
     parser.add_argument("--samples-dir", type=Path, default=None)
@@ -257,7 +232,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mrstft-loss-coeff", type=float, default=45.0)
     parser.add_argument("--group-delay-loss-coeff", type=float, default=2.0)
     parser.add_argument("--mrd-loss-coeff", type=float, default=1.0)
-    parser.add_argument("--cstft-disc-loss-coeff", type=float, default=1.0)
     parser.add_argument("--disable-adversarial", action="store_true")
 
     parser.add_argument("--quant-backend", type=str, default="qnnpack")
@@ -288,91 +262,118 @@ def _is_tensor_state_dict(value: object) -> bool:
 
 def load_checkpoint(path: Path) -> tuple[Dict[str, object], Dict[str, torch.Tensor]]:
     raw = torch.load(path, map_location="cpu", weights_only=False)
-    if _is_tensor_state_dict(raw):
-        return {}, _strip_parallel_prefixes(raw)  # already a generator state_dict
     if not isinstance(raw, Mapping):
         raise TypeError(f"Unsupported checkpoint type: {type(raw)}")
+    if raw.get("backend") != "vocos":
+        raise ValueError(f"Unsupported checkpoint backend in {path}: {raw.get('backend')!r}")
+    backend_config = raw.get("backend_config")
+    if not isinstance(backend_config, Mapping) or backend_config.get("model") != "third_party/vocos":
+        raise ValueError(
+            f"Checkpoint {path} is not a third_party/vocos Kokoro decoder checkpoint "
+            f"(backend_config={backend_config!r})"
+        )
     generator = raw.get("generator")
     if not _is_tensor_state_dict(generator):
         raise KeyError(f"Checkpoint {path} does not contain a valid 'generator' state_dict")
     return dict(raw), _strip_parallel_prefixes(generator)
 
 
-def _infer_vocos_impl(state_dict: Mapping[str, torch.Tensor], requested: str) -> str:
-    if requested in {"streaming", "legacy"}:
-        return requested
-    if "backbone.embed.conv.conv.weight_v" in state_dict or "backbone.convnext.0.dwconv.conv.conv.weight_v" in state_dict:
-        return "streaming"
-    return "legacy"
-
-
-def infer_generator_config(state_dict: Mapping[str, torch.Tensor], args: argparse.Namespace) -> GeneratorConfig:
-    vocos_impl = _infer_vocos_impl(state_dict, str(args.vocos_impl).lower())
+def _int_from_config(config: Mapping[str, object], key: str, fallback: int) -> int:
+    value = config.get(key, fallback)
     try:
-        model_input_channels = int(state_dict["conditioner.0.weight"].shape[0])
-        in_channels = int(state_dict["conditioner.0.weight"].shape[1])
-        if vocos_impl == "streaming":
-            if "backbone.embed.conv.conv.weight_v" in state_dict:
-                embed_w = state_dict["backbone.embed.conv.conv.weight_v"]
-            elif "backbone.embed.conv.conv.weight" in state_dict:
-                embed_w = state_dict["backbone.embed.conv.conv.weight"]
-            else:
-                raise KeyError("backbone.embed.conv.conv.weight_v")
-            backbone_dim = int(embed_w.shape[0])
-            backbone_kernel_size = int(embed_w.shape[2])
-        else:
-            backbone_dim = int(state_dict["backbone.embed.weight"].shape[0])
-            backbone_kernel_size = int(state_dict["backbone.embed.weight"].shape[2])
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid integer backend_config[{key!r}]={value!r}") from exc
+
+
+def _infer_control_layers(state_dict: Mapping[str, torch.Tensor], branch: str) -> int:
+    prefix = f"conditioner.{branch}_proj."
+    conv_indices = []
+    for key in state_dict.keys():
+        if key.startswith(prefix) and key.endswith(".weight"):
+            parts = key[len(prefix) :].split(".")
+            if parts and parts[0].isdigit():
+                conv_indices.append(int(parts[0]))
+    if not conv_indices:
+        raise KeyError(f"conditioner.{branch}_proj.*.weight")
+    # Training builds N hidden Conv1d+GELU pairs plus one final Conv1d.
+    return max(1, len(conv_indices) - 1)
+
+
+def infer_generator_config(
+    state_dict: Mapping[str, torch.Tensor],
+    args: argparse.Namespace,
+    ckpt: Optional[Mapping[str, object]] = None,
+) -> GeneratorConfig:
+    backend_config_obj = ckpt.get("backend_config") if ckpt else None
+    backend_config: Mapping[str, object] = backend_config_obj if isinstance(backend_config_obj, Mapping) else {}
+    if backend_config and backend_config.get("model") != "third_party/vocos":
+        raise ValueError(f"Unsupported backend_config model: {backend_config.get('model')!r}")
+
+    try:
+        asr_channels = int(state_dict["conditioner.asr_proj.weight"].shape[1])
+        style_channels = int(state_dict["conditioner.style_proj.weight"].shape[1])
+        model_input_channels = int(state_dict["conditioner.asr_proj.weight"].shape[0])
+        control_channels = int(state_dict["conditioner.f0_proj.0.weight"].shape[0])
+        backbone_dim = int(state_dict["backbone.embed.weight"].shape[0])
         backbone_intermediate_dim = int(state_dict["backbone.convnext.0.pwconv1.weight"].shape[0])
         n_fft = int(state_dict["head.out.weight"].shape[0]) - 2
     except KeyError as exc:
         raise KeyError(f"Could not infer generator config, missing key: {exc}") from exc
 
-    layer_ids = set()
-    pattern = re.compile(r"^backbone\.convnext\.(\d+)\.dwconv(\.conv\.conv)?\.weight(_v)?$")
-    for key in state_dict.keys():
-        m = pattern.match(key)
-        if m:
-            layer_ids.add(int(m.group(1)))
+    layer_ids = {
+        int(parts[2])
+        for key in state_dict.keys()
+        if (parts := key.split(".")) and len(parts) >= 4 and parts[:2] == ["backbone", "convnext"] and parts[2].isdigit()
+    }
     if not layer_ids:
         raise RuntimeError("Could not infer backbone layer count from state_dict keys")
-    backbone_layers = max(layer_ids) + 1
+
+    control_layers = _infer_control_layers(state_dict, "f0")
 
     return GeneratorConfig(
-        in_channels=in_channels,
-        model_input_channels=model_input_channels,
-        backbone_dim=backbone_dim,
-        backbone_intermediate_dim=backbone_intermediate_dim,
-        backbone_layers=backbone_layers,
-        backbone_kernel_size=backbone_kernel_size,
-        vocos_impl=vocos_impl,
-        backbone_causal=bool(args.backbone_causal),
-        backbone_pad_mode=str(args.backbone_pad_mode),
-        backbone_norm=str(args.backbone_norm),
-        streaming_vocos_repo=(Path(args.streaming_vocos_repo).resolve() if args.streaming_vocos_repo else None),
-        n_fft=n_fft,
-        hop_length=int(args.hop_length),
+        in_channels=asr_channels + style_channels + 2,
+        asr_channels=asr_channels,
+        style_channels=style_channels,
+        model_input_channels=_int_from_config(backend_config, "model_input_channels", model_input_channels),
+        control_channels=_int_from_config(backend_config, "control_channels", control_channels),
+        control_layers=_int_from_config(backend_config, "control_layers", control_layers),
+        backbone_dim=_int_from_config(backend_config, "backbone_dim", backbone_dim),
+        backbone_intermediate_dim=_int_from_config(
+            backend_config,
+            "backbone_intermediate_dim",
+            backbone_intermediate_dim,
+        ),
+        backbone_layers=_int_from_config(backend_config, "backbone_layers", max(layer_ids) + 1),
+        n_fft=_int_from_config(backend_config, "n_fft", n_fft),
+        hop_length=_int_from_config(backend_config, "hop_length", int(args.hop_length)),
         padding=str(args.padding),
     )
 
 
-def build_generator(cfg: GeneratorConfig, generator_state: Mapping[str, torch.Tensor]) -> PairedVocosGenerator:
-    model = PairedVocosGenerator(
-        in_channels=cfg.in_channels,
+def create_generator(cfg: GeneratorConfig) -> KokoroVocosGenerator:
+    if cfg.asr_channels != 512 or cfg.style_channels != 128:
+        raise ValueError(
+            "third_party/vocos/train_kokoro_decoder.py currently exports KokoroFeatureConditioner "
+            f"with asr_channels=512/style_channels=128, got {cfg.asr_channels}/{cfg.style_channels}"
+        )
+    if cfg.padding != "same":
+        raise ValueError(f"KokoroVocosGenerator uses ISTFT padding='same', got {cfg.padding!r}")
+    return KokoroVocosGenerator(
         model_input_channels=cfg.model_input_channels,
         backbone_dim=cfg.backbone_dim,
         backbone_intermediate_dim=cfg.backbone_intermediate_dim,
         backbone_layers=cfg.backbone_layers,
         n_fft=cfg.n_fft,
         hop_length=cfg.hop_length,
-        padding=cfg.padding,
-        vocos_impl=cfg.vocos_impl,
-        streaming_vocos_repo=cfg.streaming_vocos_repo,
-        backbone_causal=cfg.backbone_causal,
-        backbone_pad_mode=cfg.backbone_pad_mode,
-        backbone_norm=cfg.backbone_norm,
+        control_channels=cfg.control_channels,
+        control_layers=cfg.control_layers,
     )
-    missing, unexpected = model.load_state_dict(generator_state, strict=False)
+
+
+def build_generator(cfg: GeneratorConfig, generator_state: Mapping[str, torch.Tensor]) -> KokoroVocosGenerator:
+    model = create_generator(cfg)
+    missing, unexpected = model.load_state_dict(generator_state, strict=True)
     if missing or unexpected:
         raise RuntimeError(
             "Generator state_dict mismatch. "
@@ -384,18 +385,10 @@ def build_generator(cfg: GeneratorConfig, generator_state: Mapping[str, torch.Te
 def build_train_loader(args: argparse.Namespace) -> DataLoader:
     data_root = args.data_root.resolve()
     train_filelist = args.train_filelist or data_root / "filelists" / "vocos.train.txt"
-    val_filelist = data_root / "filelists" / "vocos.val.txt"
-    manifest_root = args.manifest_root or data_root / "manifests"
-    train_filelist, _ = ensure_filelists(
-        data_root=data_root,
-        train_filelist=train_filelist,
-        val_filelist=val_filelist,
-        seed=args.seed,
-    )
+    val_filelist = args.val_filelist or data_root / "filelists" / "vocos.val.txt"
+    train_filelist, _ = ensure_filelists(data_root, train_filelist, val_filelist, args.seed)
 
-    metadata_index = build_metadata_index(manifest_root, args.hop_length)
-    train_wavs = load_wav_list(train_filelist)
-    train_items = build_items(data_root, train_wavs, metadata_index, args.hop_length)
+    train_items = build_items(data_root, train_filelist)
     if not train_items:
         raise RuntimeError(f"No training items found under {data_root}")
 
@@ -404,13 +397,12 @@ def build_train_loader(args: argparse.Namespace) -> DataLoader:
         rng.shuffle(train_items)
         train_items = train_items[: args.max_train_items]
 
-    dataset = PairedVocoderDataset(train_items, sample_rate=args.sample_rate)
-    state = AdaptiveBatchState(
+    dataset = PairedKokoroDataset(train_items, sample_rate=args.sample_rate)
+    collator = SliceCollator(
         frame_cap=args.frame_cap,
-        min_frame_cap=max(32, min(args.frame_cap, 192)),
         hop_length=args.hop_length,
+        train=True,
     )
-    collator = SlicedPairCollator(state=state, train=True, fixed_shapes=True)
     loader = DataLoader(
         dataset,
         batch_size=max(1, args.batch_size),
@@ -425,7 +417,7 @@ def build_train_loader(args: argparse.Namespace) -> DataLoader:
 
 
 def build_inference_samples(
-    dataset: PairedVocoderDataset,
+    dataset: PairedKokoroDataset,
     count: int,
     seed: int,
     max_frames: int,
@@ -496,10 +488,9 @@ def build_losses(args: argparse.Namespace, ckpt: Mapping[str, object]) -> LossBu
 
     mpd_state = _load_disc_state(ckpt, "mpd")
     mrd_state = _load_disc_state(ckpt, "mrd")
-    cstft_state = _load_disc_state(ckpt, "cstft_disc")
-    if not (mpd_state and mrd_state and cstft_state):
+    if not (mpd_state and mrd_state):
         logger.warning(
-            "Checkpoint does not contain full discriminator states; using MR-STFT + GroupDelay only for QAT"
+            "Checkpoint does not contain MPD/MRD discriminator states; using MR-STFT + GroupDelay only for QAT"
         )
         return LossBundle(
             mrstft=mrstft,
@@ -513,22 +504,18 @@ def build_losses(args: argparse.Namespace, ckpt: Mapping[str, object]) -> LossBu
 
     mpd = MultiPeriodDiscriminator().cpu()
     mrd = MultiResolutionDiscriminator().cpu()
-    cstft = MultiResolutionComplexSTFTDiscriminator().cpu()
     mpd.load_state_dict(mpd_state, strict=True)
     mrd.load_state_dict(mrd_state, strict=True)
-    cstft.load_state_dict(cstft_state, strict=True)
     set_requires_grad(mpd, False)
     set_requires_grad(mrd, False)
-    set_requires_grad(cstft, False)
     mpd.eval()
     mrd.eval()
-    cstft.eval()
     return LossBundle(
         mrstft=mrstft,
         group_delay=group_delay,
         mpd=mpd,
         mrd=mrd,
-        cstft=cstft,
+        cstft=None,
         vocos_gen_loss=VocosGeneratorLoss(),
         feat_match_loss=FeatureMatchingLoss(),
     )
@@ -589,27 +576,22 @@ def compute_generator_loss(
 
     if losses.mpd is not None:
         assert losses.mrd is not None
-        assert losses.cstft is not None
         assert losses.vocos_gen_loss is not None
         assert losses.feat_match_loss is not None
 
         _, g_mp_outs, fmap_r_mp, fmap_g_mp = losses.mpd(real, fake)
         _, g_mrd_outs, fmap_r_mrd, fmap_g_mrd = losses.mrd(real, fake)
-        _, g_cstft_outs, fmap_r_cstft, fmap_g_cstft = losses.cstft(real, fake)
 
         g_mp_adv, g_mp_terms = losses.vocos_gen_loss(g_mp_outs)
         g_mrd_adv, g_mrd_terms = losses.vocos_gen_loss(g_mrd_outs)
-        g_cstft_adv, g_cstft_terms = losses.vocos_gen_loss(g_cstft_outs)
         g_mp_adv = g_mp_adv / max(1, len(g_mp_terms))
         g_mrd_adv = g_mrd_adv / max(1, len(g_mrd_terms))
-        g_cstft_adv = g_cstft_adv / max(1, len(g_cstft_terms))
 
         fm_mp = losses.feat_match_loss(fmap_r_mp, fmap_g_mp) / max(1, len(fmap_r_mp))
         fm_mrd = losses.feat_match_loss(fmap_r_mrd, fmap_g_mrd) / max(1, len(fmap_r_mrd))
-        fm_cstft = losses.feat_match_loss(fmap_r_cstft, fmap_g_cstft) / max(1, len(fmap_r_cstft))
 
-        g_gan_raw = g_mp_adv + args.mrd_loss_coeff * g_mrd_adv + args.cstft_disc_loss_coeff * g_cstft_adv
-        g_fm_raw = fm_mp + args.mrd_loss_coeff * fm_mrd + args.cstft_disc_loss_coeff * fm_cstft
+        g_gan_raw = g_mp_adv + args.mrd_loss_coeff * g_mrd_adv
+        g_fm_raw = fm_mp + args.mrd_loss_coeff * fm_mrd
 
     g_mrstft_raw = losses.mrstft(fake, real)
     g_group_delay_raw = losses.group_delay(fake, real)
@@ -641,7 +623,7 @@ def resolve_quant_backend(requested: str) -> str:
 
 
 def run_qat(
-    generator: PairedVocosGenerator,
+    generator: nn.Module,
     train_loader: DataLoader,
     losses: LossBundle,
     args: argparse.Namespace,
@@ -872,14 +854,24 @@ def count_weight_dtypes(state_dict: Mapping[str, torch.Tensor]) -> Dict[str, int
 def estimate_ops_for_50_frames(cfg: GeneratorConfig, frames: int = 50) -> Dict[str, Dict[str, int]]:
     # MAC estimate using Conv1d/Linear style terms over learned layers.
     t = int(frames)
-    c_in = cfg.in_channels
+    c_asr = cfg.asr_channels
+    c_style = cfg.style_channels
     c_mid = cfg.model_input_channels
+    c_ctrl = cfg.control_channels
     d = cfg.backbone_dim
     d_int = cfg.backbone_intermediate_dim
     layers = cfg.backbone_layers
     head_out = cfg.n_fft + 2
 
-    conditioner_ops = t * (c_mid * c_in + c_mid * c_mid * 3 + c_mid * c_mid)
+    control_branch_ops = c_ctrl * 5 + max(0, cfg.control_layers - 1) * c_ctrl * c_ctrl * 5 + c_mid * c_ctrl
+    conditioner_ops = t * (
+        c_mid * c_asr
+        + c_mid * c_style
+        + 2 * control_branch_ops
+        + c_mid * (c_mid * 4)
+        + c_mid * c_mid * 3
+        + c_mid * c_mid
+    )
     embed_ops = t * (d * c_mid * 7)
     convnext_per_layer = t * (d * 7 + d_int * d + d * d_int)
     convnext_ops = layers * convnext_per_layer
@@ -947,21 +939,7 @@ def run_fp16_inference(
     fp16_state: Mapping[str, torch.Tensor],
     features: torch.Tensor,
 ) -> torch.Tensor:
-    half_model = PairedVocosGenerator(
-        in_channels=cfg.in_channels,
-        model_input_channels=cfg.model_input_channels,
-        backbone_dim=cfg.backbone_dim,
-        backbone_intermediate_dim=cfg.backbone_intermediate_dim,
-        backbone_layers=cfg.backbone_layers,
-        n_fft=cfg.n_fft,
-        hop_length=cfg.hop_length,
-        padding=cfg.padding,
-        vocos_impl=cfg.vocos_impl,
-        streaming_vocos_repo=cfg.streaming_vocos_repo,
-        backbone_causal=cfg.backbone_causal,
-        backbone_pad_mode=cfg.backbone_pad_mode,
-        backbone_norm=cfg.backbone_norm,
-    ).half().eval()
+    half_model = create_generator(cfg).half().eval()
     half_model.load_state_dict(fp16_state, strict=True)
     with torch.inference_mode():
         try:
@@ -1018,10 +996,10 @@ def main() -> None:
         raise FileNotFoundError(input_path)
 
     ckpt, generator_state = load_checkpoint(input_path)
-    config = infer_generator_config(generator_state, args=args)
+    config = infer_generator_config(generator_state, args=args, ckpt=ckpt)
     logger.info(
         "Inferred generator config: "
-        f"vocos_impl={config.vocos_impl}, in_channels={config.in_channels}, "
+        f"backend=third_party/vocos, in_channels={config.in_channels}, "
         f"model_input_channels={config.model_input_channels}, backbone_dim={config.backbone_dim}, "
         f"layers={config.backbone_layers}, n_fft={config.n_fft}, hop_length={config.hop_length}"
     )
