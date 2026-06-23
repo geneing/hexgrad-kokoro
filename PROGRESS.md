@@ -29,3 +29,15 @@
 - TFLite op inventory from the previous fixed-frame exports: `RESHAPE 76`, `ADD 51`, `TRANSPOSE 40`, `MUL 35`, `MEAN 20`, `FULLY_CONNECTED 17`, `GELU 14`, `SLICE 12`, `SUB 11`, `CONV_2D 10`, `DEPTHWISE_CONV_2D 10`, `SQUARED_DIFFERENCE 10`, `RSQRT 10`, `BATCH_MATMUL 2`, `TRANSPOSE_CONV 2`, and one each of `CONCATENATION`, `EXP`, `MINIMUM`, `COS`, `SIN`, `BROADCAST_TO`, `MAXIMUM`, `DIV`.
 - Latest verification command:
   `uv run python vocos_export.py --checkpoint models/vocos/last.pt --output-dir runs/litert_vocos_pixel10_aot --sample-count 3 --pixel10-fp16-aot --dynamic-frames --google-tensor-compiler-lib tools/google_tensor_ml_sdk`
+
+## 2026-06-22 fp16 export fix
+
+- Added export-safe model rewrites in `vocos_export.py`:
+  - Replaced `nn.LayerNorm` with an explicit tensor-op `ExportSafeLayerNorm` so fp16 export does not hit LiteRT-Torch's LayerNorm f32/f16 type mismatch.
+  - Replaced `KokoroFeatureConditioner` slicing with full-channel projection convolutions that have zeroed weights outside each branch's channel range, avoiding fp16 converter failures on conditioner slices.
+- Direct all-fp16 `litert_torch` export still fails later on fp16 `Conv1d` lowering (`tfl.transpose` legalization), so the working fp16 model path now uses: float32 LiteRT staging export -> AI Edge Quantizer `FLOAT_CASTING` 16-bit weight-only quantization -> final `vocos_fp16_*.tflite`.
+- Reran:
+  `uv run python vocos_export.py --checkpoint models/vocos/last.pt --output-dir runs/litert_vocos_pixel10_aot --sample-count 3 --pixel10-fp16-aot --dynamic-frames --google-tensor-compiler-lib tools/google_tensor_ml_sdk`
+- Final fp16-weight TFLite exports succeeded for all three real inputs. Example inventory for `af_alloy_00001_00` now shows `FLOAT16: 38`, `FLOAT32: 447`, `DEQUANTIZE: 38`; file size dropped from 45 MB staging to 26 MB final.
+- Local LiteRT inference sanity check on `vocos_fp16_af_alloy_00001_00_330f_litert.tflite` passed: output shape `(1, 99000)`, finite output, RMS `0.0498`.
+- Google Tensor G5 AOT still fails internally after selecting the full fp16-weight graph (`366 / 366 ops`); raw compiler log copied to `runs/litert_vocos_pixel10_aot/diagnostics/vocos_fp16_af_alloy_00001_00_330f_litert_aot_google_tensor_g5_tmp0038ko2q.error`.

@@ -86,6 +86,9 @@ logging.getLogger("torchao").setLevel(logging.ERROR)
 import litert_torch
 from ai_edge_quantizer import quantizer as aeq_quantizer
 from ai_edge_quantizer import recipe as aeq_recipe
+from ai_edge_quantizer import algorithm_manager as aeq_algorithm_manager
+from ai_edge_quantizer import qtyping as aeq_qtyping
+from ai_edge_quantizer import recipe_manager as aeq_recipe_manager
 from ai_edge_quantizer.utils import tfl_interpreter_utils
 from loguru import logger
 from torch import nn
@@ -243,7 +246,116 @@ class ExportSafeISTFTHead(nn.Module):
         return y / envelope.clamp_min(1e-11)
 
 
+class ExportSafeLayerNorm(nn.Module):
+    """LayerNorm decomposition that keeps constants in the module dtype for fp16 LiteRT export."""
+
+    def __init__(self, src: nn.LayerNorm):
+        super().__init__()
+        if isinstance(src.normalized_shape, int):
+            normalized_shape = (src.normalized_shape,)
+        else:
+            normalized_shape = tuple(int(dim) for dim in src.normalized_shape)
+        if len(normalized_shape) != 1:
+            raise ValueError(f"ExportSafeLayerNorm only supports 1D normalized_shape, got {normalized_shape}")
+        self.normalized_dim = int(normalized_shape[0])
+        self.register_buffer("eps", torch.tensor(float(src.eps), dtype=torch.float32))
+        if src.elementwise_affine:
+            assert src.weight is not None and src.bias is not None
+            self.weight = nn.Parameter(src.weight.detach().clone())
+            self.bias = nn.Parameter(src.bias.detach().clone())
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mean = x.mean(dim=-1, keepdim=True)
+        centered = x - mean
+        var = centered.square().mean(dim=-1, keepdim=True)
+        y = centered * torch.rsqrt(var + self.eps.to(dtype=x.dtype))
+        if self.weight is not None:
+            y = y * self.weight.view(*([1] * (x.ndim - 1)), self.normalized_dim)
+        if self.bias is not None:
+            y = y + self.bias.view(*([1] * (x.ndim - 1)), self.normalized_dim)
+        return y
+
+
+def _widen_conv1d_input(src: nn.Conv1d, total_channels: int, start_channel: int) -> nn.Conv1d:
+    widened = nn.Conv1d(
+        in_channels=total_channels,
+        out_channels=src.out_channels,
+        kernel_size=src.kernel_size,
+        stride=src.stride,
+        padding=src.padding,
+        dilation=src.dilation,
+        groups=1,
+        bias=src.bias is not None,
+        padding_mode=src.padding_mode,
+    )
+    with torch.no_grad():
+        widened.weight.zero_()
+        in_channels = int(src.in_channels)
+        widened.weight[:, start_channel : start_channel + in_channels, :] = src.weight.detach().clone()
+        if src.bias is not None:
+            widened.bias.copy_(src.bias.detach())
+    return widened
+
+
+def _widen_control_branch(branch: nn.Sequential, total_channels: int, start_channel: int) -> nn.Sequential:
+    if not branch or not isinstance(branch[0], nn.Conv1d):
+        raise TypeError("Expected control branch to start with Conv1d")
+    layers = list(branch.children())
+    layers[0] = _widen_conv1d_input(layers[0], total_channels=total_channels, start_channel=start_channel)
+    return nn.Sequential(*layers)
+
+
+class ExportSafeKokoroFeatureConditioner(nn.Module):
+    """Kokoro conditioner with slice-free full-channel projection branches for fp16 export."""
+
+    def __init__(self, src: nn.Module):
+        super().__init__()
+        self.asr_channels = int(src.asr_channels)
+        self.style_channels = int(src.style_channels)
+        self.total_channels = self.asr_channels + self.style_channels + 2
+        asr_start = 0
+        f0_start = self.asr_channels
+        noise_start = self.asr_channels + 1
+        style_start = self.asr_channels + 2
+
+        self.asr_proj = _widen_conv1d_input(src.asr_proj, self.total_channels, asr_start)
+        self.f0_proj = _widen_control_branch(src.f0_proj, self.total_channels, f0_start)
+        self.noise_proj = _widen_control_branch(src.noise_proj, self.total_channels, noise_start)
+        self.style_proj = _widen_conv1d_input(src.style_proj, self.total_channels, style_start)
+        self.fuse = src.fuse
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.fuse(
+            torch.cat(
+                [
+                    self.asr_proj(features),
+                    self.f0_proj(features),
+                    self.noise_proj(features),
+                    self.style_proj(features),
+                ],
+                dim=1,
+            )
+        )
+
+
+def _replace_layer_norms_for_export(module: nn.Module) -> None:
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.LayerNorm):
+            setattr(module, name, ExportSafeLayerNorm(child))
+        else:
+            _replace_layer_norms_for_export(child)
+
+
 def _patch_istft_for_export(model: nn.Module) -> None:
+    if hasattr(model, "conditioner") and all(
+        hasattr(model.conditioner, attr)
+        for attr in ("asr_channels", "style_channels", "asr_proj", "f0_proj", "noise_proj", "style_proj", "fuse")
+    ):
+        model.conditioner = ExportSafeKokoroFeatureConditioner(model.conditioner)
+    _replace_layer_norms_for_export(model)
     for module in model.modules():
         if hasattr(module, "istft") and isinstance(module.istft, ISTFT):
             module.istft = ExportSafeISTFT(module.istft)
@@ -604,6 +716,27 @@ def _quantize_fp32_tflite_to_int8(
     return int8_tflite_path
 
 
+def _fp16_weight_only_recipe() -> list[dict[str, object]]:
+    rp_manager = aeq_recipe_manager.RecipeManager()
+    rp_manager.add_weight_only_config(
+        regex=".*",
+        operation_name=aeq_qtyping.TFLOperationName.ALL_SUPPORTED,
+        num_bits=16,
+        algorithm_key=aeq_algorithm_manager.AlgorithmName.FLOAT_CASTING,
+    )
+    return rp_manager.get_quantization_recipe()
+
+
+def _quantize_tflite_to_fp16_weights(fp32_tflite_path: Path, fp16_tflite_path: Path) -> Path:
+    qt = aeq_quantizer.Quantizer(fp32_tflite_path.read_bytes())
+    qt.load_quantization_recipe(_fp16_weight_only_recipe())
+    quant_result = qt.quantize()
+    if quant_result.quantized_model is None:
+        raise RuntimeError("AI Edge Quantizer did not produce an fp16-weight model.")
+    fp16_tflite_path.write_bytes(bytes(quant_result.quantized_model))
+    return fp16_tflite_path
+
+
 def _waveform_rms(audio: np.ndarray) -> float:
     arr = np.asarray(audio, dtype=np.float32).reshape(-1)
     if arr.size == 0:
@@ -891,14 +1024,14 @@ def _select_pixel10_export_model(
     except Exception as exc:
         failure_path = diagnostics_dir / "true_fp16_export_failure.txt"
         failure_path.write_text(
-            "True fp16 LiteRT export failed; falling back to fp16 checkpoint weights exported as a float32 TFLite graph.\n\n"
+            "True all-fp16 LiteRT export failed; falling back to float32 LiteRT export plus fp16 weight casting.\n\n"
             f"sample={sample.tag}\n"
             f"sample_shape={tuple(sample.features.shape)}\n\n"
             f"{type(exc).__name__}: {exc}\n",
             encoding="utf-8",
         )
         logger.warning(f"True fp16 LiteRT export failed; diagnostic={failure_path}")
-        return fp16_model, torch.float32, "fp16_weights_float32_graph"
+        return fp16_model, torch.float32, "fp16_weight_quantized_tflite"
 
 
 def _run_pixel10_fp16_aot(args: argparse.Namespace, config: GeneratorConfig, fp16_model: nn.Module) -> None:
@@ -936,13 +1069,18 @@ def _run_pixel10_fp16_aot(args: argparse.Namespace, config: GeneratorConfig, fp1
 
     for sample in samples:
         frames = int(sample.features.shape[-1])
+        staging_path = args.output_dir / f"vocos_fp32_for_fp16_{sample.tag}_{frames}f_litert.tflite"
         out_path = args.output_dir / f"vocos_fp16_{sample.tag}_{frames}f_litert.tflite"
         _export_litert(
             model=export_model,
             sample_arg=sample.features.to(dtype=sample_dtype).unsqueeze(0),
-            out_path=out_path,
+            out_path=staging_path,
             lightweight_conversion=args.lightweight_conversion,
         )
+        if export_precision == "true_fp16":
+            shutil.copy2(staging_path, out_path)
+        else:
+            _quantize_tflite_to_fp16_weights(staging_path, out_path)
         exported.append(out_path)
         _write_tflite_diagnostics(
             model_path=out_path,
