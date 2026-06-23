@@ -58,13 +58,18 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import copy
+import io
 import logging
 import os
 import random
+import re
 import shlex
 import shutil
 import subprocess
 import wave
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Sequence
@@ -121,6 +126,16 @@ class AndroidGpuBenchmarkResult:
     gpu_compile_log_path: Path
     gpu_benchmark_log_path: Path
     cpu_benchmark_log_path: Path | None
+
+
+@dataclass
+class AotCompileResult:
+    model_path: Path
+    compiled_dir: Path
+    report_path: Path
+    raw_log_path: Path
+    copied_error_logs: list[Path]
+    success: bool
 
 
 class ExportSafeISTFT(nn.Module):
@@ -272,7 +287,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-feature-glob",
         action="append",
-        default=["data/af_alloy_0000*_00.pt"],
+        default=["data/af_alloy_0*_00.pt"],
         help="Glob for Kokoro feature .pt files to use as model inputs before dataset/random fallbacks.",
     )
 
@@ -348,6 +363,34 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="Extra flag to pass to benchmark_model GPU runs, e.g. --android-gpu-extra-flag=--gpu_backend=cl.",
+    )
+    parser.add_argument(
+        "--pixel10-fp16-aot",
+        action="store_true",
+        help=(
+            "Export fp16-named LiteRT models from real feature inputs and run Google Tensor G5 AOT compilation. "
+            "This mode skips fp32/int8 export and writes diagnostics under output-dir/diagnostics."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-frames",
+        action="store_true",
+        help="In --pixel10-fp16-aot mode, first attempt a dynamic-frame LiteRT export before fixed-length fallbacks.",
+    )
+    parser.add_argument("--dynamic-frame-min", type=int, default=16)
+    parser.add_argument("--dynamic-frame-max", type=int, default=1200)
+    parser.add_argument(
+        "--google-tensor-compiler-lib",
+        type=Path,
+        default=Path("tools/google_tensor_ml_sdk"),
+        help="Directory containing liblitert_plugin_compiler.so from the Google Tensor ML SDK.",
+    )
+    parser.add_argument(
+        "--google-tensor-soc-model",
+        type=str,
+        default="TENSOR_G5",
+        choices=("TENSOR_G3", "TENSOR_G4", "TENSOR_G5", "TENSOR_G6"),
+        help="Google Tensor SoC model to use for AOT compilation.",
     )
     return parser.parse_args()
 
@@ -614,16 +657,347 @@ def _export_litert(
     sample_arg: torch.Tensor,
     out_path: Path,
     lightweight_conversion: bool,
+    dynamic_shapes: tuple[object, ...] | None = None,
 ) -> Path:
     model.eval()
     edge_model = litert_torch.convert(
         model,
         sample_args=(sample_arg,),
         strict_export=False,
+        dynamic_shapes=dynamic_shapes,
         lightweight_conversion=lightweight_conversion,
     )
     edge_model.export(str(out_path))
     return out_path
+
+
+def _schema_enum_names(enum_cls: object) -> dict[int, str]:
+    names: dict[int, str] = {}
+    for name in dir(enum_cls):
+        if not name.isupper():
+            continue
+        value = getattr(enum_cls, name)
+        if isinstance(value, int):
+            names[int(value)] = name
+    return names
+
+
+def _write_tflite_diagnostics(model_path: Path, out_path: Path, num_frames: int) -> None:
+    from ai_edge_litert import schema_py_generated as schema
+
+    model_bytes = model_path.read_bytes()
+    fb_model = schema.Model.GetRootAsModel(model_bytes, 0)
+    op_code_names = _schema_enum_names(schema.BuiltinOperator)
+    tensor_type_names = _schema_enum_names(schema.TensorType)
+
+    opcode_indices: list[int] = []
+    custom_codes: list[str] = []
+    for i in range(fb_model.OperatorCodesLength()):
+        code = fb_model.OperatorCodes(i)
+        builtin = int(code.BuiltinCode())
+        opcode_indices.append(builtin)
+        custom = code.CustomCode()
+        custom_codes.append(custom.decode("utf-8") if custom else "")
+
+    op_hist: Counter[str] = Counter()
+    tensor_hist: Counter[str] = Counter()
+    lines: list[str] = [f"Model: {model_path}", ""]
+
+    for subgraph_idx in range(fb_model.SubgraphsLength()):
+        subgraph = fb_model.Subgraphs(subgraph_idx)
+        lines.append(f"Subgraph {subgraph_idx}")
+        lines.append(f"  tensors: {subgraph.TensorsLength()}")
+        lines.append(f"  operators: {subgraph.OperatorsLength()}")
+
+        for tensor_idx in range(subgraph.TensorsLength()):
+            tensor = subgraph.Tensors(tensor_idx)
+            tensor_type = tensor_type_names.get(int(tensor.Type()), str(int(tensor.Type())))
+            tensor_hist[tensor_type] += 1
+
+        lines.append("  operators:")
+        for op_idx in range(subgraph.OperatorsLength()):
+            op = subgraph.Operators(op_idx)
+            opcode_index = int(op.OpcodeIndex())
+            builtin = opcode_indices[opcode_index]
+            op_name = custom_codes[opcode_index] or op_code_names.get(builtin, str(builtin))
+            op_hist[op_name] += 1
+            inputs = [int(op.Inputs(i)) for i in range(op.InputsLength())]
+            outputs = [int(op.Outputs(i)) for i in range(op.OutputsLength())]
+            lines.append(f"    {op_idx:03d} {op_name} inputs={inputs} outputs={outputs}")
+        lines.append("")
+
+    arith = _estimate_tflite_arithmetic_ops(model_path, num_frames=num_frames)
+    lines.append("Operator histogram:")
+    for op_name, count in op_hist.most_common():
+        lines.append(f"  {op_name}: {count}")
+    lines.append("")
+    lines.append("Tensor type histogram:")
+    for type_name, count in tensor_hist.most_common():
+        lines.append(f"  {type_name}: {count}")
+    lines.append("")
+    lines.append(
+        "Estimated arithmetic ops: "
+        f"float={_format_int(arith.float_ops)}, int={_format_int(arith.int_ops)}, total={_format_int(arith.total)}"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _copy_aot_error_logs(report_text: str, diagnostics_dir: Path, model_stem: str) -> list[Path]:
+    copied: list[Path] = []
+    for match in re.finditer(r"See\s+(/tmp/\S+?\.error)", report_text):
+        source = Path(match.group(1))
+        if not source.exists():
+            continue
+        dest = diagnostics_dir / f"{model_stem}_{source.name}"
+        shutil.copy2(source, dest)
+        copied.append(dest)
+    return copied
+
+
+def _run_google_tensor_aot(
+    model_path: Path,
+    output_dir: Path,
+    diagnostics_dir: Path,
+    soc_model_name: str,
+    compiler_lib: Path,
+) -> AotCompileResult:
+    from ai_edge_litert.aot.aot_compile import aot_compile
+    from ai_edge_litert.aot.vendors.google_tensor.target import SocManufacturer, SocModel, Target
+
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    compiled_dir = output_dir / "compiled" / model_path.stem
+    compiled_dir.mkdir(parents=True, exist_ok=True)
+
+    compiler_lib = compiler_lib.resolve()
+    if compiler_lib.exists():
+        os.environ["GOOGLE_TENSOR_BACKEND_ENABLED"] = "1"
+        os.environ["GOOGLE_TENSOR_COMPILER_LIB"] = str(compiler_lib)
+
+    # Importing the backend module registers backend id "GOOGLE" with LiteRT AOT.
+    import ai_edge_litert.aot.vendors.google_tensor.google_tensor_backend  # noqa: F401
+
+    target = Target(getattr(SocModel, soc_model_name), SocManufacturer.GOOGLE)
+    raw = io.StringIO()
+    result = None
+    exc: Exception | None = None
+    with contextlib.redirect_stdout(raw), contextlib.redirect_stderr(raw):
+        try:
+            result = aot_compile(
+                str(model_path),
+                output_dir=compiled_dir,
+                target=target,
+                keep_going=True,
+            )
+        except Exception as err:  # Keep diagnostics even when the wrapper raises.
+            exc = err
+
+    report = result.compilation_report() if result is not None else ""
+    success = bool(result is not None and result.models_with_backend and not result.failed_backends)
+    if exc is not None:
+        report += ("\n" if report else "") + f"AOT wrapper exception: {type(exc).__name__}: {exc}"
+
+    report_path = diagnostics_dir / f"{model_path.stem}_aot_{repr(target).lower()}.txt"
+    raw_log_path = diagnostics_dir / f"{model_path.stem}_aot_{repr(target).lower()}_raw.txt"
+    report_path.write_text(
+        f"GOOGLE_TENSOR_COMPILER_LIB={os.environ.get('GOOGLE_TENSOR_COMPILER_LIB', '')}\n\n"
+        + (report if report.strip() else "No compilation report was produced.")
+        + "\n",
+        encoding="utf-8",
+    )
+    raw_log_path.write_text(raw.getvalue(), encoding="utf-8")
+    copied_errors = _copy_aot_error_logs(report, diagnostics_dir, f"{model_path.stem}_aot_{repr(target).lower()}")
+
+    logger.info(
+        f"AOT compile {'succeeded' if success else 'failed'} for {model_path.name}; "
+        f"report={report_path}, raw={raw_log_path}"
+    )
+    return AotCompileResult(
+        model_path=model_path,
+        compiled_dir=compiled_dir,
+        report_path=report_path,
+        raw_log_path=raw_log_path,
+        copied_error_logs=copied_errors,
+        success=success,
+    )
+
+
+def _attempt_dynamic_fp16_export(
+    model: nn.Module,
+    sample: InferenceSample,
+    output_dir: Path,
+    diagnostics_dir: Path,
+    args: argparse.Namespace,
+    sample_dtype: torch.dtype = torch.float32,
+) -> Path | None:
+    out_path = output_dir / "vocos_fp16_dynamic_litert.tflite"
+    try:
+        dynamic_shapes = (
+            {2: torch.export.Dim("frames", min=args.dynamic_frame_min, max=args.dynamic_frame_max)},
+        )
+        _export_litert(
+            model=model,
+            sample_arg=sample.features.to(dtype=sample_dtype).unsqueeze(0),
+            out_path=out_path,
+            lightweight_conversion=args.lightweight_conversion,
+            dynamic_shapes=dynamic_shapes,
+        )
+        logger.info(f"Exported dynamic-frame fp16 LiteRT model: {out_path}")
+        return out_path
+    except Exception as exc:
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        failure_path = diagnostics_dir / "dynamic_export_failure.txt"
+        failure_path.write_text(
+            "Dynamic-frame litert_torch export failed.\n\n"
+            f"sample={sample.tag}\n"
+            f"sample_shape={tuple(sample.features.shape)}\n"
+            f"dynamic_frame_min={args.dynamic_frame_min}\n"
+            f"dynamic_frame_max={args.dynamic_frame_max}\n\n"
+            f"{type(exc).__name__}: {exc}\n",
+            encoding="utf-8",
+        )
+        logger.warning(f"Dynamic-frame fp16 LiteRT export failed; diagnostic={failure_path}")
+        return None
+
+
+def _select_pixel10_export_model(
+    fp16_model: nn.Module,
+    sample: InferenceSample,
+    output_dir: Path,
+    diagnostics_dir: Path,
+    args: argparse.Namespace,
+) -> tuple[nn.Module, torch.dtype, str]:
+    frames = int(sample.features.shape[-1])
+    probe_path = output_dir / f"vocos_true_fp16_probe_{sample.tag}_{frames}f_litert.tflite"
+    try:
+        true_fp16_model = copy.deepcopy(fp16_model).half().eval()
+        _export_litert(
+            model=true_fp16_model,
+            sample_arg=sample.features.half().unsqueeze(0),
+            out_path=probe_path,
+            lightweight_conversion=args.lightweight_conversion,
+        )
+        _write_tflite_diagnostics(
+            model_path=probe_path,
+            out_path=diagnostics_dir / f"{probe_path.stem}_op_inventory.txt",
+            num_frames=frames,
+        )
+        (diagnostics_dir / "true_fp16_export.txt").write_text(
+            f"True fp16 LiteRT export succeeded for probe sample {sample.tag}: {probe_path}\n",
+            encoding="utf-8",
+        )
+        logger.info(f"True fp16 LiteRT probe export succeeded: {probe_path}")
+        return true_fp16_model, torch.float16, "true_fp16"
+    except Exception as exc:
+        failure_path = diagnostics_dir / "true_fp16_export_failure.txt"
+        failure_path.write_text(
+            "True fp16 LiteRT export failed; falling back to fp16 checkpoint weights exported as a float32 TFLite graph.\n\n"
+            f"sample={sample.tag}\n"
+            f"sample_shape={tuple(sample.features.shape)}\n\n"
+            f"{type(exc).__name__}: {exc}\n",
+            encoding="utf-8",
+        )
+        logger.warning(f"True fp16 LiteRT export failed; diagnostic={failure_path}")
+        return fp16_model, torch.float32, "fp16_weights_float32_graph"
+
+
+def _run_pixel10_fp16_aot(args: argparse.Namespace, config: GeneratorConfig, fp16_model: nn.Module) -> None:
+    diagnostics_dir = args.output_dir / "diagnostics"
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+
+    samples = _collect_feature_pt_samples(args, input_channels=config.in_channels, count=max(args.sample_count, 3))
+    if not samples:
+        raise RuntimeError(
+            "--pixel10-fp16-aot requires feature .pt inputs. "
+            f"No usable files matched {args.input_feature_glob}."
+        )
+
+    export_model, sample_dtype, export_precision = _select_pixel10_export_model(
+        fp16_model=fp16_model,
+        sample=samples[0],
+        output_dir=args.output_dir,
+        diagnostics_dir=diagnostics_dir,
+        args=args,
+    )
+
+    exported: list[Path] = []
+    dynamic_path: Path | None = None
+    if args.dynamic_frames:
+        dynamic_path = _attempt_dynamic_fp16_export(
+            model=export_model,
+            sample=samples[0],
+            output_dir=args.output_dir,
+            diagnostics_dir=diagnostics_dir,
+            args=args,
+            sample_dtype=sample_dtype,
+        )
+        if dynamic_path is not None:
+            exported.append(dynamic_path)
+
+    for sample in samples:
+        frames = int(sample.features.shape[-1])
+        out_path = args.output_dir / f"vocos_fp16_{sample.tag}_{frames}f_litert.tflite"
+        _export_litert(
+            model=export_model,
+            sample_arg=sample.features.to(dtype=sample_dtype).unsqueeze(0),
+            out_path=out_path,
+            lightweight_conversion=args.lightweight_conversion,
+        )
+        exported.append(out_path)
+        _write_tflite_diagnostics(
+            model_path=out_path,
+            out_path=diagnostics_dir / f"{out_path.stem}_op_inventory.txt",
+            num_frames=frames,
+        )
+        logger.info(f"Exported fixed-frame fp16 LiteRT model for {sample.tag}: {out_path}")
+
+    aot_results = [
+        _run_google_tensor_aot(
+            model_path=model_path,
+            output_dir=args.output_dir,
+            diagnostics_dir=diagnostics_dir,
+            soc_model_name=args.google_tensor_soc_model,
+            compiler_lib=args.google_tensor_compiler_lib,
+        )
+        for model_path in exported
+    ]
+
+    summary_lines = [
+        "Pixel 10 / Google Tensor fp16 export + AOT diagnostics",
+        "",
+        "Input examples:",
+    ]
+    for sample in samples:
+        summary_lines.append(f"  {sample.tag}: [1,{config.in_channels},{int(sample.features.shape[-1])}]")
+    summary_lines.extend(
+        [
+            "",
+            f"Export precision path: {export_precision}",
+            "",
+            "Dynamic-frame export:",
+            "  attempted: " + str(bool(args.dynamic_frames)),
+            "  result: " + ("exported " + str(dynamic_path) if dynamic_path else "not exported; see dynamic_export_failure.txt"),
+            "",
+            "Fixed-frame LiteRT exports:",
+        ]
+    )
+    summary_lines.extend(f"  {path.name}" for path in exported if path != dynamic_path)
+    summary_lines.extend(["", "AOT compilation:"])
+    for result in aot_results:
+        summary_lines.append(
+            f"  {result.model_path.name}: {'success' if result.success else 'failed'}; "
+            f"report={result.report_path.name}; copied_errors={[p.name for p in result.copied_error_logs]}"
+        )
+    summary_lines.extend(
+        [
+            "",
+            "Notes:",
+            "  Tensor and op inventories are saved as *_op_inventory.txt.",
+            "  If the Google Tensor compiler reports an internal failure after selecting all ops, there may be no per-op unsupported list.",
+        ]
+    )
+    (diagnostics_dir / "summary.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    logger.info(f"Saved Pixel 10 fp16/AOT diagnostics to: {diagnostics_dir}")
 
 
 def _run_litert_inference(model_path: Path, features: np.ndarray) -> np.ndarray:
@@ -1208,6 +1582,10 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     config, fp32_model, fp16_model = _load_models(args)
+
+    if args.pixel10_fp16_aot:
+        _run_pixel10_fp16_aot(args=args, config=config, fp16_model=fp16_model)
+        return
 
     sample_features_fp32 = torch.randn(1, config.in_channels, args.num_frames, dtype=torch.float32)
 
