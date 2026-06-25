@@ -90,6 +90,7 @@ from ai_edge_quantizer import algorithm_manager as aeq_algorithm_manager
 from ai_edge_quantizer import qtyping as aeq_qtyping
 from ai_edge_quantizer import recipe_manager as aeq_recipe_manager
 from ai_edge_quantizer.utils import tfl_interpreter_utils
+from litert_torch.generative.quantize import quant_recipes
 from loguru import logger
 from torch import nn
 
@@ -141,6 +142,21 @@ class AotCompileResult:
     success: bool
 
 
+@dataclass
+class LocalQualityResult:
+    sample_tag: str
+    staging_path: Path
+    fp16_path: Path
+    output_shape: tuple[int, ...]
+    finite: bool
+    rms: float
+    peak: float
+    max_abs_error: float
+    mean_abs_error: float
+    error_rms: float
+    rms_delta: float
+
+
 class ExportSafeISTFT(nn.Module):
     """ISTFT forward variant without data-dependent Python asserts (export-safe)."""
 
@@ -188,7 +204,7 @@ class ExportSafeISTFTHead(nn.Module):
 
     def __init__(self, src_head: nn.Module):
         super().__init__()
-        self.out = src_head.out
+        self.out = _linear_to_conv1d(src_head.out)
         assert isinstance(src_head.istft, ISTFT)
         self.istft = ExportSafeISTFT(src_head.istft)
 
@@ -199,8 +215,27 @@ class ExportSafeISTFTHead(nn.Module):
         angle = 2.0 * torch.pi * n * k.unsqueeze(0) / float(n_fft)
         self.register_buffer("_cos_basis", torch.cos(angle))
         self.register_buffer("_sin_basis", torch.sin(angle))
+        # 1x1 projections avoid einsum->BATCH_MATMUL lowering on Android GPU delegate.
+        self.register_buffer("_cos_proj", torch.cos(angle).unsqueeze(-1))
+        self.register_buffer("_sin_proj", torch.sin(angle).unsqueeze(-1))
         self.register_buffer("_nyquist_sign", torch.pow(torch.tensor(-1.0), torch.arange(n_fft, dtype=torch.float32)))
         self.register_buffer("_ola_kernel", torch.eye(self.istft.win_length, dtype=torch.float32).unsqueeze(1))
+        shift_kernel = torch.zeros(self.istft.win_length, 1, self.istft.win_length, dtype=torch.float32)
+        for c in range(self.istft.win_length):
+            shift_kernel[c, 0, self.istft.win_length - 1 - c] = 1.0
+        self.register_buffer("_ola_shift_kernel", shift_kernel)
+        hop_mask = torch.zeros(1, 1, self.istft.hop_length, dtype=torch.float32)
+        hop_mask[..., 0] = 1.0
+        self.register_buffer("_hop_mask", hop_mask)
+        self.register_buffer("_fixed_window_sq", torch.empty(0, dtype=torch.float32))
+        self.use_transpose_conv_overlap_add = False
+
+    def set_fixed_frames(self, frames: int | None) -> None:
+        if frames is None:
+            self._fixed_window_sq = torch.empty(0, dtype=self.istft.window.dtype, device=self.istft.window.device)
+            return
+        fixed = self.istft.window.square().view(1, self.istft.win_length, 1)
+        self._fixed_window_sq = fixed.repeat(1, 1, int(frames))
 
     def _irfft_real(self, real: torch.Tensor, imag: torch.Tensor) -> torch.Tensor:
         # real/imag: [B, F, T], with F = n_fft//2 + 1
@@ -209,12 +244,14 @@ class ExportSafeISTFTHead(nn.Module):
         nyquist = real[:, -1:, :] * self._nyquist_sign.view(1, n_fft, 1)
         real_mid = real[:, 1:-1, :]
         imag_mid = imag[:, 1:-1, :]
-        inner = torch.einsum("bkt,nk->bnt", real_mid, self._cos_basis)
-        inner = inner - torch.einsum("bkt,nk->bnt", imag_mid, self._sin_basis)
+        cos_w = self._cos_proj.to(dtype=real_mid.dtype)
+        sin_w = self._sin_proj.to(dtype=imag_mid.dtype)
+        inner = torch.nn.functional.conv1d(real_mid, cos_w)
+        inner = inner - torch.nn.functional.conv1d(imag_mid, sin_w)
         return (dc + nyquist + (2.0 * inner)) / float(n_fft)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.out(x).transpose(1, 2)
+        x = self.out(x.transpose(1, 2))
         mag, phase = x.chunk(2, dim=1)
         mag = torch.exp(mag).clamp(max=1e2)
         real = mag * torch.cos(phase)
@@ -224,26 +261,54 @@ class ExportSafeISTFTHead(nn.Module):
         window = self.istft.window
         ifft = ifft * window[None, :, None]
 
-        t_frames = ifft.shape[-1]
-        output_size = (t_frames - 1) * self.istft.hop_length + self.istft.win_length
         pad = (self.istft.win_length - self.istft.hop_length) // 2 if self.istft.padding == "same" else 0
-        ola = torch.nn.functional.conv_transpose1d(
-            ifft,
-            self._ola_kernel,
-            stride=self.istft.hop_length,
-            groups=1,
-        )
-        y = ola[:, 0, pad : (output_size - pad)]
+        if self.use_transpose_conv_overlap_add:
+            y = self._overlap_add_transpose_conv(ifft)
+        else:
+            y = self._overlap_add_no_transpose_conv(ifft)
+        y = y[:, pad:-pad] if pad > 0 else y
 
-        window_sq = window.square().expand(1, t_frames, -1).transpose(1, 2)
-        env_ola = torch.nn.functional.conv_transpose1d(
-            window_sq,
-            self._ola_kernel,
+        if self._fixed_window_sq.numel() > 0:
+            window_sq = self._fixed_window_sq.to(dtype=ifft.dtype)
+        else:
+            window_sq = window.square().view(1, self.istft.win_length, 1) * torch.ones_like(ifft[:, :1, :])
+        if self.use_transpose_conv_overlap_add:
+            envelope = self._overlap_add_transpose_conv(window_sq)[0]
+        else:
+            envelope = self._overlap_add_no_transpose_conv(window_sq)[0]
+        envelope = envelope[pad:-pad] if pad > 0 else envelope
+        return y / envelope.clamp_min(1e-11)
+
+    def _overlap_add_transpose_conv(self, x: torch.Tensor) -> torch.Tensor:
+        ola = torch.nn.functional.conv_transpose1d(
+            x,
+            self._ola_kernel.to(dtype=x.dtype, device=x.device),
             stride=self.istft.hop_length,
             groups=1,
         )
-        envelope = env_ola[0, 0, pad : (output_size - pad)]
-        return y / envelope.clamp_min(1e-11)
+        return ola[:, 0, :]
+
+    def _overlap_add_no_transpose_conv(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, win_length, frames]
+        hop = int(self.istft.hop_length)
+        if hop > 1:
+            x_up = x.repeat_interleave(hop, dim=2)
+            frames = x.shape[-1]
+            mask = self._hop_mask.to(dtype=x.dtype, device=x.device).repeat(1, 1, frames)
+            x_up = x_up * mask
+        else:
+            x_up = x
+        shifted = torch.nn.functional.conv1d(
+            x_up,
+            self._ola_shift_kernel.to(dtype=x.dtype, device=x.device),
+            bias=None,
+            stride=1,
+            padding=self.istft.win_length - 1,
+            groups=self.istft.win_length,
+        )
+        y = shifted.sum(dim=1)
+        out_size = (x.shape[-1] - 1) * hop + self.istft.win_length
+        return y[:, :out_size]
 
 
 class ExportSafeLayerNorm(nn.Module):
@@ -277,6 +342,186 @@ class ExportSafeLayerNorm(nn.Module):
         if self.bias is not None:
             y = y + self.bias.view(*([1] * (x.ndim - 1)), self.normalized_dim)
         return y
+
+
+class ExportSafeChannelLayerNorm(nn.Module):
+    """LayerNorm over channel dimension for channel-first export graphs."""
+
+    def __init__(self, src: nn.LayerNorm):
+        super().__init__()
+        if isinstance(src.normalized_shape, int):
+            normalized_shape = (src.normalized_shape,)
+        else:
+            normalized_shape = tuple(int(dim) for dim in src.normalized_shape)
+        if len(normalized_shape) != 1:
+            raise ValueError(f"ExportSafeChannelLayerNorm only supports 1D normalized_shape, got {normalized_shape}")
+        self.normalized_dim = int(normalized_shape[0])
+        self.register_buffer("eps", torch.tensor(float(src.eps), dtype=torch.float32))
+        if src.elementwise_affine:
+            assert src.weight is not None and src.bias is not None
+            self.weight = nn.Parameter(src.weight.detach().clone())
+            self.bias = nn.Parameter(src.bias.detach().clone())
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mean = x.mean(dim=1, keepdim=True)
+        centered = x - mean
+        var = centered.square().mean(dim=1, keepdim=True)
+        y = centered * torch.rsqrt(var + self.eps.to(dtype=x.dtype))
+        if self.weight is not None:
+            y = y * self.weight.view(1, self.normalized_dim, 1)
+        if self.bias is not None:
+            y = y + self.bias.view(1, self.normalized_dim, 1)
+        return y
+
+
+def _linear_to_conv1d(src: nn.Linear) -> nn.Conv1d:
+    conv = nn.Conv1d(
+        in_channels=src.in_features,
+        out_channels=src.out_features,
+        kernel_size=1,
+        bias=src.bias is not None,
+    )
+    with torch.no_grad():
+        conv.weight.copy_(src.weight.detach().unsqueeze(-1))
+        if src.bias is not None:
+            conv.bias.copy_(src.bias.detach())
+    return conv
+
+
+def _as_1d_tuple(value: int | tuple[int, ...], name: str) -> tuple[int]:
+    if isinstance(value, int):
+        return (int(value),)
+    if len(value) != 1:
+        raise ValueError(f"Expected 1D {name}, got {value}")
+    return (int(value[0]),)
+
+
+class ExportSafeTemporalConv1d(nn.Module):
+    """Conv1d equivalent expressed without torch conv lowering."""
+
+    def __init__(self, src: nn.Conv1d):
+        super().__init__()
+        if src.padding_mode != "zeros":
+            raise ValueError(f"ExportSafeTemporalConv1d only supports zero padding, got {src.padding_mode}")
+
+        kernel_size = _as_1d_tuple(src.kernel_size, "kernel_size")[0]
+        stride = _as_1d_tuple(src.stride, "stride")[0]
+        padding = _as_1d_tuple(src.padding, "padding")[0]
+        dilation = _as_1d_tuple(src.dilation, "dilation")[0]
+        if stride != 1:
+            raise ValueError(f"ExportSafeTemporalConv1d only supports stride=1, got {stride}")
+        if dilation != 1:
+            raise ValueError(f"ExportSafeTemporalConv1d only supports dilation=1, got {dilation}")
+        if src.groups not in (1, src.in_channels) or (src.groups == src.in_channels and src.out_channels != src.in_channels):
+            raise ValueError(
+                "ExportSafeTemporalConv1d only supports groups=1 or depthwise groups=in_channels=out_channels, "
+                f"got in={src.in_channels}, out={src.out_channels}, groups={src.groups}"
+            )
+
+        self.in_channels = int(src.in_channels)
+        self.out_channels = int(src.out_channels)
+        self.kernel_size = int(kernel_size)
+        self.padding = int(padding)
+        self.groups = int(src.groups)
+        self.weight = nn.Parameter(src.weight.detach().clone())
+        if src.bias is not None:
+            self.bias = nn.Parameter(src.bias.detach().clone())
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.padding > 0:
+            x = torch.nn.functional.pad(x, (self.padding, self.padding))
+
+        acc: torch.Tensor | None = None
+        for offset in range(self.kernel_size):
+            if self.kernel_size == 1 or offset == self.kernel_size - 1:
+                segment = x[:, :, offset:]
+            else:
+                segment = x[:, :, offset : offset - (self.kernel_size - 1)]
+
+            if self.groups == self.in_channels:
+                term = segment * self.weight[:, 0, offset].view(1, self.out_channels, 1)
+            else:
+                term = (segment.unsqueeze(1) * self.weight[:, :, offset].view(1, self.out_channels, self.in_channels, 1)).sum(dim=2)
+            acc = term if acc is None else acc + term
+
+        assert acc is not None
+        if self.bias is not None:
+            acc = acc + self.bias.view(1, self.out_channels, 1)
+        return acc
+
+
+def _replace_conv1ds_with_temporal_conv2d(module: nn.Module) -> None:
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Conv1d):
+            setattr(module, name, ExportSafeTemporalConv1d(child))
+        else:
+            _replace_conv1ds_with_temporal_conv2d(child)
+
+
+class ExportSafeConvNeXtBlock(nn.Module):
+    """ConvNeXt block kept channel-first to avoid symbolic Linear bias expands."""
+
+    def __init__(self, src: nn.Module):
+        super().__init__()
+        if getattr(src, "adanorm", False):
+            raise ValueError("ExportSafeConvNeXtBlock does not support AdaLayerNorm")
+        if not isinstance(src.norm, nn.LayerNorm):
+            raise TypeError(f"Expected ConvNeXtBlock.norm to be LayerNorm, got {type(src.norm)}")
+        self.dwconv = src.dwconv
+        self.norm = ExportSafeChannelLayerNorm(src.norm)
+        self.pwconv1 = _linear_to_conv1d(src.pwconv1)
+        self.act = src.act
+        self.pwconv2 = _linear_to_conv1d(src.pwconv2)
+        if src.gamma is not None:
+            self.gamma = nn.Parameter(src.gamma.detach().clone(), requires_grad=src.gamma.requires_grad)
+        else:
+            self.register_parameter("gamma", None)
+
+    def forward(self, x: torch.Tensor, cond_embedding_id: torch.Tensor | None = None) -> torch.Tensor:
+        del cond_embedding_id
+        residual = x
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        if self.gamma is not None:
+            x = x * self.gamma.view(1, -1, 1)
+        return residual + x
+
+
+class ExportSafeVocosBackbone(nn.Module):
+    """Vocos backbone export wrapper with channel-first ConvNeXt blocks."""
+
+    def __init__(self, src: nn.Module):
+        super().__init__()
+        if getattr(src, "adanorm", False):
+            raise ValueError("ExportSafeVocosBackbone does not support AdaLayerNorm")
+        if not isinstance(src.norm, nn.LayerNorm):
+            raise TypeError(f"Expected VocosBackbone.norm to be LayerNorm, got {type(src.norm)}")
+        if not isinstance(src.final_layer_norm, nn.LayerNorm):
+            raise TypeError(
+                f"Expected VocosBackbone.final_layer_norm to be LayerNorm, got {type(src.final_layer_norm)}"
+            )
+        self.input_channels = int(src.input_channels)
+        self.embed = src.embed
+        self.norm = ExportSafeChannelLayerNorm(src.norm)
+        self.convnext = nn.ModuleList(ExportSafeConvNeXtBlock(block) for block in src.convnext)
+        self.final_layer_norm = ExportSafeChannelLayerNorm(src.final_layer_norm)
+
+    def forward(self, x: torch.Tensor, **kwargs: torch.Tensor) -> torch.Tensor:
+        del kwargs
+        x = self.embed(x)
+        x = self.norm(x)
+        for conv_block in self.convnext:
+            x = conv_block(x)
+        x = self.final_layer_norm(x)
+        return x.transpose(1, 2)
 
 
 def _widen_conv1d_input(src: nn.Conv1d, total_channels: int, start_channel: int) -> nn.Conv1d:
@@ -355,12 +600,31 @@ def _patch_istft_for_export(model: nn.Module) -> None:
         for attr in ("asr_channels", "style_channels", "asr_proj", "f0_proj", "noise_proj", "style_proj", "fuse")
     ):
         model.conditioner = ExportSafeKokoroFeatureConditioner(model.conditioner)
+    if hasattr(model, "backbone") and all(
+        hasattr(model.backbone, attr)
+        for attr in ("input_channels", "embed", "norm", "convnext", "final_layer_norm")
+    ):
+        model.backbone = ExportSafeVocosBackbone(model.backbone)
     _replace_layer_norms_for_export(model)
     for module in model.modules():
         if hasattr(module, "istft") and isinstance(module.istft, ISTFT):
             module.istft = ExportSafeISTFT(module.istft)
         if hasattr(module, "head") and hasattr(module.head, "istft") and isinstance(module.head.istft, ISTFT):
             module.head = ExportSafeISTFTHead(module.head)
+    if os.environ.get("KOKORO_EXPORT_CONV_FREE_FP16_PROBE") == "1":
+        _replace_conv1ds_with_temporal_conv2d(model)
+
+
+def _set_export_fixed_frames(model: nn.Module, frames: int | None) -> None:
+    for module in model.modules():
+        if isinstance(module, ExportSafeISTFTHead):
+            module.set_fixed_frames(frames)
+
+
+def _set_export_transpose_conv_overlap_add(model: nn.Module, enabled: bool) -> None:
+    for module in model.modules():
+        if isinstance(module, ExportSafeISTFTHead):
+            module.use_transpose_conv_overlap_add = bool(enabled)
 
 
 def parse_args() -> argparse.Namespace:
@@ -480,8 +744,24 @@ def parse_args() -> argparse.Namespace:
         "--pixel10-fp16-aot",
         action="store_true",
         help=(
-            "Export fp16-named LiteRT models from real feature inputs and run Google Tensor G5 AOT compilation. "
-            "This mode skips fp32/int8 export and writes diagnostics under output-dir/diagnostics."
+            "Compatibility alias for --pixel10-fp16-gpu. Exports Pixel 10 GPU-targeted FP16-weight LiteRT models "
+            "and writes diagnostics under output-dir/diagnostics. Does not run Google Tensor AOT."
+        ),
+    )
+    parser.add_argument(
+        "--pixel10-fp16-gpu",
+        action="store_true",
+        help=(
+            "Export Pixel 10 GPU-targeted FP16-weight LiteRT models from real feature inputs. "
+            "FP16 is selected at conversion/export time; GPU acceleration is selected at Android runtime."
+        ),
+    )
+    parser.add_argument(
+        "--pixel10-multisignature-static",
+        action="store_true",
+        help=(
+            "In --pixel10-fp16-aot mode, also export one static multi-signature model with a signature "
+            "for each discovered real input frame length."
         ),
     )
     parser.add_argument(
@@ -495,14 +775,14 @@ def parse_args() -> argparse.Namespace:
         "--google-tensor-compiler-lib",
         type=Path,
         default=Path("tools/google_tensor_ml_sdk"),
-        help="Directory containing liblitert_plugin_compiler.so from the Google Tensor ML SDK.",
+        help="Deprecated for Pixel GPU export; Google Tensor AOT is not used by --pixel10-fp16-gpu.",
     )
     parser.add_argument(
         "--google-tensor-soc-model",
         type=str,
         default="TENSOR_G5",
         choices=("TENSOR_G3", "TENSOR_G4", "TENSOR_G5", "TENSOR_G6"),
-        help="Google Tensor SoC model to use for AOT compilation.",
+        help="Deprecated for Pixel GPU export; Google Tensor AOT is not used by --pixel10-fp16-gpu.",
     )
     return parser.parse_args()
 
@@ -791,13 +1071,59 @@ def _export_litert(
     out_path: Path,
     lightweight_conversion: bool,
     dynamic_shapes: tuple[object, ...] | None = None,
+    quant_config: object | None = None,
 ) -> Path:
     model.eval()
     edge_model = litert_torch.convert(
         model,
         sample_args=(sample_arg,),
         strict_export=False,
+        quant_config=quant_config,
         dynamic_shapes=dynamic_shapes,
+        lightweight_conversion=lightweight_conversion,
+    )
+    edge_model.export(str(out_path))
+    return out_path
+
+
+def _export_litert_multisignature_static(
+    model: nn.Module,
+    samples: Sequence[InferenceSample],
+    out_path: Path,
+    lightweight_conversion: bool,
+    sample_dtype: torch.dtype,
+    quant_config: object | None = None,
+) -> Path:
+    if not samples:
+        raise RuntimeError("Cannot export a multi-signature model without samples.")
+
+    first_sample = samples[0]
+    first_frames = int(first_sample.features.shape[-1])
+    first_model = copy.deepcopy(model).eval()
+    _set_export_fixed_frames(first_model, first_frames)
+    converter = litert_torch.signature(
+        f"frames_{first_frames}",
+        first_model,
+        sample_args=(first_sample.features.to(dtype=sample_dtype).unsqueeze(0),),
+    )
+
+    seen_frames = {first_frames}
+    for sample in samples[1:]:
+        frames = int(sample.features.shape[-1])
+        if frames in seen_frames:
+            continue
+        seen_frames.add(frames)
+        signature_model = copy.deepcopy(model).eval()
+        _set_export_fixed_frames(signature_model, frames)
+        converter.add_signature(
+            f"frames_{frames}",
+            signature_model,
+            sample_args=(sample.features.to(dtype=sample_dtype).unsqueeze(0),),
+        )
+
+    edge_model = converter.convert(
+        strict_export=False,
+        quant_config=quant_config,
         lightweight_conversion=lightweight_conversion,
     )
     edge_model.export(str(out_path))
@@ -842,9 +1168,12 @@ def _write_tflite_diagnostics(model_path: Path, out_path: Path, num_frames: int)
         lines.append(f"  tensors: {subgraph.TensorsLength()}")
         lines.append(f"  operators: {subgraph.OperatorsLength()}")
 
+        tensor_meta: dict[int, tuple[str, list[int]]] = {}
         for tensor_idx in range(subgraph.TensorsLength()):
             tensor = subgraph.Tensors(tensor_idx)
             tensor_type = tensor_type_names.get(int(tensor.Type()), str(int(tensor.Type())))
+            tensor_shape = [int(tensor.Shape(i)) for i in range(tensor.ShapeLength())]
+            tensor_meta[tensor_idx] = (tensor_type, tensor_shape)
             tensor_hist[tensor_type] += 1
 
         lines.append("  operators:")
@@ -856,7 +1185,15 @@ def _write_tflite_diagnostics(model_path: Path, out_path: Path, num_frames: int)
             op_hist[op_name] += 1
             inputs = [int(op.Inputs(i)) for i in range(op.InputsLength())]
             outputs = [int(op.Outputs(i)) for i in range(op.OutputsLength())]
-            lines.append(f"    {op_idx:03d} {op_name} inputs={inputs} outputs={outputs}")
+            input_shapes = [tensor_meta.get(idx, ("", []))[1] for idx in inputs]
+            output_shapes = [tensor_meta.get(idx, ("", []))[1] for idx in outputs]
+            input_types = [tensor_meta.get(idx, ("", []))[0] for idx in inputs]
+            output_types = [tensor_meta.get(idx, ("", []))[0] for idx in outputs]
+            lines.append(
+                f"    {op_idx:03d} {op_name} inputs={inputs} outputs={outputs} "
+                f"input_shapes={input_shapes} output_shapes={output_shapes} "
+                f"input_types={input_types} output_types={output_types}"
+            )
         lines.append("")
 
     arith = _estimate_tflite_arithmetic_ops(model_path, num_frames=num_frames)
@@ -962,9 +1299,12 @@ def _attempt_dynamic_fp16_export(
     diagnostics_dir: Path,
     args: argparse.Namespace,
     sample_dtype: torch.dtype = torch.float32,
+    quant_config: object | None = None,
 ) -> Path | None:
     out_path = output_dir / "vocos_fp16_dynamic_litert.tflite"
     try:
+        _set_export_fixed_frames(model, None)
+        _set_export_transpose_conv_overlap_add(model, True)
         dynamic_shapes = (
             {2: torch.export.Dim("frames", min=args.dynamic_frame_min, max=args.dynamic_frame_max)},
         )
@@ -974,6 +1314,7 @@ def _attempt_dynamic_fp16_export(
             out_path=out_path,
             lightweight_conversion=args.lightweight_conversion,
             dynamic_shapes=dynamic_shapes,
+            quant_config=quant_config,
         )
         logger.info(f"Exported dynamic-frame fp16 LiteRT model: {out_path}")
         return out_path
@@ -991,6 +1332,8 @@ def _attempt_dynamic_fp16_export(
         )
         logger.warning(f"Dynamic-frame fp16 LiteRT export failed; diagnostic={failure_path}")
         return None
+    finally:
+        _set_export_transpose_conv_overlap_add(model, False)
 
 
 def _select_pixel10_export_model(
@@ -1004,6 +1347,7 @@ def _select_pixel10_export_model(
     probe_path = output_dir / f"vocos_true_fp16_probe_{sample.tag}_{frames}f_litert.tflite"
     try:
         true_fp16_model = copy.deepcopy(fp16_model).half().eval()
+        _set_export_fixed_frames(true_fp16_model, frames)
         _export_litert(
             model=true_fp16_model,
             sample_arg=sample.features.half().unsqueeze(0),
@@ -1045,15 +1389,15 @@ def _run_pixel10_fp16_aot(args: argparse.Namespace, config: GeneratorConfig, fp1
             f"No usable files matched {args.input_feature_glob}."
         )
 
-    export_model, sample_dtype, export_precision = _select_pixel10_export_model(
-        fp16_model=fp16_model,
-        sample=samples[0],
-        output_dir=args.output_dir,
-        diagnostics_dir=diagnostics_dir,
-        args=args,
-    )
+    export_model = fp16_model
+    sample_dtype = torch.float32
+    export_precision = "litert_torch_full_fp16_recipe"
+    fp16_quant_config = quant_recipes.full_fp16_recipe()
 
     exported: list[Path] = []
+    exported_pairs: list[tuple[InferenceSample, Path, Path]] = []
+    quality_results: list[LocalQualityResult] = []
+    multisig_path: Path | None = None
     dynamic_path: Path | None = None
     if args.dynamic_frames:
         dynamic_path = _attempt_dynamic_fp16_export(
@@ -1063,45 +1407,79 @@ def _run_pixel10_fp16_aot(args: argparse.Namespace, config: GeneratorConfig, fp1
             diagnostics_dir=diagnostics_dir,
             args=args,
             sample_dtype=sample_dtype,
+            quant_config=fp16_quant_config,
         )
         if dynamic_path is not None:
             exported.append(dynamic_path)
+            _write_tflite_diagnostics(
+                model_path=dynamic_path,
+                out_path=diagnostics_dir / f"{dynamic_path.stem}_op_inventory.txt",
+                num_frames=int(samples[0].features.shape[-1]),
+            )
 
     for sample in samples:
         frames = int(sample.features.shape[-1])
         staging_path = args.output_dir / f"vocos_fp32_for_fp16_{sample.tag}_{frames}f_litert.tflite"
         out_path = args.output_dir / f"vocos_fp16_{sample.tag}_{frames}f_litert.tflite"
+        _set_export_fixed_frames(export_model, frames)
         _export_litert(
             model=export_model,
             sample_arg=sample.features.to(dtype=sample_dtype).unsqueeze(0),
             out_path=staging_path,
             lightweight_conversion=args.lightweight_conversion,
         )
-        if export_precision == "true_fp16":
-            shutil.copy2(staging_path, out_path)
-        else:
-            _quantize_tflite_to_fp16_weights(staging_path, out_path)
+        _export_litert(
+            model=export_model,
+            sample_arg=sample.features.to(dtype=sample_dtype).unsqueeze(0),
+            out_path=out_path,
+            lightweight_conversion=args.lightweight_conversion,
+            quant_config=fp16_quant_config,
+        )
         exported.append(out_path)
+        exported_pairs.append((sample, staging_path, out_path))
         _write_tflite_diagnostics(
             model_path=out_path,
             out_path=diagnostics_dir / f"{out_path.stem}_op_inventory.txt",
             num_frames=frames,
         )
+        quality_results.append(
+            _run_fixed_frame_quality_check(
+                sample=sample,
+                staging_path=staging_path,
+                fp16_path=out_path,
+                diagnostics_dir=diagnostics_dir,
+            )
+        )
         logger.info(f"Exported fixed-frame fp16 LiteRT model for {sample.tag}: {out_path}")
 
-    aot_results = [
-        _run_google_tensor_aot(
-            model_path=model_path,
-            output_dir=args.output_dir,
-            diagnostics_dir=diagnostics_dir,
-            soc_model_name=args.google_tensor_soc_model,
-            compiler_lib=args.google_tensor_compiler_lib,
+    if args.pixel10_multisignature_static:
+        multisig_path = args.output_dir / "vocos_fp16_multisig_static_litert.tflite"
+        _export_litert_multisignature_static(
+            model=export_model,
+            samples=samples,
+            out_path=multisig_path,
+            lightweight_conversion=args.lightweight_conversion,
+            sample_dtype=sample_dtype,
+            quant_config=fp16_quant_config,
         )
-        for model_path in exported
-    ]
+        _write_tflite_diagnostics(
+            model_path=multisig_path,
+            out_path=diagnostics_dir / f"{multisig_path.stem}_op_inventory.txt",
+            num_frames=max(int(sample.features.shape[-1]) for sample in samples),
+        )
+        logger.info(f"Exported static multi-signature fp16 LiteRT model: {multisig_path}")
+
+    _save_pixel10_sample_audio(
+        exports=exported_pairs,
+        output_dir=args.output_dir,
+        sample_rate=args.sample_rate,
+        multisig_path=multisig_path,
+        dynamic_path=dynamic_path,
+        dynamic_frame_max=args.dynamic_frame_max if args.dynamic_frames else None,
+    )
 
     summary_lines = [
-        "Pixel 10 / Google Tensor fp16 export + AOT diagnostics",
+        "Pixel 10 GPU FP16 export diagnostics",
         "",
         "Input examples:",
     ]
@@ -1111,6 +1489,8 @@ def _run_pixel10_fp16_aot(args: argparse.Namespace, config: GeneratorConfig, fp1
         [
             "",
             f"Export precision path: {export_precision}",
+            "GPU runtime: Android LiteRT CompiledModel with Accelerator.GPU (or older TFLite GPU delegate with FP16/reduced precision enabled).",
+            "AOT compilation: skipped; Google Tensor AOT is for NPU/TPU vendor targets, not Pixel GPU runtime selection.",
             "",
             "Dynamic-frame export:",
             "  attempted: " + str(bool(args.dynamic_frames)),
@@ -1120,31 +1500,57 @@ def _run_pixel10_fp16_aot(args: argparse.Namespace, config: GeneratorConfig, fp1
         ]
     )
     summary_lines.extend(f"  {path.name}" for path in exported if path != dynamic_path)
-    summary_lines.extend(["", "AOT compilation:"])
-    for result in aot_results:
+    if multisig_path is not None:
+        summary_lines.extend(
+            [
+                "",
+                "Static multi-signature export:",
+                f"  {multisig_path.name}",
+                "  signatures: " + ", ".join(f"frames_{int(sample.features.shape[-1])}" for sample in samples),
+            ]
+        )
+    summary_lines.extend(["", "Local LiteRT quality checks:"])
+    for result in quality_results:
         summary_lines.append(
-            f"  {result.model_path.name}: {'success' if result.success else 'failed'}; "
-            f"report={result.report_path.name}; copied_errors={[p.name for p in result.copied_error_logs]}"
+            f"  {result.sample_tag}: finite={result.finite}, shape={list(result.output_shape)}, "
+            f"rms={result.rms:.6g}, peak={result.peak:.6g}, "
+            f"max_abs_error={result.max_abs_error:.6g}, mean_abs_error={result.mean_abs_error:.6g}, "
+            f"error_rms={result.error_rms:.6g}, rms_delta={result.rms_delta:.6g}"
         )
     summary_lines.extend(
         [
             "",
             "Notes:",
             "  Tensor and op inventories are saved as *_op_inventory.txt.",
-            "  If the Google Tensor compiler reports an internal failure after selecting all ops, there may be no per-op unsupported list.",
+            "  Sample WAV outputs are saved under sample_audio/.",
+            "  FP16 is a conversion/export choice; GPU acceleration is a runtime loading choice.",
         ]
     )
     (diagnostics_dir / "summary.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
-    logger.info(f"Saved Pixel 10 fp16/AOT diagnostics to: {diagnostics_dir}")
+    _write_pixel10_gpu_runtime_notes(diagnostics_dir)
+    logger.info(f"Saved Pixel 10 GPU FP16 diagnostics to: {diagnostics_dir}")
 
 
-def _run_litert_inference(model_path: Path, features: np.ndarray) -> np.ndarray:
-    model = litert_torch.load(str(model_path))
-    interpreter = model._get_interpreter()
+def _run_litert_inference(model_path: Path, features: np.ndarray, signature_name: str | None = None) -> np.ndarray:
+    try:
+        model = litert_torch.load(str(model_path))
+        interpreter = model._get_interpreter()
+    except RuntimeError as exc:
+        logger.warning(
+            f"Default LiteRT interpreter failed for {model_path.name}; retrying without XNNPACK/default delegates: {exc}"
+        )
+        interpreter = tfl_interpreter_utils.create_tfl_interpreter(
+            str(model_path),
+            allocate_tensors=False,
+            use_xnnpack=False,
+            preserve_all_tensors=False,
+        )
     signatures = list(interpreter.get_signature_list().keys())
     if not signatures:
         raise RuntimeError(f"No TFLite signatures found in {model_path}")
-    signature_key = signatures[0]
+    signature_key = signature_name or signatures[0]
+    if signature_key not in signatures:
+        raise RuntimeError(f"Signature {signature_key!r} not found in {model_path}; available={signatures}")
     runner = interpreter.get_signature_runner(signature_key)
 
     input_details = runner.get_input_details()
@@ -1187,6 +1593,127 @@ def _run_litert_inference(model_path: Path, features: np.ndarray) -> np.ndarray:
         pred = pred.astype(np.float32)
 
     return pred
+
+
+def _run_fixed_frame_quality_check(
+    sample: InferenceSample,
+    staging_path: Path,
+    fp16_path: Path,
+    diagnostics_dir: Path,
+) -> LocalQualityResult:
+    input_np = sample.features.float().unsqueeze(0).numpy().astype(np.float32)
+    staging_pred = _run_litert_inference(staging_path, input_np)
+    fp16_pred = _run_litert_inference(fp16_path, input_np)
+    diff = fp16_pred.astype(np.float32) - staging_pred.astype(np.float32)
+    fp16_flat = fp16_pred.astype(np.float32).reshape(-1)
+    diff_flat = diff.reshape(-1)
+
+    result = LocalQualityResult(
+        sample_tag=sample.tag,
+        staging_path=staging_path,
+        fp16_path=fp16_path,
+        output_shape=tuple(int(dim) for dim in fp16_pred.shape),
+        finite=bool(np.isfinite(fp16_pred).all()),
+        rms=_waveform_rms(fp16_pred),
+        peak=float(np.max(np.abs(fp16_flat))) if fp16_flat.size else 0.0,
+        max_abs_error=float(np.max(np.abs(diff_flat))) if diff_flat.size else 0.0,
+        mean_abs_error=float(np.mean(np.abs(diff_flat))) if diff_flat.size else 0.0,
+        error_rms=_waveform_rms(diff),
+        rms_delta=abs(_waveform_rms(fp16_pred) - _waveform_rms(staging_pred)),
+    )
+
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    report_path = diagnostics_dir / f"{fp16_path.stem}_quality.txt"
+    report_path.write_text(
+        "\n".join(
+            [
+                f"sample={result.sample_tag}",
+                f"staging_model={result.staging_path}",
+                f"fp16_model={result.fp16_path}",
+                f"output_shape={list(result.output_shape)}",
+                f"finite={result.finite}",
+                f"rms={result.rms:.9g}",
+                f"peak={result.peak:.9g}",
+                f"max_abs_error={result.max_abs_error:.9g}",
+                f"mean_abs_error={result.mean_abs_error:.9g}",
+                f"error_rms={result.error_rms:.9g}",
+                f"rms_delta={result.rms_delta:.9g}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return result
+
+
+def _write_pixel10_gpu_runtime_notes(diagnostics_dir: Path) -> None:
+    notes = """Pixel 10 GPU FP16 runtime notes
+
+FP16 is selected when exporting the LiteRT/TFLite flatbuffer:
+
+```python
+from litert_torch.generative.quantize import quant_recipes
+
+edge_model = litert_torch.convert(
+    model.eval(),
+    sample_args,
+    quant_config=quant_recipes.full_fp16_recipe(),
+)
+edge_model.export("model_fp16.tflite")
+```
+
+GPU acceleration is selected when loading the model on Android. Do not use Google Tensor AOT compilation for Pixel GPU runtime selection.
+
+```kotlin
+val env = Environment.create()
+
+val model = CompiledModel.create(
+    context.assets,
+    "model_fp16.tflite",
+    CompiledModel.Options(Accelerator.GPU),
+    env,
+)
+```
+
+If using the older TensorFlow Lite `Interpreter` GPU delegate instead of LiteRT `CompiledModel`, enable FP16/reduced precision in the GPU delegate options.
+"""
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    (diagnostics_dir / "pixel10_gpu_runtime_notes.md").write_text(notes, encoding="utf-8")
+
+
+def _save_pixel10_sample_audio(
+    exports: Sequence[tuple[InferenceSample, Path, Path]],
+    output_dir: Path,
+    sample_rate: int,
+    multisig_path: Path | None = None,
+    dynamic_path: Path | None = None,
+    dynamic_frame_max: int | None = None,
+) -> None:
+    wav_dir = output_dir / "sample_audio"
+    wav_dir.mkdir(parents=True, exist_ok=True)
+
+    for sample, staging_path, fp16_path in exports:
+        input_np = sample.features.float().unsqueeze(0).numpy().astype(np.float32)
+        staging_pred = _run_litert_inference(staging_path, input_np)
+        save_wav_16bit(wav_dir / f"{sample.tag}_fp32_staging_litert.wav", staging_pred, sample_rate)
+
+        fp16_pred = _run_litert_inference(fp16_path, input_np)
+        save_wav_16bit(wav_dir / f"{sample.tag}_fp16_litert.wav", fp16_pred, sample_rate)
+
+        if multisig_path is not None and multisig_path.exists():
+            frames = int(sample.features.shape[-1])
+            multisig_pred = _run_litert_inference(multisig_path, input_np, signature_name=f"frames_{frames}")
+            save_wav_16bit(wav_dir / f"{sample.tag}_fp16_multisig_litert.wav", multisig_pred, sample_rate)
+
+        if dynamic_path is not None and dynamic_path.exists():
+            frames = int(sample.features.shape[-1])
+            if dynamic_frame_max is None or frames <= int(dynamic_frame_max):
+                try:
+                    dynamic_pred = _run_litert_inference(dynamic_path, input_np)
+                except Exception as exc:
+                    logger.warning(f"Skipping dynamic sample audio for {sample.tag}: {exc}")
+                else:
+                    save_wav_16bit(wav_dir / f"{sample.tag}_fp16_dynamic_litert.wav", dynamic_pred, sample_rate)
 
 
 def _shape_numel(shape: np.ndarray | list[int] | tuple[int, ...]) -> int:
@@ -1721,7 +2248,7 @@ def main() -> None:
 
     config, fp32_model, fp16_model = _load_models(args)
 
-    if args.pixel10_fp16_aot:
+    if args.pixel10_fp16_gpu or args.pixel10_fp16_aot:
         _run_pixel10_fp16_aot(args=args, config=config, fp16_model=fp16_model)
         return
 
