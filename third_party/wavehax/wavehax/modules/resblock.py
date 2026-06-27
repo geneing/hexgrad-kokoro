@@ -40,6 +40,7 @@ class ConvNeXtBlock2d(nn.Module):
         drop_prob: float = 0.0,
         use_layer_norm: bool = True,
         framewise_norm: bool = True,
+        padding_mode: str = "zeros",
         layer_scale_init_value: float = None,
     ) -> None:
         """
@@ -68,7 +69,7 @@ class ConvNeXtBlock2d(nn.Module):
             padding=(kernel_size[0] // 2, kernel_size[1] // 2),
             groups=channels,
             bias=False,
-            padding_mode="reflect",
+            padding_mode=padding_mode,
         )
         if use_layer_norm:
             self.norm = LayerNorm2d(channels, framewise=framewise_norm)
@@ -120,6 +121,7 @@ class ComplexConvNeXtBlock2d(nn.Module):
         drop_prob: float = 0.0,
         use_layer_norm: bool = True,
         framewise_norm: bool = True,
+        padding_mode: str = "zeros",
         layer_scale_init_value: float = None,
     ) -> None:
         """
@@ -149,7 +151,7 @@ class ComplexConvNeXtBlock2d(nn.Module):
             padding=(kernel_size[0] // 2, kernel_size[1] // 2),
             groups=channels,
             bias=False,
-            padding_mode="reflect",
+            padding_mode=padding_mode,
         )
         if use_layer_norm:
             self.norm = ComplexLayerNorm2d(channels, framewise=framewise_norm)

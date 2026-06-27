@@ -13,6 +13,8 @@ from torch import Tensor, nn
 
 import wavehax.modules
 from wavehax.modules import (
+    BatchNorm2d,
+    RealDFTSTFT,
     STFT,
     ComplexConv1d,
     ComplexConv2d,
@@ -23,6 +25,39 @@ from wavehax.modules import (
     to_log_magnitude_and_phase,
     to_real_imaginary,
 )
+
+
+def deterministic_pcph_closed_form(
+    f0: Tensor,
+    hop_length: int,
+    sample_rate: int,
+    power_factor: float = 0.1,
+    max_frequency: float | None = None,
+    epsilon: float = 1e-6,
+) -> Tensor:
+    """Deterministic pseudo-constant-power harmonic prior for export-safe inference."""
+
+    f0_upsampled = torch.nn.functional.interpolate(f0, scale_factor=hop_length, mode="linear", align_corners=False)
+    phase_increment = f0_upsampled / float(sample_rate)
+    phase = torch.cumsum(phase_increment, dim=2) * (2.0 * torch.pi)
+    phase = torch.fmod(phase, 2.0 * torch.pi)
+
+    limit_freq = float(max_frequency) if max_frequency is not None else float(sample_rate) / 2.0
+    safe_f0 = torch.clamp(f0_upsampled, min=1e-5)
+    n_harmonics = torch.floor(limit_freq / safe_f0)
+
+    half_phase = phase / 2.0
+    numerator = torch.cos(half_phase) - torch.cos((n_harmonics + 0.5) * phase)
+    denominator = 2.0 * torch.sin(half_phase)
+    harmonics = torch.where(
+        torch.abs(denominator) > float(epsilon),
+        numerator / denominator,
+        torch.zeros_like(phase),
+    )
+
+    amp_scale = float(power_factor) * torch.sqrt(2.0 / torch.clamp(n_harmonics, min=1.0))
+    vuv_mask = (f0_upsampled > 0.0).to(dtype=f0_upsampled.dtype)
+    return harmonics * amp_scale * vuv_mask
 
 
 class WavehaxGenerator(nn.Module):
@@ -49,6 +84,7 @@ class WavehaxGenerator(nn.Module):
         framewise_norm: bool = False,
         use_logmag_phase: bool = False,
         use_gradient_checkpointing: bool = False,
+        padding_mode: str = "zeros",
     ) -> None:
         """
         Initialize the WavehaxGenerator module.
@@ -76,6 +112,7 @@ class WavehaxGenerator(nn.Module):
         self.sample_rate = sample_rate
         self.use_logmag_phase = use_logmag_phase
         self.use_gradient_checkpointing = bool(use_gradient_checkpointing)
+        self.padding_mode = str(padding_mode)
 
         # Prior waveform generator
         self.prior_generator = partial(
@@ -90,10 +127,10 @@ class WavehaxGenerator(nn.Module):
         # Input projection layers
         n_bins = n_fft // 2 + 1
         self.prior_proj = nn.Conv1d(
-            n_bins, n_bins, 7, padding=3, padding_mode="reflect"
+            n_bins, n_bins, 7, padding=3, padding_mode=self.padding_mode
         )
         self.cond_proj = nn.Conv1d(
-            in_channels, n_bins, 7, padding=3, padding_mode="reflect"
+            in_channels, n_bins, 7, padding=3, padding_mode=self.padding_mode
         )
 
         # Input normalization and projection layers
@@ -110,6 +147,7 @@ class WavehaxGenerator(nn.Module):
                 drop_prob=drop_prob,
                 use_layer_norm=use_layer_norm,
                 framewise_norm=framewise_norm,
+                padding_mode=self.padding_mode,
                 layer_scale_init_value=1 / num_blocks,
             )
             self.blocks += [block]
@@ -213,6 +251,7 @@ class ComplexWavehaxGenerator(nn.Module):
         use_layer_norm: bool = True,
         framewise_norm: bool = False,
         init_weights: bool = False,
+        padding_mode: str = "zeros",
     ) -> None:
         """
         Initialize the ComplexWavehaxGenerator module.
@@ -240,6 +279,7 @@ class ComplexWavehaxGenerator(nn.Module):
         self.n_bins = n_fft // 2 + 1
         self.hop_length = hop_length
         self.sample_rate = sample_rate
+        self.padding_mode = str(padding_mode)
 
         # Prior waveform generator
         self.prior_generator = partial(
@@ -254,10 +294,10 @@ class ComplexWavehaxGenerator(nn.Module):
         # Input projection layers
         n_bins = n_fft // 2 + 1
         self.prior_proj = ComplexConv1d(
-            n_bins, n_bins, 7, padding=3, padding_mode="reflect"
+            n_bins, n_bins, 7, padding=3, padding_mode=self.padding_mode
         )
         self.cond_proj = ComplexConv1d(
-            in_channels, n_bins, 7, padding=3, padding_mode="reflect"
+            in_channels, n_bins, 7, padding=3, padding_mode=self.padding_mode
         )
 
         # Input normalization and projection layers
@@ -274,6 +314,7 @@ class ComplexWavehaxGenerator(nn.Module):
                 drop_prob=drop_prob,
                 use_layer_norm=use_layer_norm,
                 framewise_norm=framewise_norm,
+                padding_mode=self.padding_mode,
                 layer_scale_init_value=1 / num_blocks,
             )
             self.blocks += [block]
@@ -367,6 +408,9 @@ class MultiScaleWavehaxGenerator(nn.Module):
         drop_prob: float = 0.0,
         framewise_norm: bool = True,
         use_gradient_checkpointing: bool = False,
+        norm_type: str = "layer",
+        padding_mode: str = "zeros",
+        export_safe_ops: bool = False,
     ) -> None:
         """
         Initialize the MultiScaleWavehaxGenerator module.
@@ -396,29 +440,53 @@ class MultiScaleWavehaxGenerator(nn.Module):
         self.hop_length = hop_length
         self.sample_rate = sample_rate
         self.use_gradient_checkpointing = bool(use_gradient_checkpointing)
+        self.norm_type = str(norm_type)
+        self.padding_mode = str(padding_mode)
+        self.export_safe_ops = bool(export_safe_ops)
+        if self.norm_type not in {"layer", "batch"}:
+            raise ValueError(f"Unsupported norm_type={self.norm_type}")
 
         # Define signal decomposition module
         self.num_splits = num_splits
-        self.decomposer = getattr(wavehax.modules, decomposer)(num_splits)
+        decomposer_cls = getattr(wavehax.modules, decomposer)
+        if decomposer == "MultiStream1d":
+            self.decomposer = decomposer_cls(
+                num_splits,
+                padding_mode=self.padding_mode,
+                export_safe_synthesis=self.export_safe_ops,
+            )
+        else:
+            self.decomposer = decomposer_cls(num_splits)
 
         # Prior waveform generator
-        self.prior_generator = partial(
-            getattr(wavehax.modules, f"generate_{prior_type}"),
-            hop_length=self.hop_length,
-            sample_rate=sample_rate,
-        )
+        if self.export_safe_ops and prior_type == "pcph_closed_form":
+            self.prior_generator = partial(
+                deterministic_pcph_closed_form,
+                hop_length=self.hop_length,
+                sample_rate=sample_rate,
+            )
+        else:
+            self.prior_generator = partial(
+                getattr(wavehax.modules, f"generate_{prior_type}"),
+                hop_length=self.hop_length,
+                sample_rate=sample_rate,
+            )
 
         # STFT layer
-        self.stft = STFT(n_fft=n_fft, hop_length=hop_length // num_splits)
+        stft_cls = RealDFTSTFT if self.export_safe_ops else STFT
+        self.stft = stft_cls(n_fft=n_fft, hop_length=hop_length // num_splits)
 
         # Input projection layers
         self.cond_proj = nn.Conv1d(
-            in_channels, num_splits * self.n_bins, 7, padding=3, padding_mode="reflect"
+            in_channels, num_splits * self.n_bins, 7, padding=3, padding_mode=self.padding_mode
         )
 
         # Input normalization and projection layers
         self.input_proj = nn.Conv2d(3 * num_splits, channels, 1, bias=False)
-        self.input_norm = LayerNorm2d(channels, framewise=framewise_norm)
+        if self.norm_type == "batch":
+            self.input_norm = BatchNorm2d(channels)
+        else:
+            self.input_norm = LayerNorm2d(channels, framewise=framewise_norm)
 
         # ConvNeXt-based residual blocks
         self.blocks = nn.ModuleList()
@@ -428,13 +496,18 @@ class MultiScaleWavehaxGenerator(nn.Module):
                 mult_channels,
                 kernel_size,
                 drop_prob=drop_prob,
+                use_layer_norm=self.norm_type == "layer",
                 framewise_norm=framewise_norm,
+                padding_mode=self.padding_mode,
                 layer_scale_init_value=1 / num_blocks,
             )
             self.blocks += [block]
 
         # Output projection and normalization layers
-        self.output_norm = LayerNorm2d(channels, framewise=framewise_norm)
+        if self.norm_type == "batch":
+            self.output_norm = BatchNorm2d(channels)
+        else:
+            self.output_norm = LayerNorm2d(channels, framewise=framewise_norm)
         self.output_proj = nn.Conv2d(channels, 2 * num_splits, 1)
 
         # Initialize weights

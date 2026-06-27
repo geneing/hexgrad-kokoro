@@ -100,8 +100,11 @@ class KokoroMultiScaleWavehaxGenerator(nn.Module):
             sample_rate=int(sample_rate),
             prior_type=str(config["prior_type"]),
             drop_prob=float(config["drop_prob"]),
-            framewise_norm=bool(config["framewise_norm"]),
+            framewise_norm=bool(config.get("framewise_norm", True)),
             use_gradient_checkpointing=False,
+            norm_type=str(config.get("norm_type", "layer")),
+            padding_mode=str(config.get("padding_mode", "reflect")),
+            export_safe_ops=bool(config.get("export_safe_ops", False)),
         )
 
     def forward(self, features: Tensor) -> Tensor:
@@ -111,12 +114,114 @@ class KokoroMultiScaleWavehaxGenerator(nn.Module):
         return audio[:, 0, :] if audio.ndim == 3 and audio.shape[1] == 1 else audio
 
 
+class StreamingWavehaxChunk(nn.Module):
+    """Fixed-shape chunk wrapper with explicit state tensors for TFLite-style loops."""
+
+    def __init__(
+        self,
+        model: KokoroMultiScaleWavehaxGenerator,
+        chunk_frames: int = 24,
+        feature_channels: int = 642,
+        sample_rate: int = 24000,
+        hop_length: int = 300,
+    ):
+        super().__init__()
+        self.model = model.eval()
+        self.chunk_frames = int(chunk_frames)
+        self.feature_channels = int(feature_channels)
+        self.sample_rate = int(sample_rate)
+        self.hop_length = int(hop_length)
+        self.chunk_samples = self.chunk_frames * self.hop_length
+
+    def initial_state(self, device: torch.device | None = None, dtype: torch.dtype = torch.float32) -> tuple[Tensor, Tensor, Tensor]:
+        if device is None:
+            try:
+                device = next(self.parameters()).device
+            except StopIteration:
+                device = torch.device("cpu")
+        feature_state = torch.zeros(1, self.feature_channels, self.chunk_frames, device=device, dtype=dtype)
+        prior_phase = torch.zeros(1, 1, 1, device=device, dtype=dtype)
+        output_buffer = torch.zeros(1, self.chunk_samples, device=device, dtype=dtype)
+        return feature_state, prior_phase, output_buffer
+
+    def forward(
+        self,
+        features_chunk: Tensor,
+        feature_state: Tensor,
+        prior_phase: Tensor,
+        output_buffer: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        if features_chunk.shape != (1, self.feature_channels, self.chunk_frames):
+            raise ValueError(
+                f"Expected features_chunk [1,{self.feature_channels},{self.chunk_frames}], got {tuple(features_chunk.shape)}"
+            )
+        full_features = torch.cat([feature_state, features_chunk], dim=-1)
+        full_audio = self.model(full_features)
+        audio_chunk = full_audio[..., : self.chunk_samples] + output_buffer * 0.0
+        next_feature_state = full_features[..., -self.chunk_frames :].contiguous()
+
+        f0 = features_chunk[:, 512:513, :]
+        f0_audio = F.interpolate(f0, scale_factor=self.hop_length, mode="linear", align_corners=False)
+        phase_delta = f0_audio.sum(dim=-1, keepdim=True) * (2.0 * torch.pi / float(self.sample_rate))
+        next_prior_phase = torch.fmod(prior_phase + phase_delta, 2.0 * torch.pi)
+        next_output_buffer = audio_chunk
+        return audio_chunk, next_feature_state, next_prior_phase, next_output_buffer
+
+
+class StreamingKokoroWavehax:
+    def __init__(self, model: KokoroMultiScaleWavehaxGenerator, chunk_frames: int, sample_rate: int, hop_length: int):
+        self.chunk = StreamingWavehaxChunk(
+            model=model,
+            chunk_frames=chunk_frames,
+            sample_rate=sample_rate,
+            hop_length=hop_length,
+        )
+
+    @torch.inference_mode()
+    def synthesize(self, features: Tensor) -> Tensor:
+        if features.ndim != 3 or features.shape[0] != 1:
+            raise ValueError(f"Expected features [1,642,T], got {tuple(features.shape)}")
+        device = features.device
+        dtype = features.dtype
+        feature_state, prior_phase, output_buffer = self.chunk.initial_state(device=device, dtype=dtype)
+        outputs: list[Tensor] = []
+        frames = int(features.shape[-1])
+        pos = 0
+        while pos < frames:
+            valid = min(self.chunk.chunk_frames, frames - pos)
+            chunk = features[..., pos : pos + valid]
+            if valid < self.chunk.chunk_frames:
+                chunk = F.pad(chunk, (0, self.chunk.chunk_frames - valid))
+            audio, feature_state, prior_phase, output_buffer = self.chunk(
+                chunk,
+                feature_state,
+                prior_phase,
+                output_buffer,
+            )
+            if pos > 0:
+                outputs.append(audio)
+            pos += valid
+
+        zero_flush = torch.zeros(1, self.chunk.feature_channels, self.chunk.chunk_frames, device=device, dtype=dtype)
+        audio, feature_state, prior_phase, output_buffer = self.chunk(
+            zero_flush,
+            feature_state,
+            prior_phase,
+            output_buffer,
+        )
+        del feature_state, prior_phase, output_buffer
+        outputs.append(audio[..., : ((frames - 1) % self.chunk.chunk_frames + 1) * self.chunk.hop_length])
+        return torch.cat(outputs, dim=-1)[..., : frames * self.chunk.hop_length] if outputs else torch.empty(1, 0)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Generate Wavehax WAVs from Kokoro feature .pt files using PyTorch")
     parser.add_argument("--checkpoint", type=Path, default=Path("models/wavehax/last.pt"))
     parser.add_argument("--input-feature-glob", action="append", default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("runs/wavehax_streaming"))
     parser.add_argument("--sample-rate", type=int, default=24000)
+    parser.add_argument("--hop-length", type=int, default=300)
+    parser.add_argument("--chunk-frames", type=int, default=24)
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     return parser.parse_args()
 
@@ -136,6 +241,28 @@ def audio_stats(audio: np.ndarray) -> tuple[float, float]:
     rms = float(np.sqrt(np.mean(waveform * waveform))) if waveform.size else 0.0
     peak = float(np.max(np.abs(waveform))) if waveform.size else 0.0
     return rms, peak
+
+
+def comparison_metrics(reference: np.ndarray, candidate: np.ndarray, chunk_samples: int) -> dict[str, float]:
+    ref = np.nan_to_num(np.asarray(reference, dtype=np.float32).reshape(-1))
+    pred = np.nan_to_num(np.asarray(candidate, dtype=np.float32).reshape(-1))
+    n = min(ref.size, pred.size)
+    ref = ref[:n]
+    pred = pred[:n]
+    diff = pred - ref
+    corr = float(np.corrcoef(ref, pred)[0, 1]) if n > 1 and np.std(ref) > 0 and np.std(pred) > 0 else 0.0
+    boundary = 0.0
+    if chunk_samples > 0 and pred.size > chunk_samples:
+        jumps = []
+        for idx in range(chunk_samples, pred.size, chunk_samples):
+            jumps.append(abs(float(pred[idx] - pred[idx - 1])))
+        boundary = float(np.mean(jumps)) if jumps else 0.0
+    return {
+        "mae": float(np.mean(np.abs(diff))) if n else 0.0,
+        "rmse": float(np.sqrt(np.mean(diff * diff))) if n else 0.0,
+        "corr": corr,
+        "boundary_click": boundary,
+    }
 
 
 def feature_paths_from_globs(patterns: Sequence[str]) -> list[Path]:
@@ -211,6 +338,24 @@ def main() -> None:
             save_wav_16bit(torch_path, torch_audio, args.sample_rate)
             torch_rms, torch_peak = audio_stats(torch_audio)
             print(f"Wrote {torch_path} shape={tuple(torch_audio.shape)} rms={torch_rms:.6f} peak={torch_peak:.6f}")
+
+            streamer = StreamingKokoroWavehax(
+                model=model,
+                chunk_frames=args.chunk_frames,
+                sample_rate=args.sample_rate,
+                hop_length=args.hop_length,
+            )
+            stream_audio = streamer.synthesize(features).detach().cpu().numpy()
+            stream_path = args.output_dir / f"{path.stem}_streaming_{args.chunk_frames}f.wav"
+            save_wav_16bit(stream_path, stream_audio, args.sample_rate)
+            stream_rms, stream_peak = audio_stats(stream_audio)
+            metrics = comparison_metrics(torch_audio, stream_audio, args.chunk_frames * args.hop_length)
+            print(
+                f"Wrote {stream_path} shape={tuple(stream_audio.shape)} "
+                f"rms={stream_rms:.6f} peak={stream_peak:.6f} "
+                f"mae={metrics['mae']:.6f} rmse={metrics['rmse']:.6f} "
+                f"corr={metrics['corr']:.6f} boundary={metrics['boundary_click']:.6f}"
+            )
 
 
 if __name__ == "__main__":

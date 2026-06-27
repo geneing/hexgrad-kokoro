@@ -173,7 +173,13 @@ class MultiStream1d(nn.Module):
         (https://ast-astrec.nict.go.jp/release/preprints/preprint_asru_2021_okamoto.pdf)
     """
 
-    def __init__(self, num_split: int = 4, taps: int = 62) -> None:
+    def __init__(
+        self,
+        num_split: int = 4,
+        taps: int = 62,
+        padding_mode: str = "zeros",
+        export_safe_synthesis: bool = False,
+    ) -> None:
         """Initilize MultiStream1d module.
 
         Args:
@@ -182,12 +188,16 @@ class MultiStream1d(nn.Module):
         """
         super().__init__()
         self.num_split = num_split
+        self.export_safe_synthesis = bool(export_safe_synthesis)
 
         # Initialize a filter for downsampling and upsampling.
         updown_filter = torch.zeros((num_split, num_split, num_split)).float()
         for k in range(num_split):
             updown_filter[k, k, 0] = 1.0
         self.register_buffer("updown_filter", updown_filter)
+        upsample_mask = torch.zeros(1, 1, num_split).float()
+        upsample_mask[..., 0] = float(num_split)
+        self.register_buffer("upsample_mask", upsample_mask)
 
         # Define analysis and synthesis convolutions based on the causal mode
         self.conv_analysis = nn.Conv1d(
@@ -195,7 +205,7 @@ class MultiStream1d(nn.Module):
             num_split,
             taps + 1,
             padding=taps // 2,
-            padding_mode="reflect",
+            padding_mode=padding_mode,
             bias=False,
         )
         self.conv_synthesis = nn.Conv1d(
@@ -203,7 +213,7 @@ class MultiStream1d(nn.Module):
             1,
             taps + 1,
             padding=taps // 2,
-            padding_mode="reflect",
+            padding_mode=padding_mode,
             bias=False,
         )
 
@@ -236,9 +246,14 @@ class MultiStream1d(nn.Module):
             len(xs) == self.num_split
         ), f"Expected {self.num_split} subscales, but got {len(xs)}."
         x = torch.cat(xs, dim=1)
-        x = F.conv_transpose1d(
-            x, self.updown_filter * self.num_split, stride=self.num_split
-        )
+        if self.export_safe_synthesis:
+            frames = x.shape[-1]
+            x = x.repeat_interleave(self.num_split, dim=2)
+            x = x * self.upsample_mask.to(dtype=x.dtype, device=x.device).repeat(1, 1, frames)
+        else:
+            x = F.conv_transpose1d(
+                x, self.updown_filter * self.num_split, stride=self.num_split
+            )
         x = self.conv_synthesis(x)
         return x
 

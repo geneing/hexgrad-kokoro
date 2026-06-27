@@ -35,8 +35,10 @@ class KokoroMultiScaleWavehaxGenerator(nn.Module):
         control_channels: int,
         control_layers: int,
         drop_prob: float,
-        framewise_norm: bool,
         use_gradient_checkpointing: bool,
+        norm_type: str,
+        padding_mode: str,
+        export_safe_ops: bool,
     ):
         super().__init__()
         self.conditioner = KokoroFeatureConditioner(
@@ -57,8 +59,11 @@ class KokoroMultiScaleWavehaxGenerator(nn.Module):
             sample_rate=sample_rate,
             prior_type=prior_type,
             drop_prob=drop_prob,
-            framewise_norm=framewise_norm,
+            framewise_norm=True,
             use_gradient_checkpointing=use_gradient_checkpointing,
+            norm_type=norm_type,
+            padding_mode=padding_mode,
+            export_safe_ops=export_safe_ops,
         )
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
@@ -93,13 +98,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-splits", type=int, default=5)
     parser.add_argument("--prior-type", type=str, default="pcph_closed_form")
     parser.add_argument("--drop-prob", type=float, default=0.0)
-    parser.add_argument("--framewise-norm", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--chunk-frames", type=int, default=24)
+    parser.add_argument("--norm-type", choices=("batch",), default="batch")
+    parser.add_argument("--padding-mode", choices=("zeros",), default="zeros")
+    parser.add_argument("--export-safe-ops", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 
+def assert_no_layer_norm(module: nn.Module) -> None:
+    offenders = [name for name, child in module.named_modules() if child.__class__.__name__.startswith("LayerNorm")]
+    if offenders:
+        raise RuntimeError(f"Strict-BN Wavehax must not contain LayerNorm modules: {offenders[:8]}")
+
+
 def build_generator(args: argparse.Namespace) -> nn.Module:
-    return KokoroMultiScaleWavehaxGenerator(
+    model = KokoroMultiScaleWavehaxGenerator(
         model_input_channels=args.model_input_channels,
         n_fft=args.n_fft,
         hop_length=args.hop_length,
@@ -114,15 +128,24 @@ def build_generator(args: argparse.Namespace) -> nn.Module:
         control_channels=args.control_channels,
         control_layers=args.control_layers,
         drop_prob=args.drop_prob,
-        framewise_norm=args.framewise_norm,
         use_gradient_checkpointing=args.gradient_checkpointing,
+        norm_type=args.norm_type,
+        padding_mode=args.padding_mode,
+        export_safe_ops=args.export_safe_ops,
     )
+    assert_no_layer_norm(model)
+    return model
 
 
 def main() -> None:
     args = parse_args()
+    if args.resume:
+        resume = torch.load(args.resume, map_location="cpu", weights_only=False)
+        resume_config = resume.get("backend_config", {}) if isinstance(resume, dict) else {}
+        if resume_config.get("norm_type") != "batch" or not bool(resume_config.get("export_safe_ops")):
+            raise ValueError("Strict-BN export-friendly Wavehax training cannot resume from an older LN/non-export-safe checkpoint.")
     backend_config: Dict[str, object] = {
-        "model": "third_party/wavehax/mswavehax",
+        "model": "third_party/wavehax/mswavehax_export_safe_streaming",
         "model_input_channels": args.model_input_channels,
         "channels": args.channels,
         "mult_channels": args.mult_channels,
@@ -132,7 +155,11 @@ def main() -> None:
         "num_splits": args.num_splits,
         "prior_type": args.prior_type,
         "drop_prob": args.drop_prob,
-        "framewise_norm": args.framewise_norm,
+        "framewise_norm": True,
+        "norm_type": args.norm_type,
+        "padding_mode": args.padding_mode,
+        "export_safe_ops": args.export_safe_ops,
+        "chunk_frames": args.chunk_frames,
         "use_gradient_checkpointing": args.gradient_checkpointing,
         "n_fft": args.n_fft,
         "hop_length": args.hop_length,

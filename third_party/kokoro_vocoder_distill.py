@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import math
 import random
 import time
 import wave
@@ -220,6 +222,9 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--pretrain-steps", type=int, default=5000)
     parser.add_argument("--gen-lr", type=float, default=1e-4)
     parser.add_argument("--disc-lr", type=float, default=.5e-4)
+    parser.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="bf16")
+    parser.add_argument("--lr-schedule", choices=("none", "cosine"), default="cosine")
+    parser.add_argument("--lr-min-ratio", type=float, default=0.05)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--gan-loss-coeff", type=float, default=1.0)
     parser.add_argument("--fm-loss-coeff", type=float, default=2.0)
@@ -392,6 +397,47 @@ def resolve_device(name: str) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def autocast_context(device: torch.device, precision: str):
+    if device.type != "cuda" or precision == "fp32":
+        return contextlib.nullcontext()
+    dtype = torch.bfloat16 if precision == "bf16" else torch.float16
+    return torch.autocast(device_type="cuda", dtype=dtype)
+
+
+def make_grad_scaler(device: torch.device, precision: str):
+    enabled = device.type == "cuda" and precision == "fp16"
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except TypeError:  # pragma: no cover - compatibility with older torch signatures
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def make_lr_scheduler(optimizer: torch.optim.Optimizer, args: argparse.Namespace):
+    if args.lr_schedule == "none":
+        return None
+    min_ratio = float(args.lr_min_ratio)
+    if not 0.0 <= min_ratio <= 1.0:
+        raise ValueError(f"--lr-min-ratio must be between 0 and 1, got {min_ratio}")
+    max_steps = max(1, int(args.max_steps))
+
+    def lr_lambda(step: int) -> float:
+        progress = min(max(0, int(step)), max_steps) / float(max_steps)
+        return min_ratio + 0.5 * (1.0 - min_ratio) * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def sync_scheduler_to_step(scheduler, step: int) -> None:
+    if scheduler is None:
+        return
+    step = max(0, int(step))
+    scheduler.last_epoch = step
+    lrs = [base_lr * fn(step) for base_lr, fn in zip(scheduler.base_lrs, scheduler.lr_lambdas)]
+    for group, lr in zip(scheduler.optimizer.param_groups, lrs):
+        group["lr"] = lr
+    scheduler._last_lr = lrs
+
+
 def train_decoder(
     args: argparse.Namespace,
     backend_name: str,
@@ -452,6 +498,9 @@ def train_decoder(
         betas=(0.8, 0.9),
         weight_decay=args.weight_decay,
     )
+    gen_sched = make_lr_scheduler(gen_opt, args)
+    disc_sched = make_lr_scheduler(disc_opt, args)
+    scaler = make_grad_scaler(device, args.precision)
     disc_loss_fn = DiscriminatorLoss()
     gen_loss_fn = GeneratorLoss()
     fm_loss_fn = FeatureMatchingLoss()
@@ -479,6 +528,8 @@ def train_decoder(
     )
     if plt is None:
         logger.warning("matplotlib is not installed; TensorBoard mel plot logging is disabled.")
+    if device.type != "cuda" and args.precision != "fp32":
+        logger.warning(f"precision={args.precision} requested on device={device}; autocast is disabled outside CUDA.")
 
     step = 0
     if args.resume:
@@ -488,9 +539,23 @@ def train_decoder(
         mrd.load_state_dict(ckpt["mrd"])
         gen_opt.load_state_dict(ckpt["gen_opt"])
         disc_opt.load_state_dict(ckpt["disc_opt"])
+        if gen_sched is not None and "gen_sched" in ckpt:
+            gen_sched.load_state_dict(ckpt["gen_sched"])
+        if disc_sched is not None and "disc_sched" in ckpt:
+            disc_sched.load_state_dict(ckpt["disc_sched"])
+        if scaler.is_enabled() and "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
         step = int(ckpt.get("step", 0))
+        if gen_sched is not None and "gen_sched" not in ckpt:
+            sync_scheduler_to_step(gen_sched, step)
+        if disc_sched is not None and "disc_sched" not in ckpt:
+            sync_scheduler_to_step(disc_sched, step)
 
     logger.info(f"Training {backend_name} on device={device}; tensorboard={tb_dir}")
+    logger.info(
+        f"Precision={args.precision} scaler_enabled={scaler.is_enabled()} "
+        f"lr_schedule={args.lr_schedule} lr_min_ratio={args.lr_min_ratio}"
+    )
     logger.info(
         f"Memory budget: batch_size={current_batch_size} min_batch_size={min_batch_size} "
         f"frame_cap={current_frame_cap} min_frame_cap={min_frame_cap}"
@@ -512,20 +577,29 @@ def train_decoder(
                     try:
                         features = batch_local["features"].to(device, non_blocking=True)  # type: ignore[union-attr]
                         real = batch_local["audio"].to(device, non_blocking=True)  # type: ignore[union-attr]
-                        fake = generator(features)
-                        fake, real = align_audio(fake, real)
+                        with autocast_context(device, args.precision):
+                            fake = generator(features)
+                            fake, real = align_audio(fake, real)
 
                         adv = step >= args.pretrain_steps
                         if adv:
                             disc_opt.zero_grad(set_to_none=True)
-                            real_mp, fake_mp, _, _ = mpd(real, fake.detach())
-                            real_mrd, fake_mrd, _, _ = mrd(real, fake.detach())
-                            d_mp, _, _ = disc_loss_fn(real_mp, fake_mp)
-                            d_mrd, _, _ = disc_loss_fn(real_mrd, fake_mrd)
-                            d_loss = d_mp + args.mrd_loss_coeff * d_mrd
-                            d_loss.backward()
+                            with autocast_context(device, args.precision):
+                                real_mp, fake_mp, _, _ = mpd(real, fake.detach())
+                                real_mrd, fake_mrd, _, _ = mrd(real, fake.detach())
+                                d_mp, _, _ = disc_loss_fn(real_mp, fake_mp)
+                                d_mrd, _, _ = disc_loss_fn(real_mrd, fake_mrd)
+                                d_loss = d_mp + args.mrd_loss_coeff * d_mrd
+                            if scaler.is_enabled():
+                                scaler.scale(d_loss).backward()
+                                scaler.unscale_(disc_opt)
+                            else:
+                                d_loss.backward()
                             d_grad_norm = grad_norm(list(mpd.parameters()) + list(mrd.parameters()))
-                            disc_opt.step()
+                            if scaler.is_enabled():
+                                scaler.step(disc_opt)
+                            else:
+                                disc_opt.step()
                         else:
                             d_mp = torch.zeros((), device=device)
                             d_mrd = torch.zeros((), device=device)
@@ -533,36 +607,51 @@ def train_decoder(
                             d_grad_norm = 0.0
 
                         gen_opt.zero_grad(set_to_none=True)
-                        stft_loss = mrstft(fake, real)
-                        gd_loss = group_delay(fake, real)
-                        g_adv = torch.zeros((), device=device)
-                        g_fm = torch.zeros((), device=device)
-                        if adv:
-                            set_requires_grad(mpd, False)
-                            set_requires_grad(mrd, False)
-                            try:
-                                _, fake_mp, fmap_real_mp, fmap_fake_mp = mpd(real, fake)
-                                _, fake_mrd, fmap_real_mrd, fmap_fake_mrd = mrd(real, fake)
-                                g_mp, _ = gen_loss_fn(fake_mp)
-                                g_mrd, _ = gen_loss_fn(fake_mrd)
-                                g_adv = g_mp + args.mrd_loss_coeff * g_mrd
-                                g_fm = fm_loss_fn(fmap_real_mp, fmap_fake_mp) + args.mrd_loss_coeff * fm_loss_fn(
-                                    fmap_real_mrd, fmap_fake_mrd
-                                )
-                            finally:
-                                set_requires_grad(mpd, True)
-                                set_requires_grad(mrd, True)
-                        g_mrstft_weighted = args.mrstft_loss_coeff * stft_loss
-                        g_gd_weighted = args.group_delay_loss_coeff * gd_loss
-                        g_adv_weighted = args.gan_loss_coeff * g_adv
-                        g_fm_weighted = args.fm_loss_coeff * g_fm
-                        g_loss = g_mrstft_weighted + g_gd_weighted + g_adv_weighted + g_fm_weighted
-                        g_loss.backward()
+                        with autocast_context(device, args.precision):
+                            stft_loss = mrstft(fake, real)
+                            gd_loss = group_delay(fake, real)
+                            g_adv = torch.zeros((), device=device)
+                            g_fm = torch.zeros((), device=device)
+                            if adv:
+                                set_requires_grad(mpd, False)
+                                set_requires_grad(mrd, False)
+                                try:
+                                    _, fake_mp, fmap_real_mp, fmap_fake_mp = mpd(real, fake)
+                                    _, fake_mrd, fmap_real_mrd, fmap_fake_mrd = mrd(real, fake)
+                                    g_mp, _ = gen_loss_fn(fake_mp)
+                                    g_mrd, _ = gen_loss_fn(fake_mrd)
+                                    g_adv = g_mp + args.mrd_loss_coeff * g_mrd
+                                    g_fm = fm_loss_fn(fmap_real_mp, fmap_fake_mp) + args.mrd_loss_coeff * fm_loss_fn(
+                                        fmap_real_mrd, fmap_fake_mrd
+                                    )
+                                finally:
+                                    set_requires_grad(mpd, True)
+                                    set_requires_grad(mrd, True)
+                            g_mrstft_weighted = args.mrstft_loss_coeff * stft_loss
+                            g_gd_weighted = args.group_delay_loss_coeff * gd_loss
+                            g_adv_weighted = args.gan_loss_coeff * g_adv
+                            g_fm_weighted = args.fm_loss_coeff * g_fm
+                            g_loss = g_mrstft_weighted + g_gd_weighted + g_adv_weighted + g_fm_weighted
+                        if scaler.is_enabled():
+                            scaler.scale(g_loss).backward()
+                            scaler.unscale_(gen_opt)
+                        else:
+                            g_loss.backward()
                         g_grad_norm = grad_norm(generator.parameters())
-                        gen_opt.step()
+                        if scaler.is_enabled():
+                            scaler.step(gen_opt)
+                            scaler.update()
+                        else:
+                            gen_opt.step()
                         step += 1
+                        if gen_sched is not None:
+                            gen_sched.step()
+                        if disc_sched is not None:
+                            disc_sched.step()
 
-                        metrics = audio_metrics(fake.detach(), real.detach())
+                        fake_log = fake.detach().float()
+                        real_log = real.detach().float()
+                        metrics = audio_metrics(fake_log, real_log)
                         running = {
                             "gen_total": float(g_loss.item()),
                             "gen_mrstft_raw": float(stft_loss.item()),
@@ -582,6 +671,7 @@ def train_decoder(
                             "batch_size_configured": float(current_batch_size),
                             "target_frames": float(batch_local["target_frames"].item()),  # type: ignore[union-attr]
                             "adv_enabled": float(1.0 if adv else 0.0),
+                            "precision_fp16_scaler_scale": float(scaler.get_scale()) if scaler.is_enabled() else 1.0,
                             "lr_gen": float(gen_opt.param_groups[0]["lr"]),
                             "lr_disc": float(disc_opt.param_groups[0]["lr"]),
                             "time_step_ms": (time.perf_counter() - iter_start) * 1000.0,
@@ -612,8 +702,8 @@ def train_decoder(
                                 writer=writer,
                                 mel_transform=mel_transform,
                                 tag="train",
-                                real=real,
-                                fake=fake,
+                                real=real_log,
+                                fake=fake_log,
                                 step=step,
                                 sample_rate=args.sample_rate,
                                 sample_count=args.sample_count,
@@ -625,6 +715,7 @@ def train_decoder(
                                 generator=generator,
                                 loader=val_loader,
                                 device=device,
+                                precision=args.precision,
                                 mrstft=mrstft,
                                 group_delay=group_delay,
                                 backend_name=backend_name,
@@ -651,8 +742,34 @@ def train_decoder(
 
                         if step % max(1, args.save_every) == 0:
                             save_path = ckpt_dir / f"step_{step:08d}.pt"
-                            save_checkpoint(save_path, step, generator, mpd, mrd, gen_opt, disc_opt, backend_name, backend_config)
-                            save_checkpoint(ckpt_dir / "last.pt", step, generator, mpd, mrd, gen_opt, disc_opt, backend_name, backend_config)
+                            save_checkpoint(
+                                save_path,
+                                step,
+                                generator,
+                                mpd,
+                                mrd,
+                                gen_opt,
+                                disc_opt,
+                                gen_sched,
+                                disc_sched,
+                                scaler,
+                                backend_name,
+                                backend_config,
+                            )
+                            save_checkpoint(
+                                ckpt_dir / "last.pt",
+                                step,
+                                generator,
+                                mpd,
+                                mrd,
+                                gen_opt,
+                                disc_opt,
+                                gen_sched,
+                                disc_sched,
+                                scaler,
+                                backend_name,
+                                backend_config,
+                            )
                         break
                     except RuntimeError as exc:
                         if device.type != "cuda" or not maybe_oom(exc):
@@ -696,8 +813,34 @@ def train_decoder(
         writer.flush()
         writer.close()
 
-    save_checkpoint(ckpt_dir / "final.pt", step, generator, mpd, mrd, gen_opt, disc_opt, backend_name, backend_config)
-    save_checkpoint(ckpt_dir / "last.pt", step, generator, mpd, mrd, gen_opt, disc_opt, backend_name, backend_config)
+    save_checkpoint(
+        ckpt_dir / "final.pt",
+        step,
+        generator,
+        mpd,
+        mrd,
+        gen_opt,
+        disc_opt,
+        gen_sched,
+        disc_sched,
+        scaler,
+        backend_name,
+        backend_config,
+    )
+    save_checkpoint(
+        ckpt_dir / "last.pt",
+        step,
+        generator,
+        mpd,
+        mrd,
+        gen_opt,
+        disc_opt,
+        gen_sched,
+        disc_sched,
+        scaler,
+        backend_name,
+        backend_config,
+    )
 
 
 @torch.no_grad()
@@ -705,6 +848,7 @@ def validate_once(
     generator: nn.Module,
     loader: DataLoader,
     device: torch.device,
+    precision: str,
     mrstft: nn.Module,
     group_delay: nn.Module,
     backend_name: str,
@@ -732,11 +876,14 @@ def validate_once(
             break
         features = batch["features"].to(device, non_blocking=True)
         real = batch["audio"].to(device, non_blocking=True)
-        fake, real = align_audio(generator(features), real)
-        stft_loss = mrstft(fake, real)
-        gd_loss = group_delay(fake, real)
-        metric = audio_metrics(fake, real)
-        total = loss_weights["mrstft"] * stft_loss + loss_weights["group_delay"] * gd_loss
+        with autocast_context(device, precision):
+            fake, real = align_audio(generator(features), real)
+            stft_loss = mrstft(fake, real)
+            gd_loss = group_delay(fake, real)
+            total = loss_weights["mrstft"] * stft_loss + loss_weights["group_delay"] * gd_loss
+        fake_log = fake.detach().float()
+        real_log = real.detach().float()
+        metric = audio_metrics(fake_log, real_log)
         totals.append(float(total.item()))
         stfts.append(float(stft_loss.item()))
         gds.append(float(gd_loss.item()))
@@ -751,8 +898,8 @@ def validate_once(
                 writer=writer,
                 mel_transform=mel_transform,
                 tag="val",
-                real=real,
-                fake=fake,
+                real=real_log,
+                fake=fake_log,
                 step=step,
                 sample_rate=sample_rate,
                 sample_count=sample_count,
@@ -782,19 +929,26 @@ def save_checkpoint(
     mrd: nn.Module,
     gen_opt: torch.optim.Optimizer,
     disc_opt: torch.optim.Optimizer,
+    gen_sched,
+    disc_sched,
+    scaler,
     backend_name: str,
     backend_config: Dict[str, object],
 ) -> None:
-    torch.save(
-        {
-            "step": step,
-            "backend": backend_name,
-            "backend_config": backend_config,
-            "generator": generator.state_dict(),
-            "mpd": mpd.state_dict(),
-            "mrd": mrd.state_dict(),
-            "gen_opt": gen_opt.state_dict(),
-            "disc_opt": disc_opt.state_dict(),
-        },
-        path,
-    )
+    payload = {
+        "step": step,
+        "backend": backend_name,
+        "backend_config": backend_config,
+        "generator": generator.state_dict(),
+        "mpd": mpd.state_dict(),
+        "mrd": mrd.state_dict(),
+        "gen_opt": gen_opt.state_dict(),
+        "disc_opt": disc_opt.state_dict(),
+    }
+    if gen_sched is not None:
+        payload["gen_sched"] = gen_sched.state_dict()
+    if disc_sched is not None:
+        payload["disc_sched"] = disc_sched.state_dict()
+    if scaler.is_enabled():
+        payload["scaler"] = scaler.state_dict()
+    torch.save(payload, path)

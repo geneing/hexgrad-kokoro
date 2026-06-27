@@ -162,6 +162,105 @@ class STFT(nn.Module):
         return x
 
 
+class RealDFTSTFT(nn.Module):
+    """STFT/iSTFT using real DFT projections and regular convolutions only."""
+
+    def __init__(
+        self, n_fft: int, hop_length: int, window: Optional[str] = "hann_window"
+    ) -> None:
+        super().__init__()
+        self.n_fft = int(n_fft)
+        self.n_bins = self.n_fft // 2 + 1
+        self.hop_length = int(hop_length)
+
+        window_tensor = getattr(torch, window)(self.n_fft).reshape(1, self.n_fft, 1)
+        self.register_buffer("window", window_tensor.reshape(1, self.n_fft, 1))
+        self.register_buffer("window_envelope", window_tensor.square().reshape(1, self.n_fft, 1))
+        self.register_buffer("enframe_kernel", torch.eye(self.n_fft).unsqueeze(1))
+
+        n = torch.arange(self.n_fft, dtype=torch.float32).unsqueeze(0)
+        k = torch.arange(self.n_bins, dtype=torch.float32).unsqueeze(1)
+        angle = 2.0 * torch.pi * k * n / float(self.n_fft)
+        self.register_buffer("dft_cos", torch.cos(angle).unsqueeze(-1))
+        self.register_buffer("dft_sin", torch.sin(angle).unsqueeze(-1))
+
+        mid_k = torch.arange(1, self.n_bins - 1, dtype=torch.float32)
+        n_col = torch.arange(self.n_fft, dtype=torch.float32).unsqueeze(1)
+        mid_angle = 2.0 * torch.pi * n_col * mid_k.unsqueeze(0) / float(self.n_fft)
+        self.register_buffer("idft_cos_mid", torch.cos(mid_angle).unsqueeze(-1))
+        self.register_buffer("idft_sin_mid", torch.sin(mid_angle).unsqueeze(-1))
+        self.register_buffer(
+            "nyquist_sign",
+            torch.pow(torch.tensor(-1.0, dtype=torch.float32), torch.arange(self.n_fft, dtype=torch.float32)),
+        )
+
+        shift_kernel = torch.zeros(self.n_fft, 1, self.n_fft, dtype=torch.float32)
+        for c in range(self.n_fft):
+            shift_kernel[c, 0, self.n_fft - 1 - c] = 1.0
+        self.register_buffer("ola_shift_kernel", shift_kernel)
+        hop_mask = torch.zeros(1, 1, self.hop_length, dtype=torch.float32)
+        hop_mask[..., 0] = 1.0
+        self.register_buffer("hop_mask", hop_mask)
+
+    def forward(self, x: Tensor, norm: Optional[str] = None) -> Tuple[Tensor, Tensor]:
+        if norm is not None:
+            raise ValueError("RealDFTSTFT only supports norm=None")
+        pad = self.n_fft - self.hop_length
+        pad_left = pad // 2
+        x = F.pad(x, (pad_left, pad - pad_left))
+        x = x.unsqueeze(1) if x.dim() == 2 else x
+        x = F.conv1d(x, self.enframe_kernel.to(dtype=x.dtype), stride=self.hop_length)
+        x = x * self.window.to(dtype=x.dtype)
+        real = F.conv1d(x, self.dft_cos.to(dtype=x.dtype))
+        imag = -F.conv1d(x, self.dft_sin.to(dtype=x.dtype))
+        return real, imag
+
+    def inverse(self, real: Tensor, imag: Tensor, norm: Optional[str] = None) -> Tensor:
+        if norm is not None:
+            raise ValueError("RealDFTSTFT only supports norm=None")
+        assert real.shape == imag.shape and real.ndim == 3
+        assert real.size(1) == self.n_bins
+
+        frames = real.shape[2]
+        samples = frames * self.hop_length
+
+        dc = real[:, 0:1, :]
+        nyquist = real[:, -1:, :] * self.nyquist_sign.to(dtype=real.dtype).view(1, self.n_fft, 1)
+        real_mid = real[:, 1:-1, :]
+        imag_mid = imag[:, 1:-1, :]
+        inner = F.conv1d(real_mid, self.idft_cos_mid.to(dtype=real.dtype))
+        inner = inner - F.conv1d(imag_mid, self.idft_sin_mid.to(dtype=imag.dtype))
+        x = (dc + nyquist + 2.0 * inner) / float(self.n_fft)
+
+        x = x * self.window.to(dtype=x.dtype)
+        x = self._overlap_add(x)
+        window_envelope = self._overlap_add(self.window_envelope.to(dtype=x.dtype).repeat(1, 1, frames))
+
+        pad = (self.n_fft - self.hop_length) // 2
+        x = x[..., pad : samples + pad]
+        window_envelope = window_envelope[..., pad : samples + pad]
+        return x / window_envelope.clamp_min(1e-11)
+
+    def _overlap_add(self, x: Tensor) -> Tensor:
+        hop = int(self.hop_length)
+        if hop > 1:
+            frames = x.shape[-1]
+            x_up = x.repeat_interleave(hop, dim=2)
+            mask = self.hop_mask.to(dtype=x.dtype, device=x.device).repeat(1, 1, frames)
+            x_up = x_up * mask
+        else:
+            x_up = x
+        shifted = F.conv1d(
+            x_up,
+            self.ola_shift_kernel.to(dtype=x.dtype, device=x.device),
+            stride=1,
+            padding=self.n_fft - 1,
+            groups=self.n_fft,
+        )
+        out_size = (x.shape[-1] - 1) * hop + self.n_fft
+        return shifted.sum(dim=1, keepdim=True)[..., :out_size]
+
+
 class MelSpectrogram(nn.Module):
     """A module to compute a mel-spectrogram from waveforms."""
 
