@@ -9,11 +9,11 @@ import re
 import shlex
 import subprocess
 import time
-import wave
 from pathlib import Path
 from typing import Mapping
 
 import numpy as np
+from scipy.io import wavfile
 import torch
 
 
@@ -25,6 +25,15 @@ class Case:
     frames: int
     signature: str | None
     precision: str
+    input_layer: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class BenchTarget:
+    case: Case
+    model: str
+    signature: str | None
+    note: str = ""
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,9 +59,11 @@ RESULT_FIELDS = [
     "device_serial",
     "flavor",
     "model",
+    "benchmark_model",
     "sample",
     "frames",
     "signature",
+    "benchmark_signature",
     "run_index",
     "status",
     "delegate",
@@ -71,6 +82,7 @@ RESULT_FIELDS = [
     "raw_log",
     "warmup_iterations",
     "measured_iterations",
+    "benchmark_note",
     "error",
 ]
 
@@ -89,6 +101,84 @@ CASES: list[Case] = [
     Case("fp16_multisig", "vocos_fp16_multisig_static_litert.tflite", "af_alloy_00002_00", 1094, "frames_1094", "fp16"),
     Case("fp16_multisig", "vocos_fp16_multisig_static_litert.tflite", "af_alloy_00403_00", 1754, "frames_1754", "fp16"),
 ]
+
+WAVEHAX_CASES: list[Case] = [
+    Case("wavehax_fp16_fixed", "wavehax_fp16_af_alloy_00001_00_330f_litert.tflite", "af_alloy_00001_00", 330, None, "fp16"),
+    Case("wavehax_fp16_fixed", "wavehax_fp16_af_alloy_00002_00_1094f_litert.tflite", "af_alloy_00002_00", 1094, None, "fp16"),
+    Case("wavehax_fp16_fixed", "wavehax_fp16_af_alloy_00403_00_1754f_litert.tflite", "af_alloy_00403_00", 1754, None, "fp16"),
+    Case("wavehax_fp16_dynamic", "wavehax_fp16_dynamic_litert.tflite", "af_alloy_00001_00", 330, None, "fp16"),
+    Case("wavehax_fp16_dynamic", "wavehax_fp16_dynamic_litert.tflite", "af_alloy_00002_00", 1094, None, "fp16"),
+    Case("wavehax_fp16_dynamic", "wavehax_fp16_dynamic_litert.tflite", "af_alloy_00403_00", 1754, None, "fp16"),
+    Case("wavehax_fp16_multisig", "wavehax_fp16_multisig_static_litert.tflite", "af_alloy_00001_00", 330, "frames_330", "fp16"),
+    Case("wavehax_fp16_multisig", "wavehax_fp16_multisig_static_litert.tflite", "af_alloy_00002_00", 1094, "frames_1094", "fp16"),
+    Case("wavehax_fp16_multisig", "wavehax_fp16_multisig_static_litert.tflite", "af_alloy_00403_00", 1754, "frames_1754", "fp16"),
+]
+
+
+def configure_family(family: str) -> list[Case]:
+    global MODELS_DIR, OUT_DIR, INPUTS_DIR, LOGS_DIR, PROFILING_DIR, WAVS_DIR, PHONE_WAVS_DIR
+    global RESULTS_CSV, SUMMARY_MD, PUSHED_FILES_TXT, DEVICE_INFO_TXT, REMOTE
+    if family == "vocos":
+        cases = CASES
+        MODELS_DIR = ROOT / "runs/litert_vocos_pixel10_gpu_fp16"
+        REMOTE = "/data/local/tmp/kokoro_vocos_bench"
+    elif family == "wavehax":
+        cases = WAVEHAX_CASES
+        MODELS_DIR = ROOT / "runs/wavehax"
+        REMOTE = "/data/local/tmp/kokoro_wavehax_bench"
+    else:
+        raise ValueError(f"Unsupported benchmark family: {family}")
+
+    OUT_DIR = MODELS_DIR / "android_bench"
+    INPUTS_DIR = OUT_DIR / "inputs"
+    LOGS_DIR = OUT_DIR / "logs"
+    PROFILING_DIR = OUT_DIR / "profiling"
+    WAVS_DIR = OUT_DIR / "wavs"
+    PHONE_WAVS_DIR = OUT_DIR / "phone_wavs"
+    RESULTS_CSV = OUT_DIR / "results.csv"
+    SUMMARY_MD = OUT_DIR / "summary.md"
+    PUSHED_FILES_TXT = OUT_DIR / "pushed_files.txt"
+    DEVICE_INFO_TXT = OUT_DIR / "device_info.txt"
+    return cases
+
+
+def fixed_sample_model_name(case: Case) -> str | None:
+    candidates: list[str] = []
+    if case.model.startswith("wavehax_"):
+        candidates.append(f"wavehax_fp16_{case.sample}_{case.frames}f_litert.tflite")
+    elif case.model.startswith("vocos_"):
+        candidates.append(f"vocos_fp16_{case.sample}_{case.frames}f_litert.tflite")
+    for name in candidates:
+        if (MODELS_DIR / name).exists():
+            return name
+    return None
+
+
+def resolve_benchmark_targets(cases: list[Case]) -> list[BenchTarget]:
+    targets: list[BenchTarget] = []
+    for case in cases:
+        fallback = fixed_sample_model_name(case)
+        if case.signature and fallback:
+            targets.append(
+                BenchTarget(
+                    case=case,
+                    model=fallback,
+                    signature=None,
+                    note=f"benchmark_model_apk_cannot_select_signature; using fixed export for {case.signature}",
+                )
+            )
+        elif not (MODELS_DIR / case.model).exists() and fallback:
+            targets.append(
+                BenchTarget(
+                    case=case,
+                    model=fallback,
+                    signature=None,
+                    note=f"requested model missing ({case.model}); using fixed export",
+                )
+            )
+        else:
+            targets.append(BenchTarget(case=case, model=case.model, signature=case.signature))
+    return targets
 
 
 def _compose_features_from_pt(path: Path) -> torch.Tensor:
@@ -225,7 +315,28 @@ def wait_for_benchmark_log(
     return last_log, False
 
 
-def build_bench_args(case: Case, remote_model: str, remote_input: str, warmup: int, runs: int) -> str:
+def discover_input_layer(model_path: Path, signature: str | None = None) -> str:
+    from ai_edge_litert.interpreter import Interpreter
+
+    interpreter = Interpreter(model_path=str(model_path))
+    signatures = interpreter.get_signature_list()
+    if signatures:
+        sig_key = signature or next(iter(signatures.keys()))
+        runner = interpreter.get_signature_runner(sig_key)
+        input_details = runner.get_input_details()
+        return next(iter(input_details.keys()))
+    return str(interpreter.get_input_details()[0]["name"])
+
+
+def build_bench_args(
+    case: Case,
+    remote_model: str,
+    remote_input: str,
+    warmup: int,
+    runs: int,
+    input_layer: str,
+    signature: str | None = None,
+) -> str:
     flags = [
         f"--graph={remote_model}",
         f"--warmup_runs={warmup}",
@@ -234,12 +345,12 @@ def build_bench_args(case: Case, remote_model: str, remote_input: str, warmup: i
         "--gpu_precision_loss_allowed=true",
         "--use_xnnpack=false",
         "--gpu_backend=cl",
-        "--input_layer=serving_default_args_0",
+        f"--input_layer={input_layer}",
         f"--input_layer_shape=1,642,{case.frames}",
-        f"--input_layer_value_files=serving_default_args_0:{remote_input}",
+        f"--input_layer_value_files={input_layer}:{remote_input}",
     ]
-    if case.signature:
-        flags.append(f"--signature_to_run={case.signature}")
+    if signature:
+        flags.append(f"--signature_to_run={signature}")
     return " ".join(flags)
 
 
@@ -253,11 +364,7 @@ def save_wav_16bit(path: Path, audio: np.ndarray, sample_rate: int = 24000) -> N
     waveform = np.asarray(audio, dtype=np.float32).reshape(-1)
     waveform = np.clip(waveform, -1.0, 1.0)
     pcm16 = (waveform * 32767.0).astype(np.int16)
-    with wave.open(str(path), "wb") as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(sample_rate)
-        wav_file.writeframes(pcm16.tobytes())
+    wavfile.write(path, sample_rate, pcm16)
 
 
 def run_tflite_inference(
@@ -265,9 +372,9 @@ def run_tflite_inference(
     input_np: np.ndarray,
     signature: str | None = None,
 ) -> np.ndarray:
-    import tensorflow as tf
+    from ai_edge_litert.interpreter import Interpreter
 
-    interpreter = tf.lite.Interpreter(model_path=str(model_path))
+    interpreter = Interpreter(model_path=str(model_path))
     signatures = interpreter.get_signature_list()
     if signatures:
         sig_key = signature or next(iter(signatures.keys()))
@@ -287,10 +394,10 @@ def run_tflite_inference(
     return np.asarray(interpreter.get_tensor(output_detail["index"]), dtype=np.float32)
 
 
-def save_host_preview_wavs(input_bins: dict[str, Path]) -> None:
+def save_host_preview_wavs(input_bins: dict[str, Path], cases: list[Case]) -> None:
     WAVS_DIR.mkdir(parents=True, exist_ok=True)
     seen: set[tuple[str, str, str]] = set()
-    for case in CASES:
+    for case in cases:
         key = (case.model, case.sample, case.signature or "")
         if key in seen:
             continue
@@ -326,7 +433,7 @@ def pull_phone_audio_files(adb_path: str, serial: str | None) -> list[Path]:
             pulled.append(local_path)
     if not pulled:
         msg = [
-            "No phone-side WAV/PCM artifacts were collected from /data/local/tmp/kokoro_vocos_bench.",
+            f"No phone-side WAV/PCM artifacts were collected from {REMOTE}.",
             "TensorFlow Lite benchmark APK typically does not emit output audio files.",
         ]
         if not remote_files:
@@ -347,6 +454,7 @@ def cleanup_remote(adb_path: str, serial: str | None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser("Run Pixel 10 Android benchmark matrix from android/PLAN_BENCH.md")
+    parser.add_argument("--family", choices=("vocos", "wavehax"), default="vocos")
     parser.add_argument("--adb", default=ADB_DEFAULT)
     parser.add_argument("--adb-serial", default=None)
     parser.add_argument("--apk", type=Path, default=APK_DEFAULT)
@@ -363,6 +471,8 @@ def main() -> None:
     parser.add_argument("--skip-phone-audio-pull", action="store_true")
     parser.add_argument("--keep-remote", action="store_true")
     args = parser.parse_args()
+    cases = configure_family(args.family)
+    targets = resolve_benchmark_targets(cases)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     INPUTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -406,9 +516,17 @@ def main() -> None:
         input_bins[sample] = out
 
     pushed_lines: list[str] = []
-    unique_models = sorted({c.model for c in CASES})
+    unique_models = sorted({t.model for t in targets})
     try:
+        for target in targets:
+            if target.note:
+                pushed_lines.append(
+                    f"BENCHMARK_TARGET {target.case.flavor} {target.case.sample}: "
+                    f"logical={target.case.model} signature={target.case.signature or ''} "
+                    f"benchmark={target.model} benchmark_signature={target.signature or ''} note={target.note}"
+                )
         available_models: set[str] = set()
+        input_layers: dict[tuple[str, str], str] = {}
         missing_models: set[str] = set()
         for model in unique_models:
             local = MODELS_DIR / model
@@ -420,6 +538,14 @@ def main() -> None:
             out = adb(args.adb, serial, ["push", str(local), remote]).strip()
             pushed_lines.append(out)
             available_models.add(model)
+        for target in targets:
+            local = MODELS_DIR / target.model
+            if local.exists():
+                try:
+                    input_layers[(target.model, target.signature or "")] = discover_input_layer(local, signature=target.signature)
+                except Exception as exc:
+                    input_layers[(target.model, target.signature or "")] = target.case.input_layer or "serving_default_args_0"
+                    pushed_lines.append(f"INPUT_LAYER_DISCOVERY_FAILED {local}: {type(exc).__name__}: {exc}")
         for sample, local in input_bins.items():
             remote = f"{REMOTE}/inputs/{local.name}"
             out = adb(args.adb, serial, ["push", str(local), remote]).strip()
@@ -432,13 +558,30 @@ def main() -> None:
 
         results: list[dict[str, str]] = []
         headers = ",".join(RESULT_FIELDS)
+        if RESULTS_CSV.exists():
+            existing_header = RESULTS_CSV.read_text(encoding="utf-8").splitlines()[:1]
+            if existing_header and existing_header[0] != headers:
+                backup = RESULTS_CSV.with_name(
+                    f"{RESULTS_CSV.stem}_legacy_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}{RESULTS_CSV.suffix}"
+                )
+                RESULTS_CSV.rename(backup)
         if not RESULTS_CSV.exists():
             RESULTS_CSV.write_text(headers + "\n", encoding="utf-8")
 
-        smoke_case = Case("fp16_fixed", "vocos_fp16_af_alloy_00001_00_330f_litert.tflite", "af_alloy_00001_00", 330, None, "fp16")
-        smoke_remote_model = f"{REMOTE}/models/{smoke_case.model}"
+        smoke_target = next((target for target in targets if target.case.frames == 330 and target.signature is None), targets[0])
+        smoke_case = smoke_target.case
+        smoke_remote_model = f"{REMOTE}/models/{smoke_target.model}"
         smoke_remote_input = f"{REMOTE}/inputs/{input_bins[smoke_case.sample].name}"
-        smoke_args = build_bench_args(smoke_case, smoke_remote_model, smoke_remote_input, warmup=1, runs=1)
+        smoke_input_layer = input_layers.get((smoke_target.model, smoke_target.signature or ""), smoke_case.input_layer or "serving_default_args_0")
+        smoke_args = build_bench_args(
+            smoke_case,
+            smoke_remote_model,
+            smoke_remote_input,
+            warmup=1,
+            runs=1,
+            input_layer=smoke_input_layer,
+            signature=smoke_target.signature,
+        )
         adb(args.adb, serial, ["logcat", "-c"])
         start_benchmark_activity(args.adb, serial, smoke_args)
         smoke_log, _ = wait_for_benchmark_log(
@@ -448,29 +591,15 @@ def main() -> None:
         )
         (LOGS_DIR / "smoke_fp16_fixed__af_alloy_00001_00__run_00.txt").write_text(smoke_log, encoding="utf-8")
 
-        run_cases = CASES if not args.smoke_only else [smoke_case]
-        probe_args = build_bench_args(
-            Case("probe", "vocos_fp16_multisig_static_litert.tflite", "af_alloy_00001_00", 330, "frames_330", "fp16"),
-            f"{REMOTE}/models/vocos_fp16_multisig_static_litert.tflite",
-            f"{REMOTE}/inputs/{input_bins['af_alloy_00001_00'].name}",
-            warmup=1,
-            runs=1,
-        )
-        adb(args.adb, serial, ["logcat", "-c"], check=False)
-        start_benchmark_activity(args.adb, serial, probe_args)
-        probe_log, _ = wait_for_benchmark_log(
-            args.adb,
-            serial,
-            timeout_seconds=max(8, args.case_timeout_seconds),
-        )
-        (LOGS_DIR / "probe_signature_support.txt").write_text(probe_log, encoding="utf-8")
-        multisig_support = "Unconsumed cmdline flags: --signature_to_run" not in probe_log
+        run_targets = targets if not args.smoke_only else [smoke_target]
 
-        for case in run_cases:
+        for target in run_targets:
+            case = target.case
             for run_index in range(1, args.run_count + 1):
                 local_log = LOGS_DIR / f"{case.flavor}__{case.sample}__run_{run_index:02d}.txt"
-                remote_model = f"{REMOTE}/models/{case.model}"
+                remote_model = f"{REMOTE}/models/{target.model}"
                 remote_input = f"{REMOTE}/inputs/{input_bins[case.sample].name}"
+                input_layer = input_layers.get((target.model, target.signature or ""), case.input_layer or "serving_default_args_0")
                 measured = args.measured_iterations_1754 if case.frames >= 1754 else args.measured_iterations
                 wait_seconds = args.log_wait_seconds_1754 if case.frames >= 1754 else args.log_wait_seconds
                 timeout_seconds = args.case_timeout_seconds_1754 if case.frames >= 1754 else args.case_timeout_seconds
@@ -480,9 +609,11 @@ def main() -> None:
                     "device_serial": serial or "",
                     "flavor": case.flavor,
                     "model": case.model,
+                    "benchmark_model": target.model,
                     "sample": case.sample,
                     "frames": str(case.frames),
                     "signature": case.signature or "",
+                    "benchmark_signature": target.signature or "",
                     "run_index": str(run_index),
                     "status": "",
                     "delegate": "gpu_cl",
@@ -501,23 +632,26 @@ def main() -> None:
                     "raw_log": str(local_log.relative_to(ROOT)),
                     "warmup_iterations": str(args.warmup_iterations),
                     "measured_iterations": str(measured),
+                    "benchmark_note": target.note,
                     "error": "",
                 }
 
-                if case.model not in available_models:
+                if target.model not in available_models:
                     msg = "skipped_missing_model"
                     local_log.write_text(msg + "\n", encoding="utf-8")
                     row["status"] = msg
-                    row["error"] = f"Missing local model file: {MODELS_DIR / case.model}"
-                    results.append(row)
-                elif case.signature and not multisig_support:
-                    msg = "skipped_no_signature_support (benchmark APK does not consume --signature_to_run)"
-                    local_log.write_text(msg + "\n", encoding="utf-8")
-                    row["status"] = "skipped_no_signature_support"
-                    row["error"] = msg
+                    row["error"] = f"Missing local benchmark model file: {MODELS_DIR / target.model}"
                     results.append(row)
                 else:
-                    bench_args = build_bench_args(case, remote_model, remote_input, warmup=args.warmup_iterations, runs=measured)
+                    bench_args = build_bench_args(
+                        case,
+                        remote_model,
+                        remote_input,
+                        warmup=args.warmup_iterations,
+                        runs=measured,
+                        input_layer=input_layer,
+                        signature=target.signature,
+                    )
                     adb(args.adb, serial, ["logcat", "-c"], check=False)
                     start_benchmark_activity(args.adb, serial, bench_args)
                     log_text, finished = wait_for_benchmark_log(
@@ -534,8 +668,10 @@ def main() -> None:
                     for k, v in metrics.items():
                         if k in row:
                             row[k] = v
-                    if has_success(log_text):
+                    if has_success(log_text) or row["avg_ms"]:
                         row["status"] = "ok"
+                        if not has_success(log_text):
+                            row["error"] = "completion_marker_timeout_but_metrics_present"
                     else:
                         row["status"] = "failed"
                         row["error"] = detect_error(log_text)
@@ -548,7 +684,7 @@ def main() -> None:
                     writer.writerow(row)
 
         if not args.skip_host_wavs:
-            save_host_preview_wavs(input_bins)
+            save_host_preview_wavs(input_bins, cases)
 
         if not args.skip_phone_audio_pull:
             pull_phone_audio_files(args.adb, serial)
@@ -561,6 +697,8 @@ def main() -> None:
             "",
             f"- Timestamp: {timestamp}",
             f"- Device serial: {serial or 'unknown'}",
+            f"- Family: {args.family}",
+            f"- Models dir: `{MODELS_DIR.relative_to(ROOT)}`",
             f"- Total runs recorded: {len(results)}",
             f"- Success: {success}",
             f"- Failed: {failed}",
@@ -569,7 +707,9 @@ def main() -> None:
             "## Notes",
             "",
             "- Benchmarks were run with TensorFlow Lite benchmark APK + GPU delegate flags.",
-            "- Multi-signature rows are marked `skipped_no_signature_support` when the APK ignores `--signature_to_run`.",
+            "- `benchmark_model` is the actual APK-compatible file pushed to the phone.",
+            "- Multi-signature rows use fixed-shape per-sample exports because the Android benchmark APK cannot select TFLite signatures.",
+            "- Missing dynamic models use fixed-shape per-sample exports when available.",
             "- Per-run raw logs are under `android_bench/logs/` and CSV rows are in `android_bench/results.csv`.",
             "- Host-generated inspection WAVs are under `android_bench/wavs/`.",
             "- Phone-side audio artifacts (if any) are under `android_bench/phone_wavs/`.",

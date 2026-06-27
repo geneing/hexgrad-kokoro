@@ -178,3 +178,8 @@ test_output/
 .kilo/
 onnx/
 
+android/*
+data/*
+litert_npu/*
+tools/*
+models/*
