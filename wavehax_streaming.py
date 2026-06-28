@@ -107,15 +107,28 @@ class KokoroMultiScaleWavehaxGenerator(nn.Module):
             export_safe_ops=bool(config.get("export_safe_ops", False)),
         )
 
-    def forward(self, features: Tensor) -> Tensor:
+    def forward(
+        self,
+        features: Tensor,
+        prior_phase: Tensor | None = None,
+        return_prior_phase: bool = False,
+    ) -> Tensor:
         cond = self.conditioner(features)
         f0 = features[:, 512:513, :]
-        audio, _prior = self.generator(cond, f0)
+        result = self.generator(cond, f0, prior_phase=prior_phase, return_prior_phase=return_prior_phase)
+        if return_prior_phase:
+            audio, _prior, next_phase = result
+            audio = audio[:, 0, :] if audio.ndim == 3 and audio.shape[1] == 1 else audio
+            return audio, next_phase
+        audio, _prior = result
         return audio[:, 0, :] if audio.ndim == 3 and audio.shape[1] == 1 else audio
+
+    def phase_advance(self, features: Tensor) -> Tensor:
+        return self.generator.phase_advance(features[:, 512:513, :])
 
 
 class StreamingWavehaxChunk(nn.Module):
-    """Fixed-shape chunk wrapper with explicit state tensors for TFLite-style loops."""
+    """Fixed-shape center-window chunk wrapper with explicit state tensors."""
 
     def __init__(
         self,
@@ -133,7 +146,7 @@ class StreamingWavehaxChunk(nn.Module):
         self.hop_length = int(hop_length)
         self.chunk_samples = self.chunk_frames * self.hop_length
 
-    def initial_state(self, device: torch.device | None = None, dtype: torch.dtype = torch.float32) -> tuple[Tensor, Tensor, Tensor]:
+    def initial_state(self, device: torch.device | None = None, dtype: torch.dtype = torch.float32) -> tuple[Tensor, Tensor]:
         if device is None:
             try:
                 device = next(self.parameters()).device
@@ -141,31 +154,29 @@ class StreamingWavehaxChunk(nn.Module):
                 device = torch.device("cpu")
         feature_state = torch.zeros(1, self.feature_channels, self.chunk_frames, device=device, dtype=dtype)
         prior_phase = torch.zeros(1, 1, 1, device=device, dtype=dtype)
-        output_buffer = torch.zeros(1, self.chunk_samples, device=device, dtype=dtype)
-        return feature_state, prior_phase, output_buffer
+        return feature_state, prior_phase
 
     def forward(
         self,
         features_chunk: Tensor,
+        next_features_chunk: Tensor,
         feature_state: Tensor,
         prior_phase: Tensor,
-        output_buffer: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         if features_chunk.shape != (1, self.feature_channels, self.chunk_frames):
             raise ValueError(
                 f"Expected features_chunk [1,{self.feature_channels},{self.chunk_frames}], got {tuple(features_chunk.shape)}"
             )
-        full_features = torch.cat([feature_state, features_chunk], dim=-1)
-        full_audio = self.model(full_features)
-        audio_chunk = full_audio[..., : self.chunk_samples] + output_buffer * 0.0
-        next_feature_state = full_features[..., -self.chunk_frames :].contiguous()
-
-        f0 = features_chunk[:, 512:513, :]
-        f0_audio = F.interpolate(f0, scale_factor=self.hop_length, mode="linear", align_corners=False)
-        phase_delta = f0_audio.sum(dim=-1, keepdim=True) * (2.0 * torch.pi / float(self.sample_rate))
-        next_prior_phase = torch.fmod(prior_phase + phase_delta, 2.0 * torch.pi)
-        next_output_buffer = audio_chunk
-        return audio_chunk, next_feature_state, next_prior_phase, next_output_buffer
+        if next_features_chunk.shape != (1, self.feature_channels, self.chunk_frames):
+            raise ValueError(
+                f"Expected next_features_chunk [1,{self.feature_channels},{self.chunk_frames}], got {tuple(next_features_chunk.shape)}"
+            )
+        full_features = torch.cat([feature_state, features_chunk, next_features_chunk], dim=-1)
+        full_audio, _next_window_phase = self.model(full_features, prior_phase=prior_phase, return_prior_phase=True)
+        audio_chunk = full_audio[..., self.chunk_samples : 2 * self.chunk_samples]
+        next_feature_state = features_chunk.contiguous()
+        next_prior_phase = torch.fmod(prior_phase + self.model.phase_advance(features_chunk), 2.0 * torch.pi)
+        return audio_chunk, next_feature_state, next_prior_phase
 
 
 class StreamingKokoroWavehax:
@@ -183,7 +194,7 @@ class StreamingKokoroWavehax:
             raise ValueError(f"Expected features [1,642,T], got {tuple(features.shape)}")
         device = features.device
         dtype = features.dtype
-        feature_state, prior_phase, output_buffer = self.chunk.initial_state(device=device, dtype=dtype)
+        feature_state, prior_phase = self.chunk.initial_state(device=device, dtype=dtype)
         outputs: list[Tensor] = []
         frames = int(features.shape[-1])
         pos = 0
@@ -192,25 +203,19 @@ class StreamingKokoroWavehax:
             chunk = features[..., pos : pos + valid]
             if valid < self.chunk.chunk_frames:
                 chunk = F.pad(chunk, (0, self.chunk.chunk_frames - valid))
-            audio, feature_state, prior_phase, output_buffer = self.chunk(
+            next_start = pos + valid
+            next_valid = min(self.chunk.chunk_frames, max(0, frames - next_start))
+            next_chunk = features[..., next_start : next_start + next_valid]
+            if next_valid < self.chunk.chunk_frames:
+                next_chunk = F.pad(next_chunk, (0, self.chunk.chunk_frames - next_valid))
+            audio, feature_state, prior_phase = self.chunk(
                 chunk,
+                next_chunk,
                 feature_state,
                 prior_phase,
-                output_buffer,
             )
-            if pos > 0:
-                outputs.append(audio)
+            outputs.append(audio[..., : valid * self.chunk.hop_length])
             pos += valid
-
-        zero_flush = torch.zeros(1, self.chunk.feature_channels, self.chunk.chunk_frames, device=device, dtype=dtype)
-        audio, feature_state, prior_phase, output_buffer = self.chunk(
-            zero_flush,
-            feature_state,
-            prior_phase,
-            output_buffer,
-        )
-        del feature_state, prior_phase, output_buffer
-        outputs.append(audio[..., : ((frames - 1) % self.chunk.chunk_frames + 1) * self.chunk.hop_length])
         return torch.cat(outputs, dim=-1)[..., : frames * self.chunk.hop_length] if outputs else torch.empty(1, 0)
 
 
@@ -218,7 +223,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Generate Wavehax WAVs from Kokoro feature .pt files using PyTorch")
     parser.add_argument("--checkpoint", type=Path, default=Path("models/wavehax/last.pt"))
     parser.add_argument("--input-feature-glob", action="append", default=None)
-    parser.add_argument("--output-dir", type=Path, default=Path("runs/wavehax_streaming"))
+    parser.add_argument("--output-dir", type=Path, default=Path("test_output"))
     parser.add_argument("--sample-rate", type=int, default=24000)
     parser.add_argument("--hop-length", type=int, default=300)
     parser.add_argument("--chunk-frames", type=int, default=24)
@@ -319,7 +324,7 @@ def select_device(name: str) -> torch.device:
 def main() -> None:
     args = parse_args()
     if args.input_feature_glob is None:
-        args.input_feature_glob = ["data/af_*.pt"]
+        args.input_feature_glob = ["data/af*.pt"]
     device = select_device(args.device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 

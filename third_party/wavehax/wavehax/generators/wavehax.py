@@ -31,6 +31,7 @@ def deterministic_pcph_closed_form(
     f0: Tensor,
     hop_length: int,
     sample_rate: int,
+    initial_phase: Tensor | None = None,
     power_factor: float = 0.1,
     max_frequency: float | None = None,
     epsilon: float = 1e-6,
@@ -40,6 +41,8 @@ def deterministic_pcph_closed_form(
     f0_upsampled = torch.nn.functional.interpolate(f0, scale_factor=hop_length, mode="linear", align_corners=False)
     phase_increment = f0_upsampled / float(sample_rate)
     phase = torch.cumsum(phase_increment, dim=2) * (2.0 * torch.pi)
+    if initial_phase is not None:
+        phase = phase + initial_phase.to(dtype=phase.dtype, device=phase.device)
     phase = torch.fmod(phase, 2.0 * torch.pi)
 
     limit_freq = float(max_frequency) if max_frequency is not None else float(sample_rate) / 2.0
@@ -58,6 +61,14 @@ def deterministic_pcph_closed_form(
     amp_scale = float(power_factor) * torch.sqrt(2.0 / torch.clamp(n_harmonics, min=1.0))
     vuv_mask = (f0_upsampled > 0.0).to(dtype=f0_upsampled.dtype)
     return harmonics * amp_scale * vuv_mask
+
+
+def pcph_phase_advance(f0: Tensor, hop_length: int, sample_rate: int) -> Tensor:
+    """Return wrapped phase advance for one F0 chunk."""
+
+    f0_upsampled = torch.nn.functional.interpolate(f0, scale_factor=hop_length, mode="linear", align_corners=False)
+    phase_delta = f0_upsampled.sum(dim=-1, keepdim=True) * (2.0 * torch.pi / float(sample_rate))
+    return torch.fmod(phase_delta, 2.0 * torch.pi)
 
 
 class WavehaxGenerator(nn.Module):
@@ -170,7 +181,13 @@ class WavehaxGenerator(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0.0)
 
-    def forward(self, cond: Tensor, f0: Tensor) -> Tensor:
+    def forward(
+        self,
+        cond: Tensor,
+        f0: Tensor,
+        prior_phase: Tensor | None = None,
+        return_prior_phase: bool = False,
+    ) -> Tensor:
         """
         Calculate forward propagation.
 
@@ -184,7 +201,10 @@ class WavehaxGenerator(nn.Module):
         """
         # Generate prior waveform and compute spectrogram
         with torch.no_grad():
-            prior = self.prior_generator(f0)
+            try:
+                prior = self.prior_generator(f0, initial_phase=prior_phase)
+            except TypeError:
+                prior = self.prior_generator(f0)
             real, imag = self.stft(prior)
             if self.use_logmag_phase:
                 prior1, prior2 = to_log_magnitude_and_phase(real, imag)
@@ -219,6 +239,11 @@ class WavehaxGenerator(nn.Module):
             real, imag = x[:, 0], x[:, 1]
         x = self.stft.inverse(real, imag)
 
+        if return_prior_phase:
+            next_phase = pcph_phase_advance(f0, self.hop_length, self.sample_rate)
+            if prior_phase is not None:
+                next_phase = torch.fmod(prior_phase.to(dtype=next_phase.dtype, device=next_phase.device) + next_phase, 2.0 * torch.pi)
+            return x, prior, next_phase
         return x, prior
 
     @torch.inference_mode()
@@ -339,7 +364,13 @@ class ComplexWavehaxGenerator(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0.0)
 
-    def forward(self, cond: Tensor, f0: Tensor) -> Tensor:
+    def forward(
+        self,
+        cond: Tensor,
+        f0: Tensor,
+        prior_phase: Tensor | None = None,
+        return_prior_phase: bool = False,
+    ) -> Tensor:
         """
         Calculate forward propagation.
 
@@ -353,7 +384,10 @@ class ComplexWavehaxGenerator(nn.Module):
         """
         # Generate prior waveform and compute spectrogram
         with torch.no_grad():
-            prior = self.prior_generator(f0)
+            try:
+                prior = self.prior_generator(f0, initial_phase=prior_phase)
+            except TypeError:
+                prior = self.prior_generator(f0)
             real, imag = self.stft(prior)
 
         # Apply input projection
@@ -378,6 +412,11 @@ class ComplexWavehaxGenerator(nn.Module):
         real, imag = real.squeeze(1), imag.squeeze(1)
         x = self.stft.inverse(real, imag)
 
+        if return_prior_phase:
+            next_phase = pcph_phase_advance(f0, self.hop_length, self.sample_rate)
+            if prior_phase is not None:
+                next_phase = torch.fmod(prior_phase.to(dtype=next_phase.dtype, device=next_phase.device) + next_phase, 2.0 * torch.pi)
+            return x, prior, next_phase
         return x, prior
 
     @torch.inference_mode()
@@ -519,7 +558,16 @@ class MultiScaleWavehaxGenerator(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0.0)
 
-    def forward(self, cond: Tensor, f0: Tensor) -> Tensor:
+    def phase_advance(self, f0: Tensor) -> Tensor:
+        return pcph_phase_advance(f0, self.hop_length, self.sample_rate)
+
+    def forward(
+        self,
+        cond: Tensor,
+        f0: Tensor,
+        prior_phase: Tensor | None = None,
+        return_prior_phase: bool = False,
+    ) -> Tensor:
         """
         Calculate forward propagation.
 
@@ -533,7 +581,10 @@ class MultiScaleWavehaxGenerator(nn.Module):
         """
         # Generate prior waveform
         with torch.no_grad():
-            prior = self.prior_generator(f0)
+            try:
+                prior = self.prior_generator(f0, initial_phase=prior_phase)
+            except TypeError:
+                prior = self.prior_generator(f0)
 
         # Decompose prior signal
         priors = self.decomposer.analysis(prior)
@@ -578,6 +629,11 @@ class MultiScaleWavehaxGenerator(nn.Module):
         # Construct the output signal
         y = self.decomposer.synthesis(ys)
 
+        if return_prior_phase:
+            next_phase = pcph_phase_advance(f0, self.hop_length, self.sample_rate)
+            if prior_phase is not None:
+                next_phase = torch.fmod(prior_phase.to(dtype=next_phase.dtype, device=next_phase.device) + next_phase, 2.0 * torch.pi)
+            return y, prior, next_phase
         return y, prior
 
     @torch.inference_mode()

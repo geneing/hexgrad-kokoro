@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import glob
+import importlib.util
 import json
 import math
 import random
@@ -13,11 +15,11 @@ from typing import Callable, Dict, Iterable, List, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchaudio
 from loguru import logger
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-from torch.utils.tensorboard import SummaryWriter
 
 try:
     import matplotlib
@@ -27,9 +29,82 @@ try:
 except ImportError:  # pragma: no cover - optional runtime dependency
     plt = None
 
-from kokoro.styletts2_losses import StyleTTS2MultiResolutionGroupDelayLoss, StyleTTS2MultiResolutionSTFTLoss
 from vocos.discriminators import MultiPeriodDiscriminator, MultiResolutionDiscriminator
 from vocos.loss import DiscriminatorLoss, FeatureMatchingLoss, GeneratorLoss
+
+
+def _load_styletts2_losses():
+    loss_path = Path(__file__).resolve().parents[1] / "kokoro" / "styletts2_losses.py"
+    spec = importlib.util.spec_from_file_location("_kokoro_styletts2_losses", loss_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load StyleTTS2 losses from {loss_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.StyleTTS2MultiResolutionGroupDelayLoss, module.StyleTTS2MultiResolutionSTFTLoss
+
+
+StyleTTS2MultiResolutionGroupDelayLoss, StyleTTS2MultiResolutionSTFTLoss = _load_styletts2_losses()
+
+
+class SafeSummaryWriter:
+    """Minimal TensorBoard writer that avoids importing torch.utils.tensorboard."""
+
+    def __init__(self, log_dir: str):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self._writer = None
+        try:
+            from tensorboard.compat.proto.event_pb2 import Event
+            from tensorboard.compat.proto.summary_pb2 import Summary
+            from tensorboard.summary.writer.event_file_writer import EventFileWriter
+
+            self._event_cls = Event
+            self._summary_cls = Summary
+            self._writer = EventFileWriter(str(self.log_dir))
+        except Exception as exc:  # pragma: no cover - depends on optional tensorboard install
+            self._event_cls = None
+            self._summary_cls = None
+            logger.warning(f"TensorBoard event logging disabled: {exc}")
+
+    def add_scalar(self, tag: str, scalar_value: float, global_step: int) -> None:
+        if self._writer is None or self._event_cls is None or self._summary_cls is None:
+            return
+        summary = self._summary_cls(value=[self._summary_cls.Value(tag=tag, simple_value=float(scalar_value))])
+        self._writer.add_event(self._event_cls(wall_time=time.time(), step=int(global_step), summary=summary))
+
+    def add_text(self, tag: str, text_string: str, global_step: int) -> None:
+        path = self._artifact_path("text", tag, global_step, ".txt")
+        path.write_text(text_string, encoding="utf-8")
+
+    def add_audio(self, tag: str, snd_tensor: torch.Tensor, global_step: int, sample_rate: int) -> None:
+        path = self._artifact_path("audio", tag, global_step, ".wav")
+        audio = snd_tensor.detach().float().cpu().reshape(-1).clamp(-1.0, 1.0).numpy()
+        pcm = (audio * 32767.0).astype(np.int16)
+        with wave.open(str(path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(int(sample_rate))
+            wav_file.writeframes(pcm.tobytes())
+
+    def add_figure(self, tag: str, figure, global_step: int, close: bool = True) -> None:
+        path = self._artifact_path("figures", tag, global_step, ".png")
+        figure.savefig(path)
+        if close and plt is not None:
+            plt.close(figure)
+
+    def _artifact_path(self, kind: str, tag: str, global_step: int, suffix: str) -> Path:
+        safe_tag = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in tag).strip("_")
+        out_dir = self.log_dir / kind
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir / f"{int(global_step):08d}_{safe_tag}{suffix}"
+
+    def flush(self) -> None:
+        if self._writer is not None:
+            self._writer.flush()
+
+    def close(self) -> None:
+        if self._writer is not None:
+            self._writer.close()
 
 
 @dataclass
@@ -231,8 +306,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--mrstft-loss-coeff", type=float, default=45.0)
     parser.add_argument("--group-delay-loss-coeff", type=float, default=2.0)
     parser.add_argument("--mrd-loss-coeff", type=float, default=1.0)
+    parser.add_argument("--streaming-loss-coeff", type=float, default=5.0)
+    parser.add_argument("--boundary-loss-coeff", type=float, default=10.0)
+    parser.add_argument("--boundary-window-ms", type=float, default=60.0)
+    parser.add_argument("--streaming-validation-glob", type=str, default="data/af*.pt")
     parser.add_argument("--seed", type=int, default=4444)
-    parser.add_argument("--device", type=str, default="cuda", choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--resume", type=Path, default=None)
     return parser
@@ -387,6 +466,110 @@ def log_samples(
                 writer.add_figure(f"{tag}/sample_{i}/mel", fig, step, close=True)
 
 
+def compose_features_from_pt(path: Path) -> torch.Tensor:
+    row = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(row, dict):
+        raise TypeError(f"Expected mapping in {path}, got {type(row)}")
+    asr = row["asr"].float()
+    f0 = row["f0"].float()
+    noise = row["noise"].float()
+    style = row["style"].float()
+    total_frames = int(f0.shape[-1])
+    if asr.shape[-1] != total_frames:
+        asr = F.interpolate(asr.unsqueeze(0), size=total_frames, mode="linear", align_corners=False).squeeze(0)
+    return torch.cat(
+        [
+            asr[:, :total_frames],
+            f0[:total_frames].unsqueeze(0),
+            noise[:total_frames].unsqueeze(0),
+            style.unsqueeze(-1).expand(style.shape[0], total_frames),
+        ],
+        dim=0,
+    ).contiguous()
+
+
+def streaming_center_audio(generator: nn.Module, features: torch.Tensor, chunk_frames: int, hop_length: int) -> torch.Tensor:
+    method = getattr(generator, "streaming_center", None)
+    if callable(method):
+        return method(features, int(chunk_frames), int(hop_length))
+    return generator(features)
+
+
+def boundary_crops(
+    fake: torch.Tensor,
+    real: torch.Tensor,
+    chunk_samples: int,
+    boundary_window_samples: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    chunk_samples = int(chunk_samples)
+    half = max(1, int(boundary_window_samples) // 2)
+    length = min(int(fake.shape[-1]), int(real.shape[-1]))
+    crops_fake: list[torch.Tensor] = []
+    crops_real: list[torch.Tensor] = []
+    for boundary in range(chunk_samples, length, chunk_samples):
+        start = max(0, boundary - half)
+        end = min(length, boundary + half)
+        if end - start >= 2:
+            crops_fake.append(fake[..., start:end])
+            crops_real.append(real[..., start:end])
+    if not crops_fake:
+        return None, None
+    target = min(c.shape[-1] for c in crops_fake + crops_real)
+    crops_fake = [c[..., :target] for c in crops_fake]
+    crops_real = [c[..., :target] for c in crops_real]
+    return torch.cat(crops_fake, dim=0), torch.cat(crops_real, dim=0)
+
+
+def boundary_jump_metric(audio: torch.Tensor, chunk_samples: int) -> float:
+    chunk_samples = int(chunk_samples)
+    if chunk_samples <= 0 or audio.shape[-1] <= chunk_samples:
+        return 0.0
+    jumps = []
+    for idx in range(chunk_samples, int(audio.shape[-1]), chunk_samples):
+        jumps.append(torch.abs(audio[..., idx] - audio[..., idx - 1]).detach().float().mean())
+    if not jumps:
+        return 0.0
+    return float(torch.stack(jumps).mean().item())
+
+
+@torch.no_grad()
+def log_streaming_validation_samples(
+    generator: nn.Module,
+    writer: SummaryWriter,
+    mel_transform: torchaudio.transforms.MelSpectrogram,
+    feature_glob: str,
+    device: torch.device,
+    precision: str,
+    step: int,
+    sample_rate: int,
+    sample_count: int,
+    include_mels: bool,
+    chunk_frames: int,
+    hop_length: int,
+) -> None:
+    paths = sorted(Path(p) for p in glob.glob(feature_glob))
+    if not paths:
+        logger.warning(f"No streaming validation feature files matched: {feature_glob}")
+        return
+    generator.eval()
+    for i, path in enumerate(paths[: max(1, int(sample_count))]):
+        features = compose_features_from_pt(path).unsqueeze(0).to(device)
+        with autocast_context(device, precision):
+            full = generator(features)
+            stream = streaming_center_audio(generator, features, chunk_frames, hop_length)
+            full, stream = align_audio(full, stream)
+        writer.add_audio(f"val_streaming/{path.stem}/full", full[0].detach().cpu(), step, sample_rate)
+        writer.add_audio(f"val_streaming/{path.stem}/streaming", stream[0].detach().cpu(), step, sample_rate)
+        metric = audio_metrics(stream.detach().float(), full.detach().float())
+        writer.add_scalar(f"val_streaming/{path.stem}/rmse_vs_full", metric["rmse"], step)
+        writer.add_scalar(f"val_streaming/{path.stem}/boundary_click", boundary_jump_metric(stream, chunk_frames * hop_length), step)
+        if include_mels:
+            fig = mel_figure(mel_transform, full[0].detach().float(), stream[0].detach().float())
+            if fig is not None:
+                writer.add_figure(f"val_streaming/{path.stem}/mel", fig, step, close=True)
+    generator.train()
+
+
 def resolve_device(name: str) -> torch.device:
     if name == "cpu":
         return torch.device("cpu")
@@ -516,7 +699,7 @@ def train_decoder(
         json.dumps({"backend": backend_name, "backend_config": backend_config, "args": vars(args)}, indent=2, default=str),
         encoding="utf-8",
     )
-    writer = SummaryWriter(log_dir=str(tb_dir))
+    writer = SafeSummaryWriter(log_dir=str(tb_dir))
     writer.add_text("run/config", json.dumps({"backend": backend_name, "backend_config": backend_config, "args": vars(args)}, indent=2, default=str), 0)
     mel_transform = torchaudio.transforms.MelSpectrogram(
         sample_rate=args.sample_rate,
@@ -610,6 +793,32 @@ def train_decoder(
                         with autocast_context(device, args.precision):
                             stft_loss = mrstft(fake, real)
                             gd_loss = group_delay(fake, real)
+                            chunk_frames = int(getattr(args, "chunk_frames", 24))
+                            chunk_samples = chunk_frames * int(args.hop_length)
+                            boundary_window_samples = max(2, int(float(args.boundary_window_ms) * float(args.sample_rate) / 1000.0))
+                            stream_fake = streaming_center_audio(generator, features, chunk_frames, args.hop_length)
+                            stream_fake, stream_real = align_audio(stream_fake, real)
+                            stream_stft_loss = mrstft(stream_fake, stream_real)
+                            stream_gd_loss = group_delay(stream_fake, stream_real)
+                            stream_loss = stream_stft_loss + stream_gd_loss
+                            boundary_fake, boundary_real = boundary_crops(
+                                stream_fake,
+                                stream_real,
+                                chunk_samples=chunk_samples,
+                                boundary_window_samples=boundary_window_samples,
+                            )
+                            if boundary_fake is not None and boundary_real is not None:
+                                fake_diff = boundary_fake[..., 1:] - boundary_fake[..., :-1]
+                                real_diff = boundary_real[..., 1:] - boundary_real[..., :-1]
+                                boundary_deriv_loss = torch.mean(torch.abs(fake_diff - real_diff))
+                                boundary_stft_loss = mrstft(boundary_fake, boundary_real)
+                                boundary_gd_loss = group_delay(boundary_fake, boundary_real)
+                                boundary_loss = boundary_deriv_loss + boundary_stft_loss + boundary_gd_loss
+                            else:
+                                boundary_deriv_loss = torch.zeros((), device=device)
+                                boundary_stft_loss = torch.zeros((), device=device)
+                                boundary_gd_loss = torch.zeros((), device=device)
+                                boundary_loss = torch.zeros((), device=device)
                             g_adv = torch.zeros((), device=device)
                             g_fm = torch.zeros((), device=device)
                             if adv:
@@ -631,7 +840,16 @@ def train_decoder(
                             g_gd_weighted = args.group_delay_loss_coeff * gd_loss
                             g_adv_weighted = args.gan_loss_coeff * g_adv
                             g_fm_weighted = args.fm_loss_coeff * g_fm
-                            g_loss = g_mrstft_weighted + g_gd_weighted + g_adv_weighted + g_fm_weighted
+                            g_stream_weighted = args.streaming_loss_coeff * stream_loss
+                            g_boundary_weighted = args.boundary_loss_coeff * boundary_loss
+                            g_loss = (
+                                g_mrstft_weighted
+                                + g_gd_weighted
+                                + g_adv_weighted
+                                + g_fm_weighted
+                                + g_stream_weighted
+                                + g_boundary_weighted
+                            )
                         if scaler.is_enabled():
                             scaler.scale(g_loss).backward()
                             scaler.unscale_(gen_opt)
@@ -646,7 +864,7 @@ def train_decoder(
                         step += 1
                         if gen_sched is not None:
                             gen_sched.step()
-                        if disc_sched is not None:
+                        if adv and disc_sched is not None:
                             disc_sched.step()
 
                         fake_log = fake.detach().float()
@@ -656,10 +874,19 @@ def train_decoder(
                             "gen_total": float(g_loss.item()),
                             "gen_mrstft_raw": float(stft_loss.item()),
                             "gen_group_delay_raw": float(gd_loss.item()),
+                            "gen_streaming_raw": float(stream_loss.item()),
+                            "gen_streaming_mrstft_raw": float(stream_stft_loss.item()),
+                            "gen_streaming_group_delay_raw": float(stream_gd_loss.item()),
+                            "gen_boundary_raw": float(boundary_loss.item()),
+                            "gen_boundary_derivative_raw": float(boundary_deriv_loss.item()),
+                            "gen_boundary_mrstft_raw": float(boundary_stft_loss.item()),
+                            "gen_boundary_group_delay_raw": float(boundary_gd_loss.item()),
                             "gen_gan_raw": float(g_adv.item()),
                             "gen_feat_match_raw": float(g_fm.item()),
                             "gen_mrstft_weighted": float(g_mrstft_weighted.item()),
                             "gen_group_delay_weighted": float(g_gd_weighted.item()),
+                            "gen_streaming_weighted": float(g_stream_weighted.item()),
+                            "gen_boundary_weighted": float(g_boundary_weighted.item()),
                             "gen_gan_weighted": float(g_adv_weighted.item()),
                             "gen_feat_match_weighted": float(g_fm_weighted.item()),
                             "disc_total": float(d_loss.item()),
@@ -675,6 +902,7 @@ def train_decoder(
                             "lr_gen": float(gen_opt.param_groups[0]["lr"]),
                             "lr_disc": float(disc_opt.param_groups[0]["lr"]),
                             "time_step_ms": (time.perf_counter() - iter_start) * 1000.0,
+                            "streaming_boundary_click": boundary_jump_metric(stream_fake.detach().float(), chunk_samples),
                             **metrics,
                         }
 
@@ -730,6 +958,20 @@ def train_decoder(
                                     "mrstft": args.mrstft_loss_coeff,
                                     "group_delay": args.group_delay_loss_coeff,
                                 },
+                            )
+                            log_streaming_validation_samples(
+                                generator=generator,
+                                writer=writer,
+                                mel_transform=mel_transform,
+                                feature_glob=args.streaming_validation_glob,
+                                device=device,
+                                precision=args.precision,
+                                step=step,
+                                sample_rate=args.sample_rate,
+                                sample_count=args.sample_count,
+                                include_mels=log_mels,
+                                chunk_frames=int(getattr(args, "chunk_frames", 24)),
+                                hop_length=args.hop_length,
                             )
 
                         if time.time() - last_log > 10 or step % max(1, args.log_every) == 0:
@@ -893,18 +1135,6 @@ def validate_once(
         snrs.append(metric["snr_db"])
         real_rms.append(metric["real_rms"])
         fake_rms.append(metric["fake_rms"])
-        if i == 0:
-            log_samples(
-                writer=writer,
-                mel_transform=mel_transform,
-                tag="val",
-                real=real_log,
-                fake=fake_log,
-                step=step,
-                sample_rate=sample_rate,
-                sample_count=sample_count,
-                include_mels=log_mels,
-            )
     if totals:
         writer.add_scalar("val/gen_total_estimate", sum(totals) / len(totals), step)
         writer.add_scalar("val/gen_mrstft_raw", sum(stfts) / len(stfts), step)
