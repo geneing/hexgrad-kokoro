@@ -450,6 +450,9 @@ class MultiScaleWavehaxGenerator(nn.Module):
         norm_type: str = "layer",
         padding_mode: str = "zeros",
         export_safe_ops: bool = False,
+        trainable_stft: bool = False,
+        trainable_stft_analysis: bool = False,
+        trainable_stft_window: bool = False,
     ) -> None:
         """
         Initialize the MultiScaleWavehaxGenerator module.
@@ -482,6 +485,9 @@ class MultiScaleWavehaxGenerator(nn.Module):
         self.norm_type = str(norm_type)
         self.padding_mode = str(padding_mode)
         self.export_safe_ops = bool(export_safe_ops)
+        self.trainable_stft = bool(trainable_stft)
+        self.trainable_stft_analysis = bool(trainable_stft_analysis)
+        self.trainable_stft_window = bool(trainable_stft_window)
         if self.norm_type not in {"layer", "batch"}:
             raise ValueError(f"Unsupported norm_type={self.norm_type}")
 
@@ -513,7 +519,16 @@ class MultiScaleWavehaxGenerator(nn.Module):
 
         # STFT layer
         stft_cls = RealDFTSTFT if self.export_safe_ops else STFT
-        self.stft = stft_cls(n_fft=n_fft, hop_length=hop_length // num_splits)
+        if stft_cls is RealDFTSTFT:
+            self.stft = stft_cls(
+                n_fft=n_fft,
+                hop_length=hop_length // num_splits,
+                trainable_inverse=self.trainable_stft,
+                trainable_analysis=self.trainable_stft_analysis,
+                trainable_window=self.trainable_stft_window,
+            )
+        else:
+            self.stft = stft_cls(n_fft=n_fft, hop_length=hop_length // num_splits)
 
         # Input projection layers
         self.cond_proj = nn.Conv1d(

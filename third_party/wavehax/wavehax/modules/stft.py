@@ -110,12 +110,16 @@ class STFT(nn.Module):
         x = x.unsqueeze(1) if x.dim() == 2 else x
         x = F.conv1d(x, self.enframe_kernel, stride=self.hop_length)
 
-        # Perform the forward real-valued DFT on each frame
-        x = x * self.window
-        x_stft = torch.fft.rfft(x, dim=1, norm=norm)
+        # cuFFT only supports power-of-two half/bfloat16 FFT sizes. Keep the
+        # FFT itself in fp32 so non-power-of-two sizes such as n_fft=480 work
+        # under autocast, then cast the spectrogram back to the incoming dtype.
+        out_dtype = x.dtype
+        fft_dtype = torch.float32 if x.is_cuda and x.dtype in {torch.float16, torch.bfloat16} else x.dtype
+        x = x.to(dtype=fft_dtype) * self.window.to(dtype=fft_dtype)
+        x_stft = torch.fft.rfft(x, n=self.n_fft, dim=1, norm=norm)
         real, imag = x_stft.real, x_stft.imag
 
-        return real, imag
+        return real.to(dtype=out_dtype), imag.to(dtype=out_dtype)
 
     def inverse(self, real: Tensor, imag: Tensor, norm: Optional[str] = None) -> Tensor:
         """
@@ -138,15 +142,20 @@ class STFT(nn.Module):
         frames = real.shape[2]
         samples = frames * self.hop_length
 
-        # Inverse RDFT and apply windowing, followed by overlap-add
-        x = torch.fft.irfft(torch.complex(real, imag), dim=1, norm=norm)
-        x = x * self.window
-        x = F.conv_transpose1d(x, self.enframe_kernel, stride=self.hop_length)
+        # Inverse RDFT and apply windowing, followed by overlap-add. See the
+        # forward path for why the FFT is forced to fp32 under CUDA autocast.
+        out_dtype = real.dtype
+        fft_dtype = torch.float32 if real.is_cuda and real.dtype in {torch.float16, torch.bfloat16} else real.dtype
+        real = real.to(dtype=fft_dtype)
+        imag = imag.to(dtype=fft_dtype)
+        x = torch.fft.irfft(torch.complex(real, imag), n=self.n_fft, dim=1, norm=norm)
+        x = x * self.window.to(dtype=fft_dtype)
+        x = F.conv_transpose1d(x, self.enframe_kernel.to(dtype=fft_dtype), stride=self.hop_length)
 
         # Compute window envelope for normalization
         window_envelope = F.conv_transpose1d(
-            self.window_envelope.repeat(1, 1, frames),
-            self.enframe_kernel,
+            self.window_envelope.to(dtype=fft_dtype).repeat(1, 1, frames),
+            self.enframe_kernel.to(dtype=fft_dtype),
             stride=self.hop_length,
         )
 
@@ -159,36 +168,54 @@ class STFT(nn.Module):
         assert (window_envelope > 1e-11).all()
         x = x / window_envelope
 
-        return x
+        return x.to(dtype=out_dtype)
 
 
 class RealDFTSTFT(nn.Module):
     """STFT/iSTFT using real DFT projections and regular convolutions only."""
 
     def __init__(
-        self, n_fft: int, hop_length: int, window: Optional[str] = "hann_window"
+        self,
+        n_fft: int,
+        hop_length: int,
+        window: Optional[str] = "hann_window",
+        trainable_inverse: bool = False,
+        trainable_analysis: bool = False,
+        trainable_window: bool = False,
     ) -> None:
         super().__init__()
         self.n_fft = int(n_fft)
         self.n_bins = self.n_fft // 2 + 1
         self.hop_length = int(hop_length)
+        self.trainable_inverse = bool(trainable_inverse)
+        self.trainable_analysis = bool(trainable_analysis)
+        self.trainable_window = bool(trainable_window)
 
         window_tensor = getattr(torch, window)(self.n_fft).reshape(1, self.n_fft, 1)
-        self.register_buffer("window", window_tensor.reshape(1, self.n_fft, 1))
+        self._register_tensor("window", window_tensor.reshape(1, self.n_fft, 1), self.trainable_window)
+        self.register_buffer("window_initial", window_tensor.reshape(1, self.n_fft, 1).clone(), persistent=False)
         self.register_buffer("window_envelope", window_tensor.square().reshape(1, self.n_fft, 1))
         self.register_buffer("enframe_kernel", torch.eye(self.n_fft).unsqueeze(1))
 
         n = torch.arange(self.n_fft, dtype=torch.float32).unsqueeze(0)
         k = torch.arange(self.n_bins, dtype=torch.float32).unsqueeze(1)
         angle = 2.0 * torch.pi * k * n / float(self.n_fft)
-        self.register_buffer("dft_cos", torch.cos(angle).unsqueeze(-1))
-        self.register_buffer("dft_sin", torch.sin(angle).unsqueeze(-1))
+        dft_cos = torch.cos(angle).unsqueeze(-1)
+        dft_sin = torch.sin(angle).unsqueeze(-1)
+        self._register_tensor("dft_cos", dft_cos, self.trainable_analysis)
+        self._register_tensor("dft_sin", dft_sin, self.trainable_analysis)
+        self.register_buffer("dft_cos_initial", dft_cos.clone(), persistent=False)
+        self.register_buffer("dft_sin_initial", dft_sin.clone(), persistent=False)
 
         mid_k = torch.arange(1, self.n_bins - 1, dtype=torch.float32)
         n_col = torch.arange(self.n_fft, dtype=torch.float32).unsqueeze(1)
         mid_angle = 2.0 * torch.pi * n_col * mid_k.unsqueeze(0) / float(self.n_fft)
-        self.register_buffer("idft_cos_mid", torch.cos(mid_angle).unsqueeze(-1))
-        self.register_buffer("idft_sin_mid", torch.sin(mid_angle).unsqueeze(-1))
+        idft_cos_mid = torch.cos(mid_angle).unsqueeze(-1)
+        idft_sin_mid = torch.sin(mid_angle).unsqueeze(-1)
+        self._register_tensor("idft_cos_mid", idft_cos_mid, self.trainable_inverse)
+        self._register_tensor("idft_sin_mid", idft_sin_mid, self.trainable_inverse)
+        self.register_buffer("idft_cos_mid_initial", idft_cos_mid.clone(), persistent=False)
+        self.register_buffer("idft_sin_mid_initial", idft_sin_mid.clone(), persistent=False)
         self.register_buffer(
             "nyquist_sign",
             torch.pow(torch.tensor(-1.0, dtype=torch.float32), torch.arange(self.n_fft, dtype=torch.float32)),
@@ -201,6 +228,40 @@ class RealDFTSTFT(nn.Module):
         hop_mask = torch.zeros(1, 1, self.hop_length, dtype=torch.float32)
         hop_mask[..., 0] = 1.0
         self.register_buffer("hop_mask", hop_mask)
+
+    def _register_tensor(self, name: str, tensor: Tensor, trainable: bool) -> None:
+        if trainable:
+            self.register_parameter(name, nn.Parameter(tensor.clone()))
+        else:
+            self.register_buffer(name, tensor.clone())
+
+    def set_trainable(self, inverse: bool, analysis: bool = False, window: bool | None = None) -> None:
+        window = bool(inverse or analysis) if window is None else bool(window)
+        for name, param in self.named_parameters(recurse=False):
+            if name in {"idft_cos_mid", "idft_sin_mid"}:
+                param.requires_grad_(bool(inverse))
+            elif name in {"dft_cos", "dft_sin"}:
+                param.requires_grad_(bool(analysis))
+            elif name == "window":
+                param.requires_grad_(window)
+
+    def regularization_loss(self) -> Tensor:
+        terms = []
+        for name in ("dft_cos", "dft_sin", "idft_cos_mid", "idft_sin_mid", "window"):
+            value = getattr(self, name, None)
+            initial = getattr(self, f"{name}_initial", None)
+            if isinstance(value, nn.Parameter) and initial is not None:
+                terms.append(F.mse_loss(value, initial.to(dtype=value.dtype, device=value.device)))
+        if not terms:
+            return self.window.new_zeros(())
+        return torch.stack(terms).sum()
+
+    def reconstruction_loss(self, audio: Tensor) -> Tensor:
+        real, imag = self(audio)
+        reconstructed = self.inverse(real, imag)
+        audio = audio.unsqueeze(1) if audio.dim() == 2 else audio
+        n = min(audio.shape[-1], reconstructed.shape[-1])
+        return F.l1_loss(reconstructed[..., :n], audio[..., :n])
 
     def forward(self, x: Tensor, norm: Optional[str] = None) -> Tuple[Tensor, Tensor]:
         if norm is not None:
@@ -234,7 +295,7 @@ class RealDFTSTFT(nn.Module):
 
         x = x * self.window.to(dtype=x.dtype)
         x = self._overlap_add(x)
-        window_envelope = self._overlap_add(self.window_envelope.to(dtype=x.dtype).repeat(1, 1, frames))
+        window_envelope = self._overlap_add(self.window.to(dtype=x.dtype).square().repeat(1, 1, frames))
 
         pad = (self.n_fft - self.hop_length) // 2
         x = x[..., pad : samples + pad]

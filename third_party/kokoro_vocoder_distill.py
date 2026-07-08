@@ -310,10 +310,15 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--boundary-loss-coeff", type=float, default=10.0)
     parser.add_argument("--boundary-window-ms", type=float, default=60.0)
     parser.add_argument("--streaming-validation-glob", type=str, default="data/af*.pt")
+    parser.add_argument("--trainable-stft-start-step", type=int, default=0)
+    parser.add_argument("--trainable-stft-analysis-start-step", type=int, default=50000)
+    parser.add_argument("--stft-reg-coeff", type=float, default=0.1)
+    parser.add_argument("--stft-reconstruction-loss-coeff", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=4444)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument("--no-auto-resume", action="store_true")
     return parser
 
 
@@ -532,6 +537,37 @@ def boundary_jump_metric(audio: torch.Tensor, chunk_samples: int) -> float:
     return float(torch.stack(jumps).mean().item())
 
 
+def iter_stft_modules(module: nn.Module) -> Iterable[nn.Module]:
+    for child in module.modules():
+        if hasattr(child, "regularization_loss") and hasattr(child, "reconstruction_loss"):
+            yield child
+
+
+def set_trainable_stft_state(generator: nn.Module, inverse: bool, analysis: bool, window: bool = False) -> None:
+    for stft in iter_stft_modules(generator):
+        set_trainable = getattr(stft, "set_trainable", None)
+        if callable(set_trainable):
+            set_trainable(inverse=inverse, analysis=analysis, window=window)
+
+
+def trainable_stft_loss(generator: nn.Module, real: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    reg_terms = []
+    recon_terms = []
+    for stft in iter_stft_modules(generator):
+        if not any(param.requires_grad for param in stft.parameters(recurse=False)):
+            continue
+        reg = stft.regularization_loss()
+        if reg.requires_grad:
+            reg_terms.append(reg)
+        recon = stft.reconstruction_loss(real.detach())
+        if recon.requires_grad:
+            recon_terms.append(recon)
+    zero = real.new_zeros(())
+    reg_loss = torch.stack(reg_terms).sum() if reg_terms else zero
+    recon_loss = torch.stack(recon_terms).mean() if recon_terms else zero
+    return reg_loss, recon_loss
+
+
 @torch.no_grad()
 def log_streaming_validation_samples(
     generator: nn.Module,
@@ -672,6 +708,13 @@ def train_decoder(
     val_loader = make_val_loader(current_frame_cap)
 
     generator = build_generator(args).to(device)
+    set_trainable_stft_state(
+        generator,
+        inverse=bool(getattr(args, "trainable_stft", False)) and int(args.trainable_stft_start_step) <= 0,
+        analysis=bool(getattr(args, "trainable_stft_analysis", False))
+        and int(args.trainable_stft_analysis_start_step) <= 0,
+        window=bool(getattr(args, "trainable_stft_window", False)) and int(args.trainable_stft_start_step) <= 0,
+    )
     mpd = MultiPeriodDiscriminator().to(device)
     mrd = MultiResolutionDiscriminator().to(device)
     gen_opt = torch.optim.AdamW(generator.parameters(), lr=args.gen_lr, betas=(0.8, 0.9), weight_decay=args.weight_decay)
@@ -733,6 +776,13 @@ def train_decoder(
             sync_scheduler_to_step(gen_sched, step)
         if disc_sched is not None and "disc_sched" not in ckpt:
             sync_scheduler_to_step(disc_sched, step)
+        set_trainable_stft_state(
+            generator,
+            inverse=bool(getattr(args, "trainable_stft", False)) and step >= int(args.trainable_stft_start_step),
+            analysis=bool(getattr(args, "trainable_stft_analysis", False))
+            and step >= int(args.trainable_stft_analysis_start_step),
+            window=bool(getattr(args, "trainable_stft_window", False)) and step >= int(args.trainable_stft_start_step),
+        )
 
     logger.info(f"Training {backend_name} on device={device}; tensorboard={tb_dir}")
     logger.info(
@@ -758,6 +808,15 @@ def train_decoder(
                 iter_start = time.perf_counter()
                 while True:
                     try:
+                        set_trainable_stft_state(
+                            generator,
+                            inverse=bool(getattr(args, "trainable_stft", False))
+                            and step >= int(args.trainable_stft_start_step),
+                            analysis=bool(getattr(args, "trainable_stft_analysis", False))
+                            and step >= int(args.trainable_stft_analysis_start_step),
+                            window=bool(getattr(args, "trainable_stft_window", False))
+                            and step >= int(args.trainable_stft_start_step),
+                        )
                         features = batch_local["features"].to(device, non_blocking=True)  # type: ignore[union-attr]
                         real = batch_local["audio"].to(device, non_blocking=True)  # type: ignore[union-attr]
                         with autocast_context(device, args.precision):
@@ -793,32 +852,43 @@ def train_decoder(
                         with autocast_context(device, args.precision):
                             stft_loss = mrstft(fake, real)
                             gd_loss = group_delay(fake, real)
-                            chunk_frames = int(getattr(args, "chunk_frames", 24))
-                            chunk_samples = chunk_frames * int(args.hop_length)
-                            boundary_window_samples = max(2, int(float(args.boundary_window_ms) * float(args.sample_rate) / 1000.0))
-                            stream_fake = streaming_center_audio(generator, features, chunk_frames, args.hop_length)
-                            stream_fake, stream_real = align_audio(stream_fake, real)
-                            stream_stft_loss = mrstft(stream_fake, stream_real)
-                            stream_gd_loss = group_delay(stream_fake, stream_real)
-                            stream_loss = stream_stft_loss + stream_gd_loss
-                            boundary_fake, boundary_real = boundary_crops(
-                                stream_fake,
-                                stream_real,
-                                chunk_samples=chunk_samples,
-                                boundary_window_samples=boundary_window_samples,
-                            )
-                            if boundary_fake is not None and boundary_real is not None:
-                                fake_diff = boundary_fake[..., 1:] - boundary_fake[..., :-1]
-                                real_diff = boundary_real[..., 1:] - boundary_real[..., :-1]
-                                boundary_deriv_loss = torch.mean(torch.abs(fake_diff - real_diff))
-                                boundary_stft_loss = mrstft(boundary_fake, boundary_real)
-                                boundary_gd_loss = group_delay(boundary_fake, boundary_real)
-                                boundary_loss = boundary_deriv_loss + boundary_stft_loss + boundary_gd_loss
-                            else:
-                                boundary_deriv_loss = torch.zeros((), device=device)
-                                boundary_stft_loss = torch.zeros((), device=device)
-                                boundary_gd_loss = torch.zeros((), device=device)
-                                boundary_loss = torch.zeros((), device=device)
+                            stream_stft_loss = torch.zeros((), device=device)
+                            stream_gd_loss = torch.zeros((), device=device)
+                            stream_loss = torch.zeros((), device=device)
+                            boundary_deriv_loss = torch.zeros((), device=device)
+                            boundary_stft_loss = torch.zeros((), device=device)
+                            boundary_gd_loss = torch.zeros((), device=device)
+                            boundary_loss = torch.zeros((), device=device)
+                            streaming_boundary_click = 0.0
+                            use_stream_loss = float(args.streaming_loss_coeff) != 0.0
+                            use_boundary_loss = float(args.boundary_loss_coeff) != 0.0
+                            if use_stream_loss or use_boundary_loss:
+                                chunk_frames = int(getattr(args, "chunk_frames", 24))
+                                chunk_samples = chunk_frames * int(args.hop_length)
+                                stream_fake = streaming_center_audio(generator, features, chunk_frames, args.hop_length)
+                                stream_fake, stream_real = align_audio(stream_fake, real)
+                                streaming_boundary_click = boundary_jump_metric(stream_fake.detach().float(), chunk_samples)
+                                if use_stream_loss:
+                                    stream_stft_loss = mrstft(stream_fake, stream_real)
+                                    stream_gd_loss = group_delay(stream_fake, stream_real)
+                                    stream_loss = stream_stft_loss + stream_gd_loss
+                                if use_boundary_loss:
+                                    boundary_window_samples = max(
+                                        2, int(float(args.boundary_window_ms) * float(args.sample_rate) / 1000.0)
+                                    )
+                                    boundary_fake, boundary_real = boundary_crops(
+                                        stream_fake,
+                                        stream_real,
+                                        chunk_samples=chunk_samples,
+                                        boundary_window_samples=boundary_window_samples,
+                                    )
+                                    if boundary_fake is not None and boundary_real is not None:
+                                        fake_diff = boundary_fake[..., 1:] - boundary_fake[..., :-1]
+                                        real_diff = boundary_real[..., 1:] - boundary_real[..., :-1]
+                                        boundary_deriv_loss = torch.mean(torch.abs(fake_diff - real_diff))
+                                        boundary_stft_loss = mrstft(boundary_fake, boundary_real)
+                                        boundary_gd_loss = group_delay(boundary_fake, boundary_real)
+                                        boundary_loss = boundary_deriv_loss + boundary_stft_loss + boundary_gd_loss
                             g_adv = torch.zeros((), device=device)
                             g_fm = torch.zeros((), device=device)
                             if adv:
@@ -842,6 +912,9 @@ def train_decoder(
                             g_fm_weighted = args.fm_loss_coeff * g_fm
                             g_stream_weighted = args.streaming_loss_coeff * stream_loss
                             g_boundary_weighted = args.boundary_loss_coeff * boundary_loss
+                            stft_reg_loss, stft_recon_loss = trainable_stft_loss(generator, real)
+                            g_stft_reg_weighted = args.stft_reg_coeff * stft_reg_loss
+                            g_stft_recon_weighted = args.stft_reconstruction_loss_coeff * stft_recon_loss
                             g_loss = (
                                 g_mrstft_weighted
                                 + g_gd_weighted
@@ -849,6 +922,8 @@ def train_decoder(
                                 + g_fm_weighted
                                 + g_stream_weighted
                                 + g_boundary_weighted
+                                + g_stft_reg_weighted
+                                + g_stft_recon_weighted
                             )
                         if scaler.is_enabled():
                             scaler.scale(g_loss).backward()
@@ -881,12 +956,16 @@ def train_decoder(
                             "gen_boundary_derivative_raw": float(boundary_deriv_loss.item()),
                             "gen_boundary_mrstft_raw": float(boundary_stft_loss.item()),
                             "gen_boundary_group_delay_raw": float(boundary_gd_loss.item()),
+                            "gen_stft_reg_raw": float(stft_reg_loss.item()),
+                            "gen_stft_reconstruction_raw": float(stft_recon_loss.item()),
                             "gen_gan_raw": float(g_adv.item()),
                             "gen_feat_match_raw": float(g_fm.item()),
                             "gen_mrstft_weighted": float(g_mrstft_weighted.item()),
                             "gen_group_delay_weighted": float(g_gd_weighted.item()),
                             "gen_streaming_weighted": float(g_stream_weighted.item()),
                             "gen_boundary_weighted": float(g_boundary_weighted.item()),
+                            "gen_stft_reg_weighted": float(g_stft_reg_weighted.item()),
+                            "gen_stft_reconstruction_weighted": float(g_stft_recon_weighted.item()),
                             "gen_gan_weighted": float(g_adv_weighted.item()),
                             "gen_feat_match_weighted": float(g_fm_weighted.item()),
                             "disc_total": float(d_loss.item()),
@@ -898,11 +977,23 @@ def train_decoder(
                             "batch_size_configured": float(current_batch_size),
                             "target_frames": float(batch_local["target_frames"].item()),  # type: ignore[union-attr]
                             "adv_enabled": float(1.0 if adv else 0.0),
+                            "trainable_stft_inverse_enabled": float(
+                                1.0
+                                if bool(getattr(args, "trainable_stft", False))
+                                and step >= int(args.trainable_stft_start_step)
+                                else 0.0
+                            ),
+                            "trainable_stft_analysis_enabled": float(
+                                1.0
+                                if bool(getattr(args, "trainable_stft_analysis", False))
+                                and step >= int(args.trainable_stft_analysis_start_step)
+                                else 0.0
+                            ),
                             "precision_fp16_scaler_scale": float(scaler.get_scale()) if scaler.is_enabled() else 1.0,
                             "lr_gen": float(gen_opt.param_groups[0]["lr"]),
                             "lr_disc": float(disc_opt.param_groups[0]["lr"]),
                             "time_step_ms": (time.perf_counter() - iter_start) * 1000.0,
-                            "streaming_boundary_click": boundary_jump_metric(stream_fake.detach().float(), chunk_samples),
+                            "streaming_boundary_click": streaming_boundary_click,
                             **metrics,
                         }
 

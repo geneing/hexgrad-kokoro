@@ -6,5 +6,11 @@ time uv run python wavehax_export.py --checkpoint models/wavehax/last.pt --outpu
 
 time uv run python android/run_plan_bench.py --family wavehax --adb /mnt/c/Users/genei/Downloads/platform-tools/adb.exe --log-wait-seconds 80 --case-timeout-seconds 80 --log-wait-seconds-1754 100 --case-timeout-seconds-1754 100
 
-uv run python third_party/wavehax/train_kokoro_decoder.py   --data-root data/outputs   --output-dir data/training/wavehax/
+uv run python third_party/wavehax/train_kokoro_decoder.py   --data-root data/outputs   --output-dir data/training/wavehax/ --batch-size 16
 
+uv run python third_party/wavehax/train_kokoro_decoder.py   --data-root data/outputs   --output-dir data/training/wavehax_trainable_stft/   --no-auto-resume   --n-fft 480   --trainable-stft   --trainable-stft-window   --trainable-stft-start-step 10000   --trainable-stft-analysis   --trainable-stft-analysis-start-step 50000   --stft-reg-coeff 0.1   --stft-reconstruction-loss-coeff 1.0
+
+uv run python third_party/wavehax/train_kokoro_decoder.py   --data-root data/outputs   --output-dir data/training/wavehax/   --no-auto-resume
+
+
+ uv run python third_party/wavehax/train_kokoro_decoder.py   --data-root data/outputs   --output-dir data/training/wavehax_trainable_stft/ --n-fft 480  --trainable-stft   --trainable-stft-window   --trainable-stft-start-step 10000   --trainable-stft-analysis   --trainable-stft-analysis-start-step 50000   --stft-reg-coeff 0.1   --stft-reconstruction-loss-coeff 1.0 --batch-size 16

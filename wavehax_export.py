@@ -146,15 +146,85 @@ class KokoroMultiScaleWavehaxGenerator(nn.Module):
             sample_rate=int(sample_rate),
             prior_type=str(config["prior_type"]),
             drop_prob=float(config["drop_prob"]),
-            framewise_norm=bool(config["framewise_norm"]),
+            framewise_norm=bool(config.get("framewise_norm", True)),
             use_gradient_checkpointing=False,
+            norm_type=str(config.get("norm_type", "layer")),
+            padding_mode=str(config.get("padding_mode", "reflect")),
+            export_safe_ops=bool(config.get("export_safe_ops", False)),
+            trainable_stft=bool(config.get("trainable_stft", False)),
+            trainable_stft_analysis=bool(config.get("trainable_stft_analysis", False)),
+            trainable_stft_window=bool(config.get("trainable_stft_window", False)),
         )
 
-    def forward(self, features: Tensor) -> Tensor:
+    def forward(
+        self,
+        features: Tensor,
+        prior_phase: Tensor | None = None,
+        return_prior_phase: bool = False,
+    ) -> Tensor:
         cond = self.conditioner(features)
-        f0 = None if isinstance(self.generator, ExportOptimizedMultiScaleWavehaxGenerator) else features[:, 512:513, :]
-        audio, _prior = self.generator(cond, f0)
+        if isinstance(self.generator, ExportOptimizedMultiScaleWavehaxGenerator):
+            audio, _prior = self.generator(cond, None)
+            audio = audio[:, 0, :] if audio.ndim == 3 and audio.shape[1] == 1 else audio
+            if return_prior_phase:
+                next_phase = prior_phase if prior_phase is not None else features.new_zeros(features.shape[0], 1, 1)
+                return audio, next_phase
+            return audio
+        f0 = features[:, 512:513, :]
+        result = self.generator(cond, f0, prior_phase=prior_phase, return_prior_phase=return_prior_phase)
+        if return_prior_phase:
+            audio, _prior, next_phase = result
+            audio = audio[:, 0, :] if audio.ndim == 3 and audio.shape[1] == 1 else audio
+            return audio, next_phase
+        audio, _prior = result
         return audio[:, 0, :] if audio.ndim == 3 and audio.shape[1] == 1 else audio
+
+    def phase_advance(self, features: Tensor) -> Tensor:
+        if hasattr(self.generator, "phase_advance"):
+            return self.generator.phase_advance(features[:, 512:513, :])
+        return features.new_zeros(features.shape[0], 1, 1)
+
+
+class StreamingWavehaxChunkExport(nn.Module):
+    """Fixed-shape streaming step: previous state + current chunk + lookahead chunk."""
+
+    def __init__(
+        self,
+        model: KokoroMultiScaleWavehaxGenerator,
+        chunk_frames: int,
+        feature_channels: int = 642,
+        hop_length: int = 300,
+    ):
+        super().__init__()
+        self.model = model.eval()
+        self.chunk_frames = int(chunk_frames)
+        self.feature_channels = int(feature_channels)
+        self.hop_length = int(hop_length)
+        self.chunk_samples = self.chunk_frames * self.hop_length
+
+    def initial_state(self, device: torch.device | None = None, dtype: torch.dtype = torch.float32) -> tuple[Tensor, Tensor]:
+        if device is None:
+            try:
+                device = next(self.parameters()).device
+            except StopIteration:
+                device = torch.device("cpu")
+        feature_state = torch.zeros(1, self.feature_channels, self.chunk_frames, device=device, dtype=dtype)
+        prior_phase = torch.zeros(1, 1, 1, device=device, dtype=dtype)
+        return feature_state, prior_phase
+
+    def forward(
+        self,
+        features_chunk: Tensor,
+        next_features_chunk: Tensor,
+        feature_state: Tensor,
+        prior_phase: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        full_features = torch.cat([feature_state, features_chunk, next_features_chunk], dim=-1)
+        full_audio, _next_window_phase = self.model(full_features, prior_phase=prior_phase, return_prior_phase=True)
+        audio_chunk = full_audio[..., self.chunk_samples : 2 * self.chunk_samples]
+        next_feature_state = features_chunk.contiguous()
+        next_prior_phase = torch.fmod(prior_phase + self.model.phase_advance(features_chunk), 2.0 * torch.pi)
+        return audio_chunk, next_feature_state, next_prior_phase
 
 
 class ExportSafeKokoroFeatureConditioner(nn.Module):
@@ -460,11 +530,12 @@ def _replace_reflect_convs_with_zero_padding(module: nn.Module) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Export Kokoro Wavehax to LiteRT/TFLite")
-    parser.add_argument("--checkpoint", type=Path, default=Path("models/wavehax/last.pt"))
-    parser.add_argument("--output-dir", type=Path, default=Path("runs/wavehax"))
+    parser.add_argument("--checkpoint", type=Path, default=Path("data/training/wavehax_trainable_stft/checkpoints/last.pt"))
+    parser.add_argument("--output-dir", type=Path, default=Path("data/training/wavehax_trainable_stft/"))
     parser.add_argument("--input-feature-glob", action="append", default=["data/af_alloy*.pt"])
     parser.add_argument("--sample-count", type=int, default=3)
     parser.add_argument("--num-frames", type=int, default=330)
+    parser.add_argument("--chunk-frames", type=int, default=None)
     parser.add_argument("--sample-rate", type=int, default=24000)
     parser.add_argument("--seed", type=int, default=4444)
     parser.add_argument("--lightweight-conversion", action="store_true")
@@ -539,6 +610,41 @@ def _trim_or_pad_features(features: torch.Tensor, target_frames: int) -> torch.T
     return torch.cat([features, pad], dim=-1)
 
 
+def _chunk_at(features: Tensor, start: int, chunk_frames: int) -> tuple[Tensor, int]:
+    frames = int(features.shape[-1])
+    valid = max(0, min(int(chunk_frames), frames - int(start)))
+    chunk = features[..., int(start) : int(start) + valid]
+    if valid < int(chunk_frames):
+        chunk = F.pad(chunk, (0, int(chunk_frames) - valid))
+    return chunk.contiguous(), valid
+
+
+@torch.inference_mode()
+def _run_chunked_pytorch(chunk_model: StreamingWavehaxChunkExport, features: Tensor) -> Tensor:
+    if features.ndim != 3 or features.shape[0] != 1:
+        raise ValueError(f"Expected features [1,642,T], got {tuple(features.shape)}")
+    device = features.device
+    dtype = features.dtype
+    feature_state, prior_phase = chunk_model.initial_state(device=device, dtype=dtype)
+    outputs: list[Tensor] = []
+    frames = int(features.shape[-1])
+    pos = 0
+    while pos < frames:
+        features_chunk, valid = _chunk_at(features, pos, chunk_model.chunk_frames)
+        next_features_chunk, _next_valid = _chunk_at(features, pos + valid, chunk_model.chunk_frames)
+        audio, feature_state, prior_phase = chunk_model(
+            features_chunk,
+            next_features_chunk,
+            feature_state,
+            prior_phase,
+        )
+        outputs.append(audio[..., : valid * chunk_model.hop_length])
+        pos += valid
+    if not outputs:
+        return features.new_empty(1, 0)
+    return torch.cat(outputs, dim=-1)[..., : frames * chunk_model.hop_length]
+
+
 def _load_wavehax_model(
     checkpoint_path: Path,
     sample_rate: int,
@@ -590,7 +696,7 @@ def _patch_model_for_export(
 
 def _export_litert(
     model: nn.Module,
-    sample_arg: torch.Tensor,
+    sample_args: Sequence[torch.Tensor],
     out_path: Path,
     *,
     lightweight_conversion: bool,
@@ -601,7 +707,7 @@ def _export_litert(
     model.eval()
     edge_model = litert_torch.convert(
         model,
-        sample_args=(sample_arg,),
+        sample_args=tuple(sample_args),
         strict_export=False,
         quant_config=quant_config,
         dynamic_shapes=dynamic_shapes,
@@ -672,6 +778,82 @@ def _run_litert_inference(model_path: Path, features: np.ndarray) -> np.ndarray:
     in_dtype = np.dtype(input_details[input_name]["dtype"])
     pred_map = runner(**{input_name: np.asarray(features, dtype=in_dtype)})
     return np.asarray(next(iter(pred_map.values())), dtype=np.float32)
+
+
+def _run_litert_chunk_step(
+    model_path: Path,
+    features_chunk: np.ndarray,
+    next_features_chunk: np.ndarray,
+    feature_state: np.ndarray,
+    prior_phase: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    try:
+        model = litert_torch.load(str(model_path))
+        interpreter = model._get_interpreter()
+    except RuntimeError:
+        interpreter = tfl_interpreter_utils.create_tfl_interpreter(
+            str(model_path),
+            allocate_tensors=False,
+            use_xnnpack=False,
+            preserve_all_tensors=False,
+        )
+    signatures = list(interpreter.get_signature_list().keys())
+    if not signatures:
+        raise RuntimeError(f"No TFLite signatures found in {model_path}")
+    runner = interpreter.get_signature_runner(signatures[0])
+    input_details = runner.get_input_details()
+    arrays_by_role = {
+        "features_chunk": features_chunk,
+        "next_features_chunk": next_features_chunk,
+        "feature_state": feature_state,
+        "prior_phase": prior_phase,
+    }
+    fallback_roles = ["features_chunk", "next_features_chunk", "feature_state", "prior_phase"]
+    name_match_roles = ["next_features_chunk", "features_chunk", "feature_state", "prior_phase"]
+    feed: dict[str, np.ndarray] = {}
+    for idx, (name, detail) in enumerate(input_details.items()):
+        role = next((key for key in name_match_roles if key in name), fallback_roles[idx])
+        feed[name] = np.asarray(arrays_by_role[role], dtype=np.dtype(detail["dtype"]))
+    pred_map = runner(**feed)
+    outputs = {name: np.asarray(value, dtype=np.float32) for name, value in pred_map.items()}
+
+    audio_name = next((name for name, value in outputs.items() if value.ndim == 2), None)
+    phase_name = next((name for name, value in outputs.items() if list(value.shape[-2:]) == [1, 1]), None)
+    state_name = next((name for name, value in outputs.items() if value.ndim == 3 and name != phase_name), None)
+    if audio_name is None or state_name is None or phase_name is None:
+        ordered = list(outputs.values())
+        if len(ordered) != 3:
+            raise RuntimeError(f"Expected 3 LiteRT outputs from {model_path}, got {list(outputs)}")
+        ordered_by_size = sorted(ordered, key=lambda arr: arr.size)
+        phase = ordered_by_size[0]
+        audio = next(arr for arr in ordered if arr.ndim == 2)
+        state = next(arr for arr in ordered if arr.ndim == 3)
+        return audio, state, phase
+    return outputs[audio_name], outputs[state_name], outputs[phase_name]
+
+
+def _run_chunked_litert(model_path: Path, features: Tensor, chunk_frames: int, hop_length: int) -> np.ndarray:
+    frames = int(features.shape[-1])
+    feature_state = np.zeros((1, int(features.shape[1]), int(chunk_frames)), dtype=np.float32)
+    prior_phase = np.zeros((1, 1, 1), dtype=np.float32)
+    outputs: list[np.ndarray] = []
+    pos = 0
+    features = features.float()
+    while pos < frames:
+        features_chunk, valid = _chunk_at(features, pos, chunk_frames)
+        next_features_chunk, _next_valid = _chunk_at(features, pos + valid, chunk_frames)
+        audio, feature_state, prior_phase = _run_litert_chunk_step(
+            model_path,
+            features_chunk.cpu().numpy().astype(np.float32),
+            next_features_chunk.cpu().numpy().astype(np.float32),
+            feature_state,
+            prior_phase,
+        )
+        outputs.append(audio[..., : valid * int(hop_length)])
+        pos += valid
+    if not outputs:
+        return np.empty((1, 0), dtype=np.float32)
+    return np.concatenate(outputs, axis=-1)[..., : frames * int(hop_length)]
 
 
 def _schema_enum_names(enum_cls: object) -> dict[int, str]:
@@ -770,22 +952,40 @@ def main() -> None:
         zero_pad_reflect_convs=args.zero_pad_reflect_convs,
     )
     input_channels = 512 + 1 + 1 + 128
-    fixed_frames = int(args.num_frames)
-    fixed = _trim_or_pad_features(samples[0].features.float(), fixed_frames).unsqueeze(0)
+    chunk_frames = int(args.chunk_frames if args.chunk_frames is not None else config.get("chunk_frames", args.num_frames))
+    if chunk_frames <= 0:
+        raise ValueError("chunk_frames must be > 0")
+    chunk_model = StreamingWavehaxChunkExport(
+        model=model,
+        chunk_frames=chunk_frames,
+        feature_channels=input_channels,
+        hop_length=int(config.get("hop_length", args.sample_rate // 80)),
+    ).eval()
+    fixed_features = _trim_or_pad_features(samples[0].features.float(), chunk_frames * 2).unsqueeze(0)
+    sample_chunk = fixed_features[..., :chunk_frames].contiguous()
+    sample_next_chunk = fixed_features[..., chunk_frames : 2 * chunk_frames].contiguous()
+    sample_feature_state, sample_prior_phase = chunk_model.initial_state(dtype=torch.float32)
+    sample_args = (sample_chunk, sample_next_chunk, sample_feature_state, sample_prior_phase)
 
     with torch.inference_mode():
         for sample in samples:
-            audio = model(sample.features.float().unsqueeze(0)).detach().cpu().numpy()
-            save_wav_16bit(wav_dir / f"{sample.tag}_pytorch.wav", audio, sample.sample_rate)
-            logger.info(f"Wrote PyTorch WAV for {sample.tag}: shape={audio.shape}")
+            features = sample.features.float().unsqueeze(0)
+            full_audio = model(features).detach().cpu().numpy()
+            chunk_audio = _run_chunked_pytorch(chunk_model, features).detach().cpu().numpy()
+            save_wav_16bit(wav_dir / f"{sample.tag}_pytorch_full.wav", full_audio, sample.sample_rate)
+            save_wav_16bit(wav_dir / f"{sample.tag}_pytorch_chunked_{chunk_frames}f.wav", chunk_audio, sample.sample_rate)
+            logger.info(
+                f"Wrote PyTorch WAVs for {sample.tag}: full_shape={full_audio.shape} "
+                f"chunked_shape={chunk_audio.shape} chunk_frames={chunk_frames}"
+            )
 
     variants: list[LiteRTVariant] = []
     fp32_path = args.output_dir / "wavehax_fp32_litert.tflite"
     fp16_path = args.output_dir / "wavehax_fp16_litert.tflite"
 
     _export_litert(
-        model=model,
-        sample_arg=fixed,
+        model=chunk_model,
+        sample_args=sample_args,
         out_path=fp32_path,
         lightweight_conversion=args.lightweight_conversion,
     )
@@ -794,8 +994,8 @@ def main() -> None:
     logger.info(f"Exported fp32 LiteRT model: {fp32_path}")
 
     _export_litert(
-        model=model,
-        sample_arg=fixed,
+        model=chunk_model,
+        sample_args=sample_args,
         out_path=fp16_path,
         lightweight_conversion=args.lightweight_conversion,
         quant_config=quant_recipes.full_fp16_recipe(),
@@ -807,85 +1007,34 @@ def main() -> None:
     dynamic_path: Path | None = None
     dynamic_error = ""
     if args.dynamic_frames:
-        dynamic_path = args.output_dir / "wavehax_fp16_dynamic_litert.tflite"
-        try:
-            _export_litert(
-                model=model,
-                sample_arg=fixed,
-                out_path=dynamic_path,
-                lightweight_conversion=args.lightweight_conversion,
-                dynamic_shapes=(
-                    {2: torch.export.Dim("frames", min=args.dynamic_frame_min, max=args.dynamic_frame_max)},
-                ),
-                quant_config=quant_recipes.full_fp16_recipe(),
-            )
-            _write_tflite_diagnostics(dynamic_path, diagnostics_dir / f"{dynamic_path.stem}_op_inventory.txt")
-            logger.info(f"Exported dynamic-frame fp16 LiteRT model: {dynamic_path}")
-        except Exception as exc:
-            dynamic_error = f"{type(exc).__name__}: {exc}"
-            dynamic_path = None
-            (diagnostics_dir / "wavehax_fp16_dynamic_export_failure.txt").write_text(
-                "Dynamic-frame Wavehax LiteRT export failed.\n\n"
-                f"sample_shape={tuple(fixed.shape)}\n"
-                f"dynamic_frame_min={args.dynamic_frame_min}\n"
-                f"dynamic_frame_max={args.dynamic_frame_max}\n\n"
-                f"{dynamic_error}\n",
-                encoding="utf-8",
-            )
-            logger.warning(f"Dynamic-frame fp16 export failed: {dynamic_error}")
+        dynamic_error = "Dynamic-frame export is not used by the fixed-chunk streaming model."
+        (diagnostics_dir / "wavehax_fp16_dynamic_export_failure.txt").write_text(dynamic_error + "\n", encoding="utf-8")
+        logger.warning(dynamic_error)
 
     multisig_path: Path | None = None
     multisig_error = ""
     if args.multisignature_static:
-        multisig_path = args.output_dir / "wavehax_fp16_multisig_static_litert.tflite"
-        try:
-            _export_litert_multisignature_static(
-                model=model,
-                samples=samples,
-                out_path=multisig_path,
-                lightweight_conversion=args.lightweight_conversion,
-                quant_config=quant_recipes.full_fp16_recipe(),
-            )
-            _write_tflite_diagnostics(multisig_path, diagnostics_dir / f"{multisig_path.stem}_op_inventory.txt")
-            logger.info(f"Exported static multi-signature fp16 LiteRT model: {multisig_path}")
-        except Exception as exc:
-            multisig_error = f"{type(exc).__name__}: {exc}"
-            multisig_path = None
-            (diagnostics_dir / "wavehax_fp16_multisig_export_failure.txt").write_text(
-                "Static multi-signature Wavehax LiteRT export failed.\n\n"
-                f"samples={[sample.tag for sample in samples]}\n\n"
-                f"{multisig_error}\n",
-                encoding="utf-8",
-            )
-            logger.warning(f"Static multi-signature fp16 export failed: {multisig_error}")
+        multisig_error = "Static multi-signature export is not used by the fixed-chunk streaming model."
+        (diagnostics_dir / "wavehax_fp16_multisig_export_failure.txt").write_text(multisig_error + "\n", encoding="utf-8")
+        logger.warning(multisig_error)
 
     sample_length_models: list[Path] = []
     if args.export_all_sample_lengths:
-        for sample in samples:
-            frames = int(sample.features.shape[-1])
-            sample_input = sample.features.float().unsqueeze(0)
-            sample_path = args.output_dir / f"wavehax_fp16_{sample.tag}_{frames}f_litert.tflite"
-            sample_model = copy.deepcopy(model).eval()
-            _export_litert(
-                model=sample_model,
-                sample_arg=sample_input,
-                out_path=sample_path,
-                lightweight_conversion=args.lightweight_conversion,
-                quant_config=quant_recipes.full_fp16_recipe(),
-            )
-            _write_tflite_diagnostics(sample_path, diagnostics_dir / f"{sample_path.stem}_op_inventory.txt")
-            sample_length_models.append(sample_path)
-            logger.info(f"Exported sample-length fp16 LiteRT model: {sample_path}")
+        logger.warning("Sample-length exports are skipped because streaming export uses one fixed chunk shape.")
 
     quality: list[dict[str, object]] = []
     if not args.skip_litert_validation:
         for sample in samples:
-            fixed_sample = _trim_or_pad_features(sample.features.float(), fixed_frames)
-            input_np = fixed_sample.unsqueeze(0).numpy().astype(np.float32)
+            features = sample.features.float().unsqueeze(0)
             with torch.inference_mode():
-                torch_pred = model(fixed_sample.unsqueeze(0)).detach().cpu().numpy().astype(np.float32)
+                torch_pred = _run_chunked_pytorch(chunk_model, features).detach().cpu().numpy().astype(np.float32)
             for variant in variants:
-                pred = _run_litert_inference(variant.path, input_np)
+                pred = _run_chunked_litert(
+                    variant.path,
+                    features,
+                    chunk_frames=chunk_frames,
+                    hop_length=chunk_model.hop_length,
+                )
                 save_wav_16bit(wav_dir / f"{sample.tag}_{variant.name}_litert.wav", pred, sample.sample_rate)
                 diff = pred.reshape(-1) - torch_pred.reshape(-1)
                 quality.append(
@@ -905,8 +1054,15 @@ def main() -> None:
     manifest = {
         "checkpoint": str(args.checkpoint.resolve()),
         "output_dir": str(args.output_dir),
-        "fixed_frames": fixed_frames,
+        "chunk_frames": chunk_frames,
+        "chunk_samples": chunk_model.chunk_samples,
         "input_channels": input_channels,
+        "export_signature": {
+            "features_chunk": list(sample_chunk.shape),
+            "next_features_chunk": list(sample_next_chunk.shape),
+            "feature_state": list(sample_feature_state.shape),
+            "prior_phase": list(sample_prior_phase.shape),
+        },
         "optimized_prior": bool(args.optimized_prior),
         "zero_pad_reflect_convs": bool(args.zero_pad_reflect_convs),
         "config": config,
@@ -955,7 +1111,7 @@ def main() -> None:
             f"- Multisig fp16: `{multisig_path.name}`" if multisig_path else f"- Multisig fp16: not exported ({multisig_error or 'not requested'})",
             f"- Sample-length fp16 models: {len(sample_length_models)}",
             f"- Samples: {', '.join(s.tag for s in samples)}",
-            f"- Fixed export shape: `[1, {input_channels}, {fixed_frames}]`",
+            f"- Fixed chunk export shapes: features/current/next/state `[1, {input_channels}, {chunk_frames}]`, phase `[1, 1, 1]`",
             f"- WAVs: `{wav_dir}`",
             f"- Diagnostics: `{diagnostics_dir}`",
             f"- Elapsed: {time.time() - start:.1f}s; max RSS: {_memory_mb():.1f} MB",

@@ -39,6 +39,9 @@ class KokoroMultiScaleWavehaxGenerator(nn.Module):
         norm_type: str,
         padding_mode: str,
         export_safe_ops: bool,
+        trainable_stft: bool,
+        trainable_stft_analysis: bool,
+        trainable_stft_window: bool,
     ):
         super().__init__()
         self.conditioner = KokoroFeatureConditioner(
@@ -64,6 +67,9 @@ class KokoroMultiScaleWavehaxGenerator(nn.Module):
             norm_type=norm_type,
             padding_mode=padding_mode,
             export_safe_ops=export_safe_ops,
+            trainable_stft=trainable_stft,
+            trainable_stft_analysis=trainable_stft_analysis,
+            trainable_stft_window=trainable_stft_window,
         )
 
     def forward(
@@ -127,7 +133,7 @@ def parse_args() -> argparse.Namespace:
         min_batch_size=1,
         frame_cap=384,
         min_frame_cap=96,
-        n_fft=120,
+        n_fft=480,
         val_steps=1,
         sample_count=1,
         pretrain_steps=10000,
@@ -135,6 +141,8 @@ def parse_args() -> argparse.Namespace:
         disc_lr=1e-4,
         gan_loss_coeff=0.1,
         fm_loss_coeff=0.5,
+        streaming_loss_coeff=0.0,
+        boundary_loss_coeff=0.0,
     )
     parser.add_argument("--channels", type=int, default=64)
     parser.add_argument("--mult-channels", type=int, default=2)
@@ -149,6 +157,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--norm-type", choices=("batch",), default="batch")
     parser.add_argument("--padding-mode", choices=("zeros",), default="zeros")
     parser.add_argument("--export-safe-ops", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--trainable-stft", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--trainable-stft-analysis", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--trainable-stft-window", action=argparse.BooleanOptionalAction, default=False)
     return parser.parse_args()
 
 
@@ -178,6 +189,9 @@ def build_generator(args: argparse.Namespace) -> nn.Module:
         norm_type=args.norm_type,
         padding_mode=args.padding_mode,
         export_safe_ops=args.export_safe_ops,
+        trainable_stft=args.trainable_stft,
+        trainable_stft_analysis=args.trainable_stft_analysis,
+        trainable_stft_window=args.trainable_stft_window,
     )
     assert_no_layer_norm(model)
     return model
@@ -185,11 +199,27 @@ def build_generator(args: argparse.Namespace) -> nn.Module:
 
 def main() -> None:
     args = parse_args()
+    if args.resume is None and not args.no_auto_resume:
+        auto_resume = args.output_dir / "checkpoints" / "last.pt"
+        if auto_resume.exists():
+            args.resume = auto_resume
+            print(f"Auto-resuming from {auto_resume}", flush=True)
     if args.resume:
         resume = torch.load(args.resume, map_location="cpu", weights_only=False)
         resume_config = resume.get("backend_config", {}) if isinstance(resume, dict) else {}
         if resume_config.get("norm_type") != "batch" or not bool(resume_config.get("export_safe_ops")):
             raise ValueError("Strict-BN export-friendly Wavehax training cannot resume from an older LN/non-export-safe checkpoint.")
+        requested_trainable_stft = bool(args.trainable_stft or args.trainable_stft_analysis or args.trainable_stft_window)
+        resumed_trainable_stft = bool(
+            resume_config.get("trainable_stft", False)
+            or resume_config.get("trainable_stft_analysis", False)
+            or resume_config.get("trainable_stft_window", False)
+        )
+        if requested_trainable_stft and not resumed_trainable_stft:
+            raise ValueError(
+                "--trainable-stft adds optimizer parameters; start a fresh run with --no-auto-resume "
+                "or resume from a checkpoint that was already trained with --trainable-stft."
+            )
     backend_config: Dict[str, object] = {
         "model": "third_party/wavehax/mswavehax_export_safe_streaming",
         "model_input_channels": args.model_input_channels,
@@ -205,6 +235,13 @@ def main() -> None:
         "norm_type": args.norm_type,
         "padding_mode": args.padding_mode,
         "export_safe_ops": args.export_safe_ops,
+        "trainable_stft": args.trainable_stft,
+        "trainable_stft_analysis": args.trainable_stft_analysis,
+        "trainable_stft_window": args.trainable_stft_window,
+        "trainable_stft_start_step": args.trainable_stft_start_step,
+        "trainable_stft_analysis_start_step": args.trainable_stft_analysis_start_step,
+        "stft_reg_coeff": args.stft_reg_coeff,
+        "stft_reconstruction_loss_coeff": args.stft_reconstruction_loss_coeff,
         "chunk_frames": args.chunk_frames,
         "streaming_loss_coeff": args.streaming_loss_coeff,
         "boundary_loss_coeff": args.boundary_loss_coeff,

@@ -203,3 +203,18 @@ Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov
 - Diagnostics: `/home/eingerman/Projects/TTS/kokoro/runs/wavehax/diagnostics`
 - Elapsed: 103.9s; max RSS: 1777.6 MB
 
+## Wavehax export - 2026-06-29 23:14:36
+- Checkpoint: `data/training/wavehax_trainable_stft/checkpoints/last.pt`
+- Output: `/export/eingerman/audio/training/wavehax_trainable_stft`
+- Exported: `wavehax_fp32_litert.tflite`, `wavehax_fp16_litert.tflite`
+- Optimized prior: False
+- Zero-pad reflect convs: True
+- Dynamic fp16: not exported (not requested)
+- Multisig fp16: not exported (not requested)
+- Sample-length fp16 models: 0
+- Samples: af_alloy_00001_00, af_alloy_00304_00, af_alloy_00403_00
+- Fixed chunk export shapes: features/current/next/state `[1, 642, 24]`, phase `[1, 1, 1]`
+- WAVs: `/export/eingerman/audio/training/wavehax_trainable_stft/sample_audio`
+- Diagnostics: `/export/eingerman/audio/training/wavehax_trainable_stft/diagnostics`
+- Elapsed: 157.9s; max RSS: 2857.9 MB
+
