@@ -143,6 +143,7 @@ def parse_args() -> argparse.Namespace:
         fm_loss_coeff=0.5,
         streaming_loss_coeff=0.0,
         boundary_loss_coeff=0.0,
+        boundary_log_mel_loss_coeff=1.0,
     )
     parser.add_argument("--channels", type=int, default=64)
     parser.add_argument("--mult-channels", type=int, default=2)
@@ -199,7 +200,7 @@ def build_generator(args: argparse.Namespace) -> nn.Module:
 
 def main() -> None:
     args = parse_args()
-    if args.resume is None and not args.no_auto_resume:
+    if args.resume is None and args.init_from is None and not args.no_auto_resume:
         auto_resume = args.output_dir / "checkpoints" / "last.pt"
         if auto_resume.exists():
             args.resume = auto_resume
@@ -244,7 +245,10 @@ def main() -> None:
         "stft_reconstruction_loss_coeff": args.stft_reconstruction_loss_coeff,
         "chunk_frames": args.chunk_frames,
         "streaming_loss_coeff": args.streaming_loss_coeff,
+        "streaming_target": args.streaming_target,
         "boundary_loss_coeff": args.boundary_loss_coeff,
+        "boundary_log_mel_loss_coeff": args.boundary_log_mel_loss_coeff,
+        "boundary_log_mel_n_fft": args.boundary_log_mel_n_fft,
         "boundary_window_ms": args.boundary_window_ms,
         "streaming_validation_glob": args.streaming_validation_glob,
         "use_gradient_checkpointing": args.gradient_checkpointing,

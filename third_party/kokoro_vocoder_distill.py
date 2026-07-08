@@ -307,7 +307,10 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--group-delay-loss-coeff", type=float, default=2.0)
     parser.add_argument("--mrd-loss-coeff", type=float, default=1.0)
     parser.add_argument("--streaming-loss-coeff", type=float, default=5.0)
+    parser.add_argument("--streaming-target", choices=("real", "full"), default="real")
     parser.add_argument("--boundary-loss-coeff", type=float, default=10.0)
+    parser.add_argument("--boundary-log-mel-loss-coeff", type=float, default=1.0)
+    parser.add_argument("--boundary-log-mel-n-fft", type=int, default=1200)
     parser.add_argument("--boundary-window-ms", type=float, default=60.0)
     parser.add_argument("--streaming-validation-glob", type=str, default="data/af*.pt")
     parser.add_argument("--trainable-stft-start-step", type=int, default=0)
@@ -318,6 +321,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument("--init-from", type=Path, default=None)
     parser.add_argument("--no-auto-resume", action="store_true")
     return parser
 
@@ -537,6 +541,19 @@ def boundary_jump_metric(audio: torch.Tensor, chunk_samples: int) -> float:
     return float(torch.stack(jumps).mean().item())
 
 
+def log_mel_l1_loss(
+    mel_transform: torchaudio.transforms.MelSpectrogram,
+    fake: torch.Tensor,
+    real: torch.Tensor,
+) -> torch.Tensor:
+    device_type = fake.device.type
+    autocast = torch.autocast(device_type=device_type, enabled=False) if device_type == "cuda" else contextlib.nullcontext()
+    with autocast:
+        fake_log_mel = torch.log(mel_transform(fake.float()).clamp_min(1e-5))
+        real_log_mel = torch.log(mel_transform(real.float()).clamp_min(1e-5))
+        return F.l1_loss(fake_log_mel, real_log_mel)
+
+
 def iter_stft_modules(module: nn.Module) -> Iterable[nn.Module]:
     for child in module.modules():
         if hasattr(child, "regularization_loss") and hasattr(child, "reconstruction_loss"):
@@ -663,6 +680,8 @@ def train_decoder(
     build_generator: Callable[[argparse.Namespace], nn.Module],
     backend_config: Dict[str, object],
 ) -> None:
+    if args.resume is not None and args.init_from is not None:
+        raise ValueError("--resume and --init-from are mutually exclusive. Use --init-from for fresh-optimizer finetuning.")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = resolve_device(args.device)
@@ -752,12 +771,28 @@ def train_decoder(
         center=True,
         power=1.0,
     )
+    boundary_mel_transform = torchaudio.transforms.MelSpectrogram(
+        sample_rate=args.sample_rate,
+        n_fft=max(int(args.boundary_log_mel_n_fft), int(args.hop_length) * 2),
+        hop_length=args.hop_length,
+        n_mels=80,
+        center=True,
+        power=1.0,
+    ).to(device)
     if plt is None:
         logger.warning("matplotlib is not installed; TensorBoard mel plot logging is disabled.")
     if device.type != "cuda" and args.precision != "fp32":
         logger.warning(f"precision={args.precision} requested on device={device}; autocast is disabled outside CUDA.")
 
     step = 0
+    if args.init_from:
+        ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        generator.load_state_dict(ckpt["generator"])
+        if "mpd" in ckpt:
+            mpd.load_state_dict(ckpt["mpd"])
+        if "mrd" in ckpt:
+            mrd.load_state_dict(ckpt["mrd"])
+        logger.info(f"Initialized {backend_name} weights from {args.init_from}; optimizer/scheduler state reset for finetuning.")
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         generator.load_state_dict(ckpt["generator"])
@@ -858,6 +893,7 @@ def train_decoder(
                             boundary_deriv_loss = torch.zeros((), device=device)
                             boundary_stft_loss = torch.zeros((), device=device)
                             boundary_gd_loss = torch.zeros((), device=device)
+                            boundary_log_mel_loss = torch.zeros((), device=device)
                             boundary_loss = torch.zeros((), device=device)
                             streaming_boundary_click = 0.0
                             use_stream_loss = float(args.streaming_loss_coeff) != 0.0
@@ -866,11 +902,12 @@ def train_decoder(
                                 chunk_frames = int(getattr(args, "chunk_frames", 24))
                                 chunk_samples = chunk_frames * int(args.hop_length)
                                 stream_fake = streaming_center_audio(generator, features, chunk_frames, args.hop_length)
-                                stream_fake, stream_real = align_audio(stream_fake, real)
+                                stream_target = fake.detach() if args.streaming_target == "full" else real
+                                stream_fake, stream_target = align_audio(stream_fake, stream_target)
                                 streaming_boundary_click = boundary_jump_metric(stream_fake.detach().float(), chunk_samples)
                                 if use_stream_loss:
-                                    stream_stft_loss = mrstft(stream_fake, stream_real)
-                                    stream_gd_loss = group_delay(stream_fake, stream_real)
+                                    stream_stft_loss = mrstft(stream_fake, stream_target)
+                                    stream_gd_loss = group_delay(stream_fake, stream_target)
                                     stream_loss = stream_stft_loss + stream_gd_loss
                                 if use_boundary_loss:
                                     boundary_window_samples = max(
@@ -878,7 +915,7 @@ def train_decoder(
                                     )
                                     boundary_fake, boundary_real = boundary_crops(
                                         stream_fake,
-                                        stream_real,
+                                        stream_target,
                                         chunk_samples=chunk_samples,
                                         boundary_window_samples=boundary_window_samples,
                                     )
@@ -888,7 +925,17 @@ def train_decoder(
                                         boundary_deriv_loss = torch.mean(torch.abs(fake_diff - real_diff))
                                         boundary_stft_loss = mrstft(boundary_fake, boundary_real)
                                         boundary_gd_loss = group_delay(boundary_fake, boundary_real)
-                                        boundary_loss = boundary_deriv_loss + boundary_stft_loss + boundary_gd_loss
+                                        boundary_log_mel_loss = log_mel_l1_loss(
+                                            boundary_mel_transform,
+                                            boundary_fake,
+                                            boundary_real,
+                                        )
+                                        boundary_loss = (
+                                            boundary_deriv_loss
+                                            + boundary_stft_loss
+                                            + boundary_gd_loss
+                                            + args.boundary_log_mel_loss_coeff * boundary_log_mel_loss
+                                        )
                             g_adv = torch.zeros((), device=device)
                             g_fm = torch.zeros((), device=device)
                             if adv:
@@ -956,6 +1003,7 @@ def train_decoder(
                             "gen_boundary_derivative_raw": float(boundary_deriv_loss.item()),
                             "gen_boundary_mrstft_raw": float(boundary_stft_loss.item()),
                             "gen_boundary_group_delay_raw": float(boundary_gd_loss.item()),
+                            "gen_boundary_log_mel_raw": float(boundary_log_mel_loss.item()),
                             "gen_stft_reg_raw": float(stft_reg_loss.item()),
                             "gen_stft_reconstruction_raw": float(stft_recon_loss.item()),
                             "gen_gan_raw": float(g_adv.item()),
